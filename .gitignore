@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+
+# 数据与产物（体积大，不入库）
+data/
+output/
+*.mp4
+*.pkl
+
+# 交接原版代码与对照脚本（仅本地验收用）
+.probe/
+
+.vscode/
+.idea/
+.DS_Store
