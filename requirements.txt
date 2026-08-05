@@ -1,0 +1,27 @@
+# 运行时依赖。
+#
+# 不含 torch / torchvision / mmcv / mmpose —— 见 install.sh：
+#   torch/mmcv  必须与 CUDA 版本匹配，mmcv 只能用官方预编译 wheel
+#   mmpose      用 --no-deps 安装以跳过 chumpy（下面已列出它其余的依赖）
+#
+# 版本约束来源：
+#   mmpose 1.3.1 / mmdet 3.2.0 均要求 mmcv<2.2.0，锁定 mmcv 2.1.0
+#   mmcv 2.1.0 只有 cu121/torch2.1.0 的 cp310 预编译 wheel
+#   numpy 锁 1.x：torch 2.1 / mmcv / mmdet 的 C 扩展基于 numpy1 ABI 编译
+
+mmengine==0.10.4
+mmdet==3.2.0
+ultralytics==8.4.56
+numpy==1.26.4
+opencv-python==4.10.0.84
+scipy==1.15.3
+matplotlib==3.10.9
+pytest==9.1.1
+
+# mmpose 1.3.1 的运行时依赖（除 chumpy）。chumpy 是它为 SMPL 网格任务引入的，
+# 本项目只做 2D 关键点用不到，且它 import 已被 numpy>=1.24 删除的
+# numpy.bool 等别名，装上会让 import mmpose 直接失败。
+json-tricks==3.17.3
+munkres==1.1.4
+xtcocotools==1.14.3
+pillow==12.3.0

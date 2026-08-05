@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swim-analyse"
+version = "1.0.0"
+description = "六路相机拼接全景视频的游泳划水计数与速度分析"
+requires-python = ">=3.10,<3.11"
+
+# 依赖版本见 requirements.txt：mmcv 需要与 torch/CUDA 版本严格匹配的预编译
+# wheel，只能由 install.sh 从 OpenMMLab 源安装，无法通过 PyPI 依赖解析得到，
+# 因此这里不声明 dependencies，避免安装本包时触发一次错误的依赖求解。
+
+[project.scripts]
+swim-analyse = "swim_analyse.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
