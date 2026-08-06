@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>swim_6cam_analyse 计算链路说明</title>
+
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['\\(', '\\)']],
+    displayMath: [['\\[', '\\]']],
+    processEscapes: true
+  },
+  options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+};
+</script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+
+<style>
+:root{
+  --bg:#0f1420; --panel:#182031; --panel2:#1f2940; --line:#2e3b57;
+  --fg:#e8edf7; --fg2:#a8b6d1; --fg3:#7d8dab;
+  --s1:#3b82f6; --s2:#a855f7; --s3:#10b981; --s4:#ef4444;
+  --s1d:#1e40af; --s2d:#6b21a8; --s4d:#991b1b;
+  --warn:#fbbf24; --ok:#34d399; --info:#38bdf8;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg);
+  font:16px/1.75 -apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;
+  padding:32px 20px 80px;
+}
+.wrap{max-width:1180px;margin:0 auto}
+
+h1{font-size:30px;line-height:1.35;margin:0 0 12px;letter-spacing:.5px}
+h2{font-size:23px;margin:56px 0 18px;padding-bottom:10px;border-bottom:2px solid var(--line)}
+h3{font-size:18px;margin:30px 0 12px;color:var(--info)}
+h4{font-size:16px;margin:20px 0 8px;color:var(--fg2)}
+p{margin:12px 0}
+code{
+  background:#0b1020;color:#8fd6ff;padding:2px 6px;border-radius:4px;
+  font:13px/1.5 "SFMono-Regular",Consolas,Menlo,monospace;
+  word-break:break-all;
+}
+a{color:var(--info)}
+
+.lede{
+  font-size:17px;color:var(--fg2);background:var(--panel);
+  border-left:4px solid var(--s2);border-radius:0 10px 10px 0;
+  padding:16px 20px;margin:0 0 8px;
+}
+
+/* ── 卡片与栅格 ─────────────────────────────────────────── */
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:18px 22px;margin:18px 0;min-height:0;overflow-wrap:break-word;
+}
+.grid{display:grid;gap:16px;margin:18px 0}
+.g2{grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(min(100%,215px),1fr))}
+.grid>*{min-width:0}
+
+/* 阶段色条 */
+.st1{border-top:4px solid var(--s1)}
+.st2{border-top:4px solid var(--s2)}
+.st3{border-top:4px solid var(--s3)}
+.st4{border-top:4px solid var(--s4)}
+
+.tag{
+  display:inline-block;font-size:12px;font-weight:700;letter-spacing:.4px;
+  padding:2px 9px;border-radius:20px;margin-right:8px;vertical-align:2px;
+}
+.t1{background:var(--s1d);color:#cfe0ff}
+.t2{background:var(--s2d);color:#eddcff}
+.t3{background:#065f46;color:#c7f5e4}
+.t4{background:var(--s4d);color:#ffd8d8}
+
+.hint{
+  font-size:14px;color:var(--fg3);background:#131a29;
+  border-left:3px solid var(--s3);border-radius:0 8px 8px 0;
+  padding:9px 14px;margin:10px 0;
+}
+.hint b{color:var(--ok)}
+
+.note{font-size:14px;color:var(--fg3);margin:8px 0}
+
+.mark{
+  display:inline-block;font-size:12px;font-weight:700;padding:1px 7px;
+  border-radius:4px;margin:0 3px;white-space:nowrap;
+}
+.m-inf{background:#3f2d00;color:var(--warn);border:1px solid #6b4c00}
+.m-tbc{background:#3a1414;color:#fca5a5;border:1px solid #7f1d1d}
+
+/* ── 表格 ───────────────────────────────────────────────── */
+.tw{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:10px;max-width:100%}
+table{border-collapse:collapse;width:100%;min-width:400px;font-size:14.5px}
+.card .tw table{min-width:0}
+th,td{padding:10px 13px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--panel2);color:var(--fg);font-weight:700}
+tr:last-child td{border-bottom:none}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+tbody tr:hover{background:#1b2436}
+
+/* 占比条 */
+.bar{position:relative;height:20px;background:#0b1020;border-radius:4px;min-width:90px;overflow:hidden}
+.bar>span{position:absolute;left:0;top:0;bottom:0;border-radius:4px;z-index:1}
+.bar>em{
+  position:absolute;right:6px;top:0;line-height:20px;font-size:12px;
+  font-style:normal;color:var(--fg);z-index:2;
+}
+
+/* ── 图示容器 ───────────────────────────────────────────── */
+.figure{
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:20px;margin:22px 0;overflow-x:auto;min-height:0;
+}
+.figure .mermaid{display:flex;justify-content:center;min-width:0}
+.figure svg{max-width:100%;height:auto}
+/* 手写 SVG 内含大量小字，窄屏下整体缩放会不可读：设最小宽度改为横向滚动 */
+.figure svg.wide{min-width:880px}
+.scrollnote{
+  display:none;font-size:12.5px;color:var(--warn);margin:0 0 8px;
+}
+@media (max-width:940px){ .scrollnote{display:block} }
+.cap{
+  font-size:13.5px;color:var(--fg3);margin-top:14px;padding-top:12px;
+  border-top:1px dashed var(--line);line-height:1.7;
+}
+.cap b{color:var(--fg2)}
+
+/* 图例 */
+.legend{display:flex;flex-wrap:wrap;gap:8px 20px;margin:12px 0 0;font-size:13.5px;color:var(--fg2)}
+.legend i{display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px}
+
+ul,ol{margin:12px 0;padding-left:24px}
+li{margin:7px 0}
+.kv{list-style:none;padding:0}
+.kv li{padding-left:0}
+.kv b{color:var(--info);font-weight:600}
+
+/* 独立公式过宽时横向滚动，不撑破容器 */
+mjx-container[display="true"]{overflow-x:auto;overflow-y:hidden;max-width:100%;padding:4px 0}
+
+.big{font-size:26px;font-weight:700;line-height:1.2}
+.big small{display:block;font-size:13px;font-weight:400;color:var(--fg3);margin-top:5px}
+
+@media (max-width:860px){
+  body{padding:22px 14px 60px;font-size:15px}
+  h1{font-size:24px} h2{font-size:20px} h3{font-size:17px}
+  .card{padding:15px 16px}
+  .g2,.g3,.g4{grid-template-columns:1fr}
+  .figure{padding:14px}
+  .big{font-size:22px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>swim_6cam_analyse：六路相机游泳分析计算链路</h1>
+
+<p class="lede">
+六机位拍摄的泳池被拼成一张全景画布：<b>在画布上做检测与跟踪</b>（视野全、ID 连续），
+再用泳池的三角网格把每个人的框<b>映射回拍得最清楚的那路原始相机</b>去回归 17 个关键点，
+最后由关键点时序算出划水次数、由框中心轨迹算出速度，叠回画布输出标注视频。
+</p>
+
+<div class="grid g4">
+  <div class="card st1"><div class="big">3000 帧<small>100 秒 · 5002×2102 画布</small></div></div>
+  <div class="card st2"><div class="big">57 827 人次<small>平均 19.3 人/帧 · 81 个 track</small></div></div>
+  <div class="card st3"><div class="big">999 次<small>划水合计 · 58 人有计数</small></div></div>
+  <div class="card st4"><div class="big">21.5 分钟<small>端到端 · 单张 H800</small></div></div>
+</div>
+
+<p class="note">
+本页所有数字均来自这一次 3000 帧全量运行的实测日志与缓存统计。凡是推断而非实测的结论都标了
+<span class="mark m-inf">推断</span>，尚未验证的标 <span class="mark m-tbc">待确认</span>。
+</p>
+
+
+<h2>一、先回答几个问题</h2>
+
+<div class="grid g2">
+
+<div class="card">
+<h3>RTMPose 是什么？是微调模型吗？</h3>
+<p>
+RTMPose 是 <b>top-down（自上而下）单人关键点回归</b>模型：它<b>不做人体检测</b>，
+只接受外部给定的人体框，输出该框内 17 个 COCO 关键点的坐标与置信度。
+本项目用的是 <code>rtmpose-m</code>（13.6 M 参数：CSPNeXt 主干 12.3 M + RTMCC 头 1.3 M）。
+</p>
+<p><b>本项目的权重是微调后的</b>，不是官方通用权重：</p>
+<ul class="kv">
+  <li><b>起点</b>：官方 COCO 预训练 <code>rtmpose-m_simcc-coco_pt-aic-coco_420e-256x192</code></li>
+  <li><b>微调数据</b>：游泳场景自建集，train 2501 图 / 26313 个人体标注，val 1072 图 / 11293 标注</li>
+  <li><b>交付权重</b>：epoch 95（第 3990 iter），保存于 20260801</li>
+</ul>
+<div class="hint"><b>直觉</b>：把"能认出常见姿态的人"，在俯视、半身没水、有水花的游泳画面上再教一遍。</div>
+
+<h4>三个和本项目直接相关的特色</h4>
+<ul>
+  <li><b>原生接受 bbox 批量输入</b>。<code>inference_topdown(model, img, bboxes)</code> 可以一次传入
+      同一张图上的多个框，模型内部自己按每个框做仿射采样到 192×256 再批量前向。
+      不需要像检测+关键点一体的 YOLO-Pose 那样先手动裁出小图再拼 batch——
+      这正是本链路"按 (帧, 相机) 分组批量推理"能成立的前提。</li>
+  <li><b>SimCC 坐标分类解码</b>。关键点位置用离散概率分布表示
+      （配置：<code>SimCCLabel</code>，<code>simcc_split_ratio = 2.0</code>），
+      而非直接回归浮点坐标。</li>
+  <li><b>框由外部给定，不存在"检测不到人"</b>。所以每个输入框必有一组输出，
+      代码里无需处理返回空的分支——质量差只体现为置信度低。</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>mesh 几何：合成图的网格还是原相机的网格？</h3>
+<p><b>两者都是——同一批三角形同时带着两套坐标，这正是它能做映射的原因。</b></p>
+<p>
+<code>configs/pool_mesh.json</code> 里共 1040 个三角形，按相机分为 6 组
+（依次 160 / 190 / 170 / 160 / 190 / 170 个）。每个三角形的 3 个顶点各有两个字段：
+</p>
+<ul class="kv">
+  <li><b>pos</b> — 2D 世界坐标（米）。决定这块面片在<b>拼接画布</b>上的位置。</li>
+  <li><b>uv</b> — 纹理坐标 \([0,1]^2\)。决定它取自<b>该路原始相机</b>图像的哪一块。</li>
+</ul>
+<p>
+一对 (pos, uv) 三角形就唯一确定一个仿射变换。所以 mesh 既是画布的网格、也是原相机的网格，
+它是<b>两个坐标系之间的一张缝合表</b>。
+</p>
+<div class="hint"><b>直觉</b>：像贴瓷砖。<code>pos</code> 说这块瓷砖贴在墙上哪里，<code>uv</code> 说它的花纹从哪张照片上剪下来。</div>
+<p class="note">
+实测尺度自洽：mesh 世界范围 50.0 m × 21.0 m，乘 <code>--ppm 100</code>（100 像素/米）得 5000×2100 px，
+与拼接视频实际的 5002×2102 一致。
+</p>
+</div>
+
+<div class="card">
+<h3>YOLO 检测的是原图还是合成图？为什么还要回原图？</h3>
+<p><b>YOLO 只在合成图（拼接画布）上跑。</b>关键点才回原图。这个分工是刻意的：</p>
+<div class="tw">
+<table>
+<thead><tr><th>任务</th><th>在哪做</th><th>为什么</th></tr></thead>
+<tbody>
+<tr><td>检测 + 跟踪</td><td>拼接画布</td>
+    <td>一个全局视野，ID 天然跨相机连续；无需处理六路之间同一个人的重复检测与边界交接</td></tr>
+<tr><td>关键点回归</td><td>原始相机</td>
+    <td>画布是六路 4K 重采样贴合的产物，单人在画布上偏小；回原图能拿到更高的有效分辨率</td></tr>
+</tbody>
+</table>
+</div>
+<p><b>实测的分辨率增益</b>（对 3000 帧按每 100 帧抽样、共 563 个框统计中位数）：</p>
+<ul class="kv">
+  <li>画布上人体框：<b>225 × 83 px</b>，面积中位 17 968</li>
+  <li>映射到最清晰相机后：<b>365 × 85 px</b>，面积中位 30 580</li>
+  <li>→ 面积放大 <b>1.7 倍</b>，线性尺寸约 <b>1.62 倍</b></li>
+</ul>
+<p>
+增益主要在水平方向。原因是拼接时沿泳道方向做了较强的压缩重采样，垂直方向压缩很小。
+RTMPose 输入是 192×256，画布上 225×83 的框被拉到该尺寸时纵向要放大约 3 倍，
+回原图后这个放大倍数明显降低。
+</p>
+<div class="hint"><b>直觉</b>：用广角合影找人，再翻出那个人的单人特写看清手臂。</div>
+</div>
+
+<div class="card">
+<h3>"投影面积排序"是 2 挑 1 吗？</h3>
+<p><b>不是。是 N 挑 1（N 随位置变化），外加一次条件性的"退而求其次"。</b></p>
+<p>流程分两步：</p>
+<ol>
+  <li><b>排序</b>：把画布框投到全部 6 路相机，凡是能投出结果的都算出投影面积，
+      <b>按面积从大到小排序</b>。面积越大 ≈ 该相机看这个人越"占像素"≈ 越清晰。</li>
+  <li><b>取第一名</b>，进入批量推理。</li>
+  <li><b>仅当</b>该目标 17 个关键点的<b>平均置信度低于阈值</b>
+      （<code>--kpt-thr</code>，默认 0.4）时，才用<b>第二名</b>相机对这个人单独再推一次；
+      新结果达标就换用它（坐标系一并切换），否则保留原结果。<b>只补检一次，不再往下扩展。</b></li>
+</ol>
+<p><b>实测候选数分布</b>（同上 563 个框）：</p>
+<div class="tw">
+<table>
+<thead><tr><th>可见相机数</th><th class="num">框数</th><th class="num">占比</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>1 路</td><td class="num">481</td><td class="num">85.4%</td><td>只有唯一选择，无从排序，也无从补检</td></tr>
+<tr><td>2 路</td><td class="num">81</td><td class="num">14.4%</td><td>真正的"2 挑 1"，可补检</td></tr>
+<tr><td>3 路</td><td class="num">1</td><td class="num">0.2%</td><td>相机重叠区</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+所以绝大多数框根本没有第二选择——相机视野基本不重叠，只有交界带有冗余。
+这与补检的实际触发量吻合：3000 帧共 <b>143 次补检成功</b>，Stage2 里只占 <b>25.5 s（4%）</b>。
+</p>
+</div>
+
+</div>
+
+<div class="card">
+<h3>插值插的是什么？</h3>
+<p>
+插的是<b>单个关键点在时间轴上的坐标</b>，不是补帧、也不是补人。
+函数 <code>interpolate_keypoints</code> 对每个 track、每个关键点通道<b>独立</b>处理：
+</p>
+<ul>
+  <li><b>输入</b>：该目标每一帧的 17 个点坐标与置信度。</li>
+  <li><b>被插的对象</b>：置信度低于 <code>KPT_THR = 0.4</code> 的点（水花遮挡、肢体入水、画面边缘裁切都会导致）。</li>
+  <li><b>怎么插</b>：用该关键点<b>前后可靠帧</b>的坐标做线性插值。</li>
+  <li><b>边界规则</b>：只在该点首个与末个可靠帧<b>之间</b>插，<b>不做端点外推</b>。</li>
+  <li><b>关键设计</b>：插出来的点<b>置信度写 0</b>。</li>
+</ul>
+<div class="hint">
+<b>为什么置信度写 0 很重要</b>：下游"按置信度过滤"的逻辑因此会自动把插值点排除在信号计算和骨架绘制之外，
+不需要额外传一个 mask。骨架绘制时连线两端任一点不可用就整段不画，
+所以长距离缺失区间不会被连出一条贯穿画面的错误线段。坐标仍被保留，供需要连续轨迹的场合使用。
+</div>
+<p class="note">
+帧集合不增不减：插值前后每个 track 的帧号完全相同（单元测试对此有断言）。
+</p>
+</div>
+
+
+<h2>二、完整链路</h2>
+
+<h3>总览：四个阶段与数据流</h3>
+
+<div class="figure">
+<div class="mermaid">
+flowchart TB
+  IN["<b>拼接全景视频</b><br/>5002×2102 · 3000 帧"]:::io
+  S1["<b>Stage1</b>　画布坐标　146 s<br/>YOLO 检测 → 包含率去重 → IoU 贪心跟踪"]:::s1
+  BOX[("<b>all_boxes</b>　帧 → (tid, 框, conf)<br/>57 827 人次 · 81 个 track")]:::data
+  S2["<b>Stage2</b>　相机坐标　683 s<br/>mesh 选最清晰相机 → 按 (帧,相机) 分组<br/>→ RTMPose 批量回归 17 关键点 → 条件补检"]:::s2
+  RAW[("<b>raw_seq</b>　tid → (帧, kpts 17×2, scores 17, cam)")]:::data
+  S3["<b>Stage3</b>　CPU　&lt; 1 s<br/>关键点插值 → 肘角度波谷 → 逐帧累计次数<br/>框中心轨迹 → 瞬时速度"]:::s3
+  S4["<b>Stage4</b>　画布坐标　463 s<br/>关键点反投影回画布 → 叠加框/标签/骨架 → 编码"]:::s4
+  OUT1["result.json　signal_plots/"]:::io
+  OUT2["annotated.mp4　3.6 GB"]:::io
+
+  CAM["六路原始相机<br/>3840×2160"]:::io
+  MESH["pool_mesh.json<br/>1040 个三角形<br/>每顶点带 pos + uv"]:::cfg
+  CACHE[["cache.pkl · 20 MB"]]:::cache
+
+  IN --> S1 --> BOX --> S2 --> RAW --> S3 --> S4
+  S3 --> OUT1
+  S4 --> OUT2
+  CAM -.-> S2
+  MESH -.-> S2
+  MESH -.-> S4
+  IN -.-> S4
+  BOX ==>|"速度：不经过 mesh"| S3
+  BOX -.-> CACHE
+  RAW -.-> CACHE
+  CACHE -.->|"存在则跳过 Stage1+2"| S3
+
+  classDef s1 fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#e8f0ff
+  classDef s2 fill:#5b21b6,stroke:#a855f7,stroke-width:2px,color:#f5eaff
+  classDef s3 fill:#065f46,stroke:#10b981,stroke-width:2px,color:#e0fff5
+  classDef s4 fill:#991b1b,stroke:#ef4444,stroke-width:2px,color:#ffeaea
+  classDef data fill:#0b1020,stroke:#64748b,stroke-width:2px,color:#cbd5e1
+  classDef cache fill:#3f2d00,stroke:#fbbf24,stroke-width:2px,color:#fde68a
+  classDef io fill:#111827,stroke:#94a3b8,stroke-width:1.5px,color:#e2e8f0
+  classDef cfg fill:#1f2937,stroke:#94a3b8,stroke-dasharray:4 3,color:#e2e8f0
+</div>
+<div class="legend">
+  <span><i style="background:#1e3a8a;border:2px solid #3b82f6"></i>Stage1 检测跟踪</span>
+  <span><i style="background:#5b21b6;border:2px solid #a855f7"></i>Stage2 关键点</span>
+  <span><i style="background:#065f46;border:2px solid #10b981"></i>Stage3 指标</span>
+  <span><i style="background:#991b1b;border:2px solid #ef4444"></i>Stage4 渲染</span>
+  <span><i style="background:#0b1020;border:2px solid #64748b"></i>中间数据</span>
+  <span><i style="background:#3f2d00;border:2px solid #fbbf24"></i>磁盘缓存</span>
+  <span><i style="background:#111827;border:1.5px solid #94a3b8"></i>输入/输出</span>
+  <span><i style="background:#1f2937;border:2px dashed #94a3b8"></i>标定配置</span>
+</div>
+<div class="cap">
+<b>箭头</b>：细实线 = 主数据流；<b>粗箭头</b> = 速度的独立支线；虚线 = 辅助输入或落盘复用。
+<b>两处坐标系切换</b>：Stage2 开头由 mesh 把画布坐标转成相机坐标（正向），
+Stage4 开头再反向转回（<code>source → canvas</code>）。
+<b>速度那条粗箭头是重点</b>：它直接取 <code>all_boxes</code> 的画布坐标，<b>完全不经过 mesh</b>——
+画布本身等比米制，像素距离除以 ppm 即得米，因此速度不受反投影失败或抖动影响。
+阶段方框内标注的是本次 3000 帧实测耗时。
+</div>
+</div>
+
+<h3>Stage2 内部：选相机、分组、批量推理、条件补检</h3>
+
+<div class="figure">
+<div class="mermaid">
+flowchart TB
+  A["本帧所有画布框<br/>平均 19.3 个"]:::data
+  B["rank_cameras<br/>每框投到 6 路相机，12 个边缘采样点<br/>按投影面积降序排列"]:::s2
+  C["取第一名相机<br/>85.4% 的框只有 1 个候选"]:::s2
+  D["按相机分组<br/>平均 4.65 组/帧 · 4.15 框/组"]:::s2
+  E["读该相机第 fi 帧 4K 图<br/>MultiVideoReader 帧缓存去重"]:::io2
+  F["RTMPose inference_topdown<br/>整帧 + 一批 bbox → 17 关键点"]:::s2
+  G{"17 点平均置信度<br/>≥ kpt-thr 0.4 ?"}:::dec
+  H["写入 raw_seq"]:::data
+  I["取第二名相机<br/>对该目标单独重推一次"]:::retry
+  J{"新结果<br/>≥ 0.4 ?"}:::dec
+  K["换用新结果<br/>坐标系一并切换<br/>全程成功 143 次"]:::retry
+  L["保留原结果<br/>低置信度点下游自动过滤"]:::retry
+
+  A --> B --> C --> D --> E --> F --> G
+  G -- 是 --> H
+  G -- 否 --> I --> J
+  J -- 是 --> K --> H
+  J -- 否 --> L --> H
+
+  classDef s2 fill:#5b21b6,stroke:#a855f7,stroke-width:2px,color:#f5eaff
+  classDef retry fill:#78350f,stroke:#f59e0b,stroke-width:2px,color:#fef3c7
+  classDef data fill:#0b1020,stroke:#64748b,stroke-width:2px,color:#cbd5e1
+  classDef io2 fill:#111827,stroke:#94a3b8,stroke-width:1.5px,color:#e2e8f0
+  classDef dec fill:#334155,stroke:#94a3b8,stroke-width:2px,color:#f1f5f9
+</div>
+<div class="legend">
+  <span><i style="background:#5b21b6;border:2px solid #a855f7"></i>主路径</span>
+  <span><i style="background:#78350f;border:2px solid #f59e0b"></i>补检路径（仅 4% 耗时）</span>
+  <span><i style="background:#334155;border:2px solid #94a3b8"></i>判断分支</span>
+  <span><i style="background:#111827;border:1.5px solid #94a3b8"></i>视频读取</span>
+  <span><i style="background:#0b1020;border:2px solid #64748b"></i>数据</span>
+</div>
+<div class="cap">
+这是整条链路里<b>唯一的分支判断</b>。橙色补检路径虽然逻辑上占了图的一半，
+实际只消耗 Stage2 的 4% 耗时——因为 85.4% 的框根本没有第二个候选相机。
+<b>分组是效率关键</b>：19.3 个框合并成约 4.65 次推理调用，而不是 19.3 次。
+</div>
+</div>
+
+<h3>坐标系与 mesh 的双向映射</h3>
+
+<div class="figure">
+<p class="scrollnote">← 图较宽，可横向滑动查看 →</p>
+<svg class="wide" viewBox="0 0 1100 400" width="100%" role="img" aria-label="mesh 双向映射示意图">
+  <defs>
+    <marker id="ar" markerWidth="11" markerHeight="8" refX="10" refY="4" orient="auto">
+      <path d="M0,0 L11,4 L0,8 Z" fill="#a855f7"/>
+    </marker>
+    <marker id="ar2" markerWidth="11" markerHeight="8" refX="10" refY="4" orient="auto">
+      <path d="M0,0 L11,4 L0,8 Z" fill="#ef4444"/>
+    </marker>
+  </defs>
+
+  <!-- 左：拼接画布 -->
+  <rect x="30" y="60" width="380" height="200" rx="8" fill="#182031" stroke="#3b82f6" stroke-width="2"/>
+  <text x="220" y="45" fill="#e8edf7" font-size="17" font-weight="700" text-anchor="middle">拼接画布 canvas</text>
+  <text x="220" y="284" fill="#7d8dab" font-size="13" text-anchor="middle">5002 × 2102 px　=　50.0 m × 21.0 m × ppm 100</text>
+  <!-- 画布上的三角面片（由 pos 决定位置） -->
+  <polygon points="70,110 190,110 190,190" fill="#1e3a8a" fill-opacity="0.55" stroke="#3b82f6" stroke-width="1.5"/>
+  <polygon points="70,110 190,190 70,190" fill="#1e3a8a" fill-opacity="0.3" stroke="#3b82f6" stroke-width="1.5"/>
+  <polygon points="200,110 320,110 320,190" fill="#1e3a8a" fill-opacity="0.55" stroke="#3b82f6" stroke-width="1.5"/>
+  <polygon points="200,110 320,190 200,190" fill="#1e3a8a" fill-opacity="0.3" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="130" y="103" fill="#93b4ff" font-size="11" text-anchor="middle">pos (米)</text>
+  <!-- 人体框 -->
+  <rect x="120" y="145" width="95" height="30" fill="none" stroke="#fbbf24" stroke-width="2.5"/>
+  <text x="167" y="139" fill="#fbbf24" font-size="12" text-anchor="middle" font-weight="700">225×83</text>
+  <text x="220" y="232" fill="#a8b6d1" font-size="13" text-anchor="middle">YOLO 检测 + 跟踪在此进行</text>
+
+  <!-- 右：原始相机 -->
+  <rect x="690" y="60" width="380" height="200" rx="8" fill="#182031" stroke="#a855f7" stroke-width="2"/>
+  <text x="880" y="45" fill="#e8edf7" font-size="17" font-weight="700" text-anchor="middle">原始相机 source</text>
+  <text x="880" y="284" fill="#7d8dab" font-size="13" text-anchor="middle">3840 × 2160 px　（uv × 纹理尺寸）</text>
+  <polygon points="730,105 860,120 850,200" fill="#5b21b6" fill-opacity="0.55" stroke="#a855f7" stroke-width="1.5"/>
+  <polygon points="730,105 850,200 725,190" fill="#5b21b6" fill-opacity="0.3" stroke="#a855f7" stroke-width="1.5"/>
+  <polygon points="880,122 1010,110 1015,195" fill="#5b21b6" fill-opacity="0.55" stroke="#a855f7" stroke-width="1.5"/>
+  <polygon points="880,122 1015,195 885,202" fill="#5b21b6" fill-opacity="0.3" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="795" y="98" fill="#ddb4ff" font-size="11" text-anchor="middle">uv × 纹理尺寸</text>
+  <rect x="775" y="140" width="150" height="32" fill="none" stroke="#fbbf24" stroke-width="2.5"/>
+  <text x="850" y="134" fill="#fbbf24" font-size="12" text-anchor="middle" font-weight="700">365×85</text>
+  <text x="880" y="232" fill="#a8b6d1" font-size="13" text-anchor="middle">RTMPose 关键点在此进行</text>
+
+  <!-- 中间箭头 -->
+  <path d="M415,120 L685,120" stroke="#a855f7" stroke-width="3" fill="none" marker-end="url(#ar)"/>
+  <text x="550" y="110" fill="#c9a2ff" font-size="14" text-anchor="middle" font-weight="700">Stage2　canvas → source</text>
+  <text x="550" y="147" fill="#a8b6d1" font-size="12.5" text-anchor="middle">框的 12 个边缘采样点各查所属三角形</text>
+  <text x="550" y="165" fill="#a8b6d1" font-size="12.5" text-anchor="middle">经该三角形仿射 M，取包围盒</text>
+
+  <path d="M685,215 L415,215" stroke="#ef4444" stroke-width="3" fill="none" marker-end="url(#ar2)"/>
+  <text x="550" y="205" fill="#ff9d9d" font-size="14" text-anchor="middle" font-weight="700">Stage4　source → canvas</text>
+  <text x="550" y="240" fill="#a8b6d1" font-size="12.5" text-anchor="middle">17 个关键点各查所属三角形</text>
+  <text x="550" y="258" fill="#a8b6d1" font-size="12.5" text-anchor="middle">经预算的逆仿射 M⁻¹ 变回画布</text>
+
+  <!-- 底部说明条 -->
+  <rect x="30" y="315" width="1040" height="65" rx="8" fill="#131a29" stroke="#2e3b57" stroke-width="1.5"/>
+  <text x="50" y="340" fill="#34d399" font-size="13.5" font-weight="700">同一个三角形，两套坐标：</text>
+  <text x="50" y="362" fill="#a8b6d1" font-size="13">
+    顶点的 pos 决定它贴在画布哪里（蓝），顶点的 uv 决定它取自相机图哪里（紫）——一对三角形唯一确定一个仿射变换 M，反向即 M⁻¹。
+  </text>
+</svg>
+<div class="cap">
+<b>颜色</b>：蓝 = 画布坐标系及其三角面片；紫 = 相机坐标系及其三角面片；黄框 = 同一个人体框在两个坐标系下的样子；
+紫箭头 = Stage2 的正向映射；红箭头 = Stage4 的反向映射。
+<b>三角形形状不同</b>是刻意画的：同一块面片在画布上是规整矩形网格，投到相机里因透视而变形——这正是仿射变换要表达的东西。
+框的尺寸标注用的是实测中位值。
+</div>
+</div>
+
+
+<h2>三、关键公式</h2>
+
+<div class="card">
+<h3>1. mesh 仿射映射</h3>
+<p>
+设某三角形在画布上的三个顶点为 \(\mathbf{d}_1,\mathbf{d}_2,\mathbf{d}_3\)（由 <code>pos</code> 换算），
+在相机图上对应 \(\mathbf{s}_1,\mathbf{s}_2,\mathbf{s}_3\)（由 <code>uv</code> 换算）。
+画布顶点由世界坐标得来：
+</p>
+\[
+\mathbf{d}_i=\Big(\,(x_i-x_{\min})\cdot \mathrm{ppm}\;,\;\; H-1-(y_i-y_{\min})\cdot \mathrm{ppm}\,\Big)
+\]
+<p>
+其中 \(H\) 是画布高度、\(\mathrm{ppm}\) 是每米像素数（本项目 100）；纵向取反是因为图像
+\(y\) 轴向下而世界 \(y\) 轴向上。相机顶点由纹理坐标得来（\(W_t,H_t\) 为该相机分辨率）：
+</p>
+\[
+\mathbf{s}_i=\big(u_i\,W_t\;,\;(1-v_i)\,H_t\big)
+\]
+<p>三点对三点唯一确定仿射矩阵 \(M\in\mathbb{R}^{2\times3}\)，满足</p>
+\[
+\mathbf{s}_i = M\begin{bmatrix}\mathbf{d}_i-\mathbf{o}\\ 1\end{bmatrix},\qquad i=1,2,3
+\]
+<p>
+\(\mathbf{o}\) 是该三角形画布包围盒的左上角（把定义域平移到局部原点，数值上更稳）。
+于是双向映射为：
+</p>
+\[
+\text{正向：}\;\; \mathbf{s}=M\begin{bmatrix}\mathbf{c}-\mathbf{o}\\1\end{bmatrix}
+\qquad\qquad
+\text{反向：}\;\; \mathbf{c}=M^{-1}\begin{bmatrix}\mathbf{s}\\1\end{bmatrix}+\mathbf{o}
+\]
+<div class="hint">
+<b>为什么反向需要额外校验</b>：\(M^{-1}\) 对整个平面都有定义，一个相机点可能落在多个三角形的
+<b>外推</b>范围内。所以反向映射后必须用画布侧三角形边界做一次"点是否在三角形内"检查，
+不通过就换下一个候选。落不进任何三角形则返回 <code>NaN</code>，由绘制层跳过。
+</div>
+
+<h4>点在三角形内的判定（重心坐标）</h4>
+<p>对三角形 \((x_1,y_1),(x_2,y_2),(x_3,y_3)\) 与查询点 \((p_x,p_y)\)：</p>
+\[
+D=(x_2-x_1)(y_3-y_1)-(x_3-x_1)(y_2-y_1)
+\]
+\[
+\alpha=\frac{(x_2-p_x)(y_3-p_y)-(x_3-p_x)(y_2-p_y)}{D},\qquad
+\beta=\frac{(x_3-p_x)(y_1-p_y)-(x_1-p_x)(y_3-p_y)}{D}
+\]
+<p>
+当 \(\alpha\ge-\epsilon\)、\(\beta\ge-\epsilon\) 且 \(1-\alpha-\beta\ge-\epsilon\) 时判定在内
+（\(\epsilon=10^{-3}\)，容忍边界与浮点误差）。\(|D|<10^{-9}\) 视为退化三角形直接跳过。
+</p>
+</div>
+
+<div class="card">
+<h3>2. 相机排序准则</h3>
+<p>
+把画布框 \(B\) 的 12 个边缘采样点（四条边各 3 点：两端点 + 中点）逐个投到相机 \(k\)，
+取所有<b>成功投出</b>的点的轴对齐包围盒 \(R_k\)，以其面积作为清晰度代理：
+</p>
+\[
+\mathrm{area}_k=\max(0,\;x^{R_k}_2-x^{R_k}_1)\cdot\max(0,\;y^{R_k}_2-y^{R_k}_1)
+\]
+\[
+k^\star=\arg\max_k \mathrm{area}_k
+\]
+<p>
+一个点都投不出来（该相机看不到这块区域）则该相机不进候选。采样点只取 12 个而非更密，
+是因为这里只要包围盒、不需要精确重建变形四边形，而这个函数会被
+"每帧 × 每目标 × 每候选相机"调用——3000 帧共约 <b>416 万次</b>点查询。
+</p>
+<h4>补检准则</h4>
+\[
+\bar{s}=\frac{1}{17}\sum_{j=1}^{17}s_j \;<\; \tau
+\quad\Longrightarrow\quad \text{用次优相机 } k^{\star\star} \text{ 重推一次}
+\]
+<p>
+\(\tau\) 即 <code>--kpt-thr</code>（默认 0.4）。新结果满足 \(\bar{s}'\ge\tau\) 才替换，
+否则保留原结果——低置信度点在下游会被过滤，不需要引入新的处理分支。
+</p>
+</div>
+
+<div class="card">
+<h3>3. 划水信号：肘角度波谷</h3>
+<p>肩、肘、腕三点构成的夹角（弧度）：</p>
+\[
+\theta_t=\arccos\!\left(
+\frac{(\mathbf{k}^{\text{wrist}}_t-\mathbf{k}^{\text{elbow}}_t)\cdot
+      (\mathbf{k}^{\text{shoulder}}_t-\mathbf{k}^{\text{elbow}}_t)}
+     {\left\|\mathbf{k}^{\text{wrist}}_t-\mathbf{k}^{\text{elbow}}_t\right\|\;
+      \left\|\mathbf{k}^{\text{shoulder}}_t-\mathbf{k}^{\text{elbow}}_t\right\|}
+\right)
+\]
+<p>
+三点中任一置信度低于 \(\tau\) 则该帧记 \(\mathrm{NaN}\)，随后由线性插值填补，再做
+<b>中值滤波（窗 5）→ Savitzky-Golay（窗 11，3 阶）</b>得到平滑信号 \(\tilde\theta\)。
+</p>
+<div class="hint">
+<b>为什么检谷不检峰</b>：波谷是"高肘抓水"，肩肘腕构型立体、夹角对坐标误差不敏感；
+波峰是手臂伸直、三点接近共线，此时 \(\arccos\) 的自变量趋近 \(\pm1\)，
+导数发散，夹角对关键点噪声极其敏感。实现上对信号取负后复用 <code>find_peaks</code>。
+</div>
+
+<h4>局部自适应阈值</h4>
+<p>
+令 \(g=-\tilde\theta\)（取负使谷变峰）。以每点为中心、宽 \(w\) 的截断滑动窗
+\(\mathcal{W}_i\)（\(w=\max(2\cdot\text{distance},\,\mathrm{fps}\times 6\,\text{s})\)）分别给出：
+</p>
+\[
+h_i=\frac{1}{|\mathcal{W}_i|}\sum_{j\in\mathcal{W}_i} g_j
+\qquad\quad
+p_i=0.2\cdot\Big(\max_{j\in\mathcal{W}_i} g_j-\min_{j\in\mathcal{W}_i} g_j\Big)
+\]
+<p>
+\(h_i\) 作为 <code>height</code> 下限、\(p_i\) 作为 <code>prominence</code> 下限逐点比较，
+另加最小间隔约束 \(\text{distance}=\mathrm{fps}\times 0.67\,\text{s}\)。
+</p>
+<div class="hint">
+<b>为什么必须局部</b>：信号常分段呈现不同幅度（动作变化导致后段震荡变浅）。
+用整条信号的全局统计量算阈值会让浅段被<b>系统性整段漏检</b>。
+单元测试里有对照实验：前 8 秒深谷 + 后 8 秒浅谷（幅度 0.15 倍）的合成信号上，
+局部自适应检出深段 8 个 + 浅段 ≥6 个，同参数的全局阈值检出深段 8 个 + <b>浅段 0 个</b>。
+</div>
+
+<h4>左右合并与累计</h4>
+<p>自由泳/仰泳左右手交替，各自计数后取较小值（抗单侧漏检）：</p>
+\[
+N=\min\!\big(|\mathcal{E}_L|,\;|\mathcal{E}_R|\big)
+\qquad\quad
+\mathrm{cum}(t)=\min_{\text{side}}\;\big|\{e\in\mathcal{E}_{\text{side}}: e\le t\}\big|
+\]
+<p>
+其余泳姿双臂同步，左右信号先取均值再统一计数（单序列，\(\min\) 退化为其本身）。
+</p>
+</div>
+
+<div class="card">
+<h3>4. 瞬时速度</h3>
+<p>
+取检测框中心 \(\mathbf{c}_t=\big(\tfrac{x_1+x_2}{2},\tfrac{y_1+y_2}{2}\big)\)（<b>画布坐标</b>）。
+每 \(\Delta t=0.2\,\text{s}\) 输出一个采样点，用最近 \(W=2\,\text{s}\) 窗口内首末两帧的位移：
+</p>
+\[
+v(t)=\frac{\big\|\mathbf{c}_{t_{\text{last}}}-\mathbf{c}_{t_{\text{first}}}\big\|_2}
+          {\mathrm{ppm}\cdot\left(t_{\text{last}}-t_{\text{first}}\right)}
+\qquad
+t_{\text{first}},t_{\text{last}}\in[t-W,\;t]
+\]
+<p>
+采样点之间前向填充（保持上一个值），首个采样点之前为 \(\mathrm{NaN}\)（标签不显示）。
+</p>
+<div class="hint">
+<b>两个设计点</b>。① <b>不经过 mesh</b>：画布是等比米制，像素距离除以 \(\mathrm{ppm}\) 即得米，
+与各点绝对世界坐标原点无关，因此速度完全不依赖反投影，也就不会被反投影失败或抖动污染。
+② <b>用框中心而非鼻子关键点</b>：框中心来自跟踪器输出、帧间连续性好；
+单个关键点的检测噪声会被 \(1/\Delta t\) 直接放大成速度突刺。
+</div>
+<p class="note">实测：3000 帧共 9775 个速度采样点，中位 1.37 m/s，90 分位 1.60 m/s。</p>
+</div>
+
+
+<h2>四、效率：为什么 Stage2 和 Stage4 最慢</h2>
+
+<p>
+一句话：<b>Stage2 慢是因为调用量大</b>（每帧近 5 路 4K 帧解码 + 近 5 次模型推理），
+<b>Stage4 慢的原因完全不同——它 85% 的时间花在视频编码上</b>，跟本项目的算法无关。
+下面逐层拆开。
+</p>
+
+<h3>第一层：四个阶段</h3>
+
+<div class="tw">
+<table>
+<thead><tr>
+  <th>阶段</th><th class="num">耗时</th><th>占比</th><th>主要成本</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td><span class="tag t1">S1</span>检测跟踪</td><td class="num">146 s</td>
+  <td><div class="bar"><span style="width:11%;background:var(--s1)"></span><em>11%</em></div></td>
+  <td>3000 次 5002×2102 整帧 YOLO 前向</td>
+</tr>
+<tr>
+  <td><span class="tag t2">S2</span>关键点</td><td class="num">683 s</td>
+  <td><div class="bar"><span style="width:53%;background:var(--s2)"></span><em>53%</em></div></td>
+  <td>13937 次推理 + 13937 次 4K 帧解码 + 416 万次几何点查询</td>
+</tr>
+<tr>
+  <td><span class="tag t3">S3</span>指标</td><td class="num">&lt; 1 s</td>
+  <td><div class="bar"><span style="width:0.5%;background:var(--s3)"></span><em>~0%</em></div></td>
+  <td>纯 CPU 信号处理，已全部向量化</td>
+</tr>
+<tr>
+  <td><span class="tag t4">S4</span>渲染</td><td class="num">463 s</td>
+  <td><div class="bar"><span style="width:36%;background:var(--s4)"></span><em>36%</em></div></td>
+  <td>3000 帧 5002×2102 mp4v 编码</td>
+</tr>
+<tr>
+  <td colspan="2"><b>合计 ≈ 21.5 分钟</b></td>
+  <td colspan="2">100 秒视频 → 约 <b>13× 实时</b>（单张 H800）</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>第二层：Stage2 细分（来自运行日志内置计时器）</h3>
+
+<div class="grid g2">
+<div class="card st2">
+<div class="tw">
+<table>
+<thead><tr><th>环节</th><th class="num">耗时</th><th>占比</th></tr></thead>
+<tbody>
+<tr><td>inference　RTMPose 推理</td><td class="num">397.8 s</td>
+    <td><div class="bar"><span style="width:58%;background:#a855f7"></span><em>58%</em></div></td></tr>
+<tr><td>video_io　4K 帧解码</td><td class="num">163.0 s</td>
+    <td><div class="bar"><span style="width:24%;background:#7c3aed"></span><em>24%</em></div></td></tr>
+<tr><td>geometry　相机排序</td><td class="num">93.8 s</td>
+    <td><div class="bar"><span style="width:14%;background:#6d28d9"></span><em>14%</em></div></td></tr>
+<tr><td>retry　次优相机补检</td><td class="num">25.5 s</td>
+    <td><div class="bar"><span style="width:4%;background:#5b21b6"></span><em>4%</em></div></td></tr>
+</tbody>
+</table>
+</div>
+<p class="note">
+这个分布是<b>健康</b>的：过半时间在 GPU 推理上，说明几何和 IO 都已不是瓶颈。
+补检只占 4%（3000 帧触发成功 143 次），性价比很高。
+</p>
+</div>
+
+<div class="card st2">
+<h4>调用量级：慢在"次数多"，不在"单次贵"</h4>
+<div class="tw">
+<table>
+<thead><tr><th>项目</th><th class="num">次数</th></tr></thead>
+<tbody>
+<tr><td>帧数</td><td class="num">3 000</td></tr>
+<tr><td>检测框人次（平均 19.3 人/帧）</td><td class="num">57 827</td></tr>
+<tr><td><code>rank_cameras</code> 调用</td><td class="num">57 827</td></tr>
+<tr><td>└ 内含几何点查询（×6 相机 ×12 点）</td><td class="num">4 163 544</td></tr>
+<tr><td><code>inference_topdown</code> 调用</td><td class="num">13 937</td></tr>
+<tr><td>└ 平均 batch 规模</td><td class="num">4.15 框/次</td></tr>
+<tr><td>4K 帧解码（每帧平均 4.65 路）</td><td class="num">13 937</td></tr>
+</tbody>
+</table>
+</div>
+<div class="hint">
+<b>批量分组省下了 76%</b>。若逐人推理需要 57 827 次调用；按 (帧, 相机) 分组后只需 13 937 次。
+每次前向都有固定开销（kernel launch、H2D 搬运、pipeline 构建），
+在每帧 19 人的密集场景下这个开销会被放大 4 倍。
+</div>
+</div>
+</div>
+
+<h3>第三层：单次推理内部（专门测量）</h3>
+
+<div class="grid g2">
+<div class="card">
+<h4>CPU 预处理 vs GPU 前向</h4>
+<p>用 4 个 bbox、重复 20 次、带 <code>cuda.synchronize</code> 的实测：</p>
+<div class="tw">
+<table>
+<thead><tr><th>环节</th><th class="num">耗时</th><th>占比</th></tr></thead>
+<tbody>
+<tr><td>CPU 预处理（仿射采样）</td><td class="num">63.1 ms</td>
+    <td><div class="bar"><span style="width:64%;background:var(--warn)"></span><em>64%</em></div></td></tr>
+<tr><td>GPU 前向</td><td class="num">36.2 ms</td>
+    <td><div class="bar"><span style="width:36%;background:var(--s2)"></span><em>36%</em></div></td></tr>
+</tbody>
+</table>
+</div>
+<div class="hint">
+<b>这是本次分析最反直觉的发现</b>：日志里名为 <code>inference</code> 的 398 秒，
+<b>近三分之二其实花在 CPU 上</b>——把 3840×2160 的整帧按每个 bbox 仿射采样到 192×256，
+且是<b>逐 bbox 串行</b>做的（mmpose 的 <code>Compose</code> 管线逐个处理 data_info）。
+GPU 只做了 36%。
+</div>
+<p class="note">
+<span class="mark m-inf">推断</span> 这意味着堆更强的 GPU 收益有限；
+把预处理并行化或让采样在 GPU 上做，理论上是 Stage2 最大的优化空间。
+<span class="mark m-tbc">待确认</span> 具体可行方案与收益未验证。
+</p>
+</div>
+
+<div class="card">
+<h4>flip_test 的代价</h4>
+<p>配置里 <code>test_cfg=dict(flip_test=True)</code>，即左右翻转推理后取平均。同条件实测：</p>
+<div class="tw">
+<table>
+<thead><tr><th>设置</th><th class="num">单次(4 bbox)</th></tr></thead>
+<tbody>
+<tr><td><code>flip_test=True</code>（当前）</td><td class="num">88.6 ms</td></tr>
+<tr><td><code>flip_test=False</code></td><td class="num">76.2 ms</td></tr>
+<tr><td><b>差值</b></td><td class="num"><b>12.4 ms（14%）</b></td></tr>
+</tbody>
+</table>
+</div>
+<p>
+差距远小于"翻转就是推理两遍"的朴素预期（那应接近 +100% 的 GPU 时间）。
+原因正是上面那条：单次调用的大头是 CPU 预处理，而<b>预处理不随 flip 翻倍</b>，
+翻倍的只是占 36% 的 GPU 前向部分。
+</p>
+<p class="note">
+<span class="mark m-inf">推断</span> 关掉 flip_test 对 Stage2 的 398 秒
+大约能省 14%（约 55 秒），代价是关键点稳定性下降。
+本项目保留了交接版的设定。
+</p>
+</div>
+</div>
+
+<h3>第四层：Stage4 细分（专门测量）</h3>
+
+<div class="card st4">
+<p>用前 300 帧实测，按比例外推到 3000 帧：</p>
+<div class="tw">
+<table>
+<thead><tr>
+  <th>环节</th><th class="num">前 300 帧</th><th>占比</th><th class="num">外推 3000 帧</th><th>做什么</th>
+</tr></thead>
+<tbody>
+<tr><td><b>mp4v 编码</b></td><td class="num">57.0 s</td>
+    <td><div class="bar"><span style="width:85%;background:var(--s4)"></span><em>85%</em></div></td>
+    <td class="num">≈ 570 s</td><td>5002×2102 逐帧压缩写盘（产物 3.6 GB）</td></tr>
+<tr><td>拼接视频解码</td><td class="num">7.1 s</td>
+    <td><div class="bar"><span style="width:11%;background:#dc2626"></span><em>11%</em></div></td>
+    <td class="num">≈ 71 s</td><td>重读一遍全景视频</td></tr>
+<tr><td>绘制（框+标签）</td><td class="num">3.0 s</td>
+    <td><div class="bar"><span style="width:4%;background:#b91c1c"></span><em>4%</em></div></td>
+    <td class="num">≈ 30 s</td><td>OpenCV 画矩形与文字</td></tr>
+</tbody>
+</table>
+</div>
+<div class="hint">
+<b>结论很明确</b>：Stage4 的 463 秒里，<b>绘制只占约 4%</b>。
+它慢不是因为要画多少东西，而是因为要把 3000 帧 5002×2102 的画面用
+CPU 软件编码器压出来。这是纯 IO/编码成本，与本项目的算法完全无关。
+</div>
+<p class="note">
+本次实测的 300 帧合计 67.1 s（外推 671 s）略高于全量实际的 463 s。
+<span class="mark m-inf">推断</span> 差异来自这次测量未启用骨架绘制、
+而全量运行开了 <code>--draw-keypoints</code>，两次运行的 IO 竞争状况也不同；
+但三者的<b>相对占比</b>（编码远大于解码远大于绘制）足以支撑上面的结论。
+</p>
+</div>
+
+<h3>缓存：让 Stage3 的调参不花钱</h3>
+
+<div class="figure">
+<div class="mermaid">
+flowchart LR
+  Q{"output_dir/cache.pkl<br/>存在？"}:::dec
+  Y["跳过 Stage1+2<br/>直接进 Stage3"]:::ok
+  N["跑 Stage1+2<br/>约 829 秒 · 占全程 64%"]:::cost
+  W[("落盘 cache.pkl<br/>20 MB")]:::cache
+  R["Stage3 + Stage4"]:::normal
+
+  Q -- 是 --> Y --> R
+  Q -- 否 --> N --> W --> R
+
+  classDef dec fill:#334155,stroke:#94a3b8,stroke-width:2px,color:#f1f5f9
+  classDef ok fill:#065f46,stroke:#10b981,stroke-width:2px,color:#e0fff5
+  classDef cost fill:#5b21b6,stroke:#a855f7,stroke-width:2px,color:#f5eaff
+  classDef cache fill:#3f2d00,stroke:#fbbf24,stroke-width:2px,color:#fde68a
+  classDef normal fill:#182031,stroke:#64748b,stroke-width:2px,color:#e2e8f0
+</div>
+<div class="cap">
+<b>缓存的内容</b>是 <code>all_boxes</code> 和 <code>raw_seq</code>（外加视频元信息），
+即两个 GPU 阶段的全部产出，20 MB。
+<b>为什么值得</b>：Stage1+2 占全程 64%（829 s），而换划水信号、换泳姿、改置信度阈值、
+改绘制选项都<b>只影响 Stage3/4</b>。有缓存时这些调整的代价从 21.5 分钟降到不足 8 分钟。
+需要重跑推理时删掉该文件即可。
+</div>
+</div>
+
+
+<h2>五、亮点与局限</h2>
+
+<div class="grid g2">
+
+<div class="card">
+<h3>设计亮点</h3>
+<ul>
+  <li><b>检测与关键点分处两个坐标系</b>。画布保证 ID 全局连续，原图保证分辨率
+      （实测框面积 ×1.7），两者的优点都拿到了，代价只是一次 mesh 映射。</li>
+  <li><b>按 (帧, 相机) 分组批量推理</b>。利用 RTMPose 原生接受 bbox 数组的特性，
+      把 57 827 次调用压到 13 937 次，减少 76%。</li>
+  <li><b>网格索引 + 逆矩阵预计算</b>。416 万次点查询若线性扫描 1040 个三角形是
+      43 亿次判定；分桶后只测同格内的少数候选。反向的 \(M^{-1}\) 在构建期一次算好，
+      不逐点求逆。</li>
+  <li><b>帧缓存消除重复解码</b>。补检与调试可视化会重复访问同一 (帧, 相机)，
+      缓存当前帧后 13 937 次解码就是全部，不做第二遍。</li>
+  <li><b>插值点置信度写 0</b>。用已有的置信度过滤链条同时承担"跳过插值点"的职责，
+      不引入并行的 mask 传递路径。</li>
+  <li><b>局部自适应阈值</b>。经合成信号对照验证，可在幅度衰减段避免全局阈值的系统性漏检。</li>
+  <li><b>Stage1+2 落盘</b>。信号调参与渲染选项的迭代不必重跑 GPU。</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>已知局限</h3>
+<ul>
+  <li><b>相机排序在多数情况下无从选择</b>。实测 85.4% 的框只被 1 路相机看到，
+      "排序 + 补检"仅对 14.6% 的框（相机交界带）实际生效。这不是实现问题，
+      是六路相机视野基本不重叠的客观结果。</li>
+  <li><b>Stage2 的大头在 CPU 而非 GPU</b>。单次推理 64% 是逐 bbox 串行的仿射采样。
+      换更强的 GPU 收益有限。</li>
+  <li><b>Stage4 的 85% 是软件视频编码</b>，与算法无关。当前产物 3.6 GB。</li>
+  <li><b>肘角度信号在俯视视角下动态范围很窄</b>。本次全量运行中 81 个目标里
+      23 个划水计数为 0；观察信号图，肘角度长期在接近伸直的区间内小幅抖动
+      （俯视时手臂多数时刻接近伸直，肩肘腕接近共线），波谷本身很浅。
+      这与代码注释中"共线构型对噪声敏感"的判断一致。
+      <span class="mark m-inf">推断</span> 属于视角与数据的固有限制，
+      而非本次重构引入——重构结果与交接原版在同一输入上数值完全一致。
+      <span class="mark m-tbc">待确认</span> 缺少人工标注真值，
+      无法量化召回率，也无法判断 <code>wrist_x_head</code> 明显更低的计数中
+      哪一个更接近真实。</li>
+  <li><b>Stage1 与 Stage2 严格串行</b>。Stage2 只依赖单帧结果，原理上可流水线并行，
+      但跟踪状态必须严格按帧序推进，实现复杂度不低。<span class="mark m-tbc">待确认</span> 未实现。</li>
+</ul>
+</div>
+</div>
+
+<h3>优化空间（按预期收益排序，均未实施）</h3>
+
+<div class="tw">
+<table>
+<thead><tr>
+  <th>方向</th><th class="num">预期收益</th><th>代价 / 风险</th><th>依据</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>Stage4 换硬件编码（如 NVENC）或降码率</td>
+  <td class="num">≈ 数百秒</td>
+  <td>画质或兼容性变化</td>
+  <td>实测编码占 Stage4 的 85%</td>
+</tr>
+<tr>
+  <td>Stage2 预处理并行化 / 采样上 GPU</td>
+  <td class="num"><span class="mark m-tbc">待确认</span></td>
+  <td>需改动 mmpose 调用方式，须重新验证数值一致性</td>
+  <td>实测 CPU 预处理占单次推理 64%</td>
+</tr>
+<tr>
+  <td>关闭 <code>flip_test</code></td>
+  <td class="num">≈ 55 s</td>
+  <td>关键点稳定性下降</td>
+  <td>实测 88.6 → 76.2 ms（−14%）</td>
+</tr>
+<tr>
+  <td>Stage1 / Stage2 流水线并行</td>
+  <td class="num"><span class="mark m-inf">推断</span> 至多省下较短那一段</td>
+  <td>跟踪状态需严格按帧序，实现复杂</td>
+  <td>Stage2 仅依赖单帧结果</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+
+<h2>六、与"直接在画布上做全套"的对比</h2>
+
+<div class="tw">
+<table>
+<thead><tr>
+  <th>维度</th>
+  <th>本方案：画布检测 + 原图关键点</th>
+  <th>朴素方案：全部在画布上做</th>
+</tr></thead>
+<tbody>
+<tr><td>关键点有效分辨率</td>
+    <td>框面积中位 30 580 px²（实测）</td>
+    <td>框面积中位 17 968 px²（实测），约为前者 <b>59%</b></td></tr>
+<tr><td>ID 连续性</td>
+    <td>画布单一视野，天然连续</td>
+    <td>同样连续（也在画布上跟踪）</td></tr>
+<tr><td>额外成本</td>
+    <td>mesh 几何 94 s + 4K 解码 163 s ＝ Stage2 的 38%</td>
+    <td>无</td></tr>
+<tr><td>实现复杂度</td>
+    <td>需要 mesh 标定、双向映射、多路视频帧级随机读取</td>
+    <td>低</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="note">
+另一条<span class="mark m-inf">推断</span>路线是"六路原图各自检测 + 跨相机 ID 关联"：
+分辨率最优，但要额外解决同一个人在相邻相机中的重复检测、边界交接与 ID 融合。
+本方案用一次几何映射换掉了这整类问题。
+<span class="mark m-tbc">待确认</span> 该路线未实现、未评测。
+</p>
+
+<div class="card" style="border-top:4px solid var(--info)">
+<h3>一句话总结</h3>
+<p style="margin:6px 0 0">
+用 mesh 把"看得全"和"看得清"这两件互相冲突的事拆到两个坐标系里各自解决；
+效率上 Stage2 慢在调用量（且其中 CPU 预处理是隐藏大头），
+Stage4 慢在视频编码而非算法；两个 GPU 阶段的结果落盘，让后续所有信号与渲染层面的
+调参都不再需要 GPU。
+</p>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  securityLevel: 'loose',
+  flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis', padding: 14 },
+  themeVariables: {
+    fontSize: '14px',
+    fontFamily: '-apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,sans-serif',
+    background: '#182031',
+    primaryColor: '#1f2940',
+    primaryTextColor: '#e8edf7',
+    lineColor: '#8fa3c8',
+    clusterBkg: '#141c2c',
+    clusterBorder: '#3a4a6b'
+  }
+});
+</script>
+
+
+
+
+
+</div>
+</body>
+</html>
+
