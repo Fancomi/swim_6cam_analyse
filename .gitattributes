@@ -1,2 +1,4 @@
 weights/*.pth filter=lfs diff=lfs merge=lfs -text
 weights/*.pt filter=lfs diff=lfs merge=lfs -text
+weights/plans/*.pth filter=lfs diff=lfs merge=lfs -text
+weights/plans/*.pt filter=lfs diff=lfs merge=lfs -text

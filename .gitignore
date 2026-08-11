@@ -20,3 +20,11 @@ output/
 .vscode/
 .idea/
 .DS_Store
+
+# 实验目录（数据集、训练产物，体积大）
+.exp/
+runs/
+yolo/
+*.pt
+!weights/*.pt
+!weights/plans/*.pt
