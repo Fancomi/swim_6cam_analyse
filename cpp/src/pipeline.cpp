@@ -143,7 +143,9 @@ void Pipeline::infer_loop(FrameSource& src) {
       SWIM_TIME(timers_, "8_frame_d2h");
       if (h_frames_.empty()) {
         frame_bytes_ = size_t(f.w) * f.h * 3;
-        h_frames_.resize(opt_.queue_depth + 1);
+        // 同时被持有的帧数 = 队列容量 + 消费者手上 1 帧 + 生产者正在写 1 帧。
+        // 少一格就会覆写消费者仍在渲染的帧（表现为画面撕裂/混帧）。
+        h_frames_.resize(opt_.queue_depth + 2);
         for (auto& p : h_frames_) p = host_alloc<uint8_t>(frame_bytes_);
       }
       raw.bgr = h_frames_[frame_cursor_];

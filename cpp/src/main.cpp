@@ -30,7 +30,7 @@ cv::Scalar id_color(int id) {           // 与 Python 版同思路：按 id 稳�
 }
 
 struct Args {
-  std::string input, models = "cpp/models", out, json;
+  std::string input, models = "cpp/models", out, json, dump;
   int    max_frames = 0, detect_size = 640, max_persons = kMaxPersons;
   float  conf = 0.25f, kpt_thr = 0.4f, ppm = 100.f;
   bool   draw_kpts = true, show_fps = false, fp32 = false;
@@ -45,6 +45,7 @@ bool parse(int argc, char** argv, Args& a) {
     else if (k == "--models")      a.models = need(i);
     else if (k == "--out")         a.out = need(i);
     else if (k == "--json")        a.json = need(i);
+    else if (k == "--dump")        a.dump = need(i);
     else if (k == "--max-frames")  a.max_frames = std::stoi(need(i));
     else if (k == "--detect-size") a.detect_size = std::stoi(need(i));
     else if (k == "--max-persons") a.max_persons = std::stoi(need(i));
@@ -63,6 +64,7 @@ bool parse(int argc, char** argv, Args& a) {
              "  --models DIR       detect.onnx/pose.onnx 所在目录 (默认 cpp/models)\n"
              "  --out FILE         写出标注视频 (H.264)\n"
              "  --json FILE        写出每个 track 的划水次数与速度\n"
+             "  --dump FILE        逐帧写出每个框(帧号,id,xyxy,conf)，用于与 Python 对照\n"
              "  --max-frames N     只处理前 N 帧\n"
              "  --detect-size N    detect 输入方形边长, 须与 onnx 一致 (默认 640)\n"
              "  --max-persons N    pose 最大人数，显存按此预留 (默认 40)\n"
@@ -158,6 +160,13 @@ int main(int argc, char** argv) try {
   if (opt.need_image)
     writer = std::make_unique<Writer>(a.out, src->width(), src->height(), src->fps());
 
+  // 逐帧 dump：定位框消失发生在哪一层（CSV: frame,id,x1,y1,x2,y2,conf）
+  std::ofstream dump;
+  if (!a.dump.empty()) {
+    dump.open(a.dump);
+    dump << "frame,id,x1,y1,x2,y2,conf\n";
+  }
+
   std::map<int, std::pair<int, float>> summary;   // track -> (划水, 末速)
   int64_t n_person = 0;
   const double t0 = now_ms();
@@ -166,6 +175,10 @@ int main(int argc, char** argv) try {
   pipe.run(*src, [&](const FrameResult& fr) {
     n_person += static_cast<int64_t>(fr.persons.size());
     for (const auto& p : fr.persons) summary[p.track_id] = {p.strokes, p.speed};
+    if (dump.is_open())
+      for (const auto& p : fr.persons)
+        dump << fr.index << ',' << p.track_id << ',' << p.x1 << ',' << p.y1
+             << ',' << p.x2 << ',' << p.y2 << ',' << p.conf << '\n';
 
     if (writer && fr.bgr) {
       cv::Mat img(fr.h, fr.w, CV_8UC3, const_cast<uint8_t*>(fr.bgr));
