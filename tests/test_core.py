@@ -123,7 +123,44 @@ def test_tracker_new_id_after_jump_and_lost_expiry():
     assert tracker.tracks == {}, "超过 max_lost 的 track 应被清除"
 
 
-def test_tracker_matches_two_targets_independently():
+def test_tracker_reuses_id_after_brief_loss():
+    """max_lost 之内的短暂丢检应复用同一 id —— 遮挡场景的核心诉求。"""
+    tracker = SimpleTracker(iou_thresh=0.3, max_lost=5)
+    first = tracker.update([(0, 0, 100, 100, 0.9)])[0][0]
+    for _ in range(3):
+        tracker.update([])                      # 连续 3 帧丢检，未到 max_lost
+    again = tracker.update([(5, 0, 105, 100, 0.9)])[0][0]
+    assert again == first, "丢检未超期时应复用原 id 而非新建"
+
+
+def test_tracker_is_deterministic_under_shuffled_input():
+    """同一序列跑两遍必须得到逐位相同的 id —— C++ 侧要按帧对齐，靠这条守着。"""
+    rng = np.random.default_rng(7)
+    dets = []
+    for fi in range(50):
+        boxes = [(200 * j + 2 * fi, 0, 200 * j + 2 * fi + 100, 100, 0.9)
+                 for j in range(6)]
+        rng.shuffle(boxes)                      # 每帧打乱检测顺序
+        dets.append(boxes)
+
+    def run():
+        t = SimpleTracker()
+        return [[p[0] for p in t.update(list(b))] for b in dets]
+
+    assert run() == run()
+
+
+def test_tracker_tie_break_is_stable():
+    """两个 track 对同一检测框 IoU 完全相等时，配对结果必须可复现。"""
+    def run():
+        t = SimpleTracker(iou_thresh=0.1)
+        t.update([(0, 0, 100, 100, 0.9), (100, 0, 200, 100, 0.9)])
+        return [p[0] for p in t.update([(50, 0, 150, 100, 0.9)])]   # 与两者各半重叠
+    assert run() == run()
+
+
+def test_tracker_matches_by_iou_not_input_order():
+    """检测框顺序打乱时，配对仍应按 IoU 走，且 id 集合不变。"""
     tracker = SimpleTracker()
     a = tracker.update([(0, 0, 100, 100, 0.9), (400, 0, 500, 100, 0.9)])
     b = tracker.update([(410, 0, 510, 100, 0.9), (5, 0, 105, 100, 0.9)])   # 顺序反了

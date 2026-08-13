@@ -76,6 +76,7 @@ class TrtEngine {
   void*                               workspace_      = nullptr;  // engine 工作区
   size_t                              workspace_bytes_ = 0;
   int                                 max_batch_      = 1;
+  int                                 cur_batch_      = 0;   // 0 = 尚未设过形状
 };
 
 }  // namespace swim

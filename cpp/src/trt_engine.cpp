@@ -6,6 +6,13 @@
 #include <cstring>
 #include <fstream>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <process.h>                 // _getpid
+#define SWIM_GETPID _getpid
+#else
+#include <unistd.h>                  // getpid
+#define SWIM_GETPID getpid
+#endif
 
 namespace swim {
 namespace {
@@ -25,7 +32,9 @@ Logger g_logger;
 
 struct FileStamp {
   int64_t mtime = 0, size = 0;
-  bool exists() const { return size >= 0 && mtime != 0; }
+  /// size > 0 是必需的：0 字节的残留 onnx/engine（写盘中断、磁盘满）若被判为
+  /// "存在"，就会跳过友好报错，改在 parse/deserialize 里以晦涩的错误现身。
+  bool exists() const { return size > 0 && mtime != 0; }
 };
 
 FileStamp stamp_of(const std::string& p) {
@@ -105,7 +114,20 @@ void build_engine(const std::string& onnx, const std::string& out,
   SWIM_CHECK(parser->parse(buf.data(), buf.size()), "ONNX 解析失败 " + onnx);
 
   TrtPtr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
-  if (fp16) cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
+  if (fp16) {
+    cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
+  } else {
+    // kFP16 只放开"算子可用 fp16"，权重精度由 ONNX 决定。export_onnx.py 默认
+    // 导 fp16 权重，此时 --fp32 得到的是"fp16 权重跑 fp32 算子"，拿它做精度
+    // 对照会得出错误结论 —— 提示改用 export_onnx.py --fp32 重导。
+    for (int i = 0; i < net->getNbInputs(); ++i)
+      if (net->getInput(i)->getType() == nvinfer1::DataType::kHALF) {
+        printf("[TRT] 提示：--fp32 只影响算子精度，%s 的输入 %s 仍是 fp16 权重。"
+               "要真正的 fp32 请先跑 export_onnx.py --fp32\n",
+               onnx.c_str(), net->getInput(i)->getName());
+        break;
+      }
+  }
 
   if (!dyn_input.empty()) {
     // profile 非法（如 opt > max）时 buildSerializedNetwork 只会返回空指针，
@@ -129,8 +151,10 @@ void build_engine(const std::string& onnx, const std::string& out,
 
   TrtPtr<nvinfer1::IHostMemory> plan(builder->buildSerializedNetwork(*net, *cfg));
   SWIM_CHECK(plan, "engine 构建失败");
-  // 先写临时文件再 rename：中途崩溃/断电不会留下半截 engine 被下次误当缓存
-  const std::string tmp = out + ".tmp";
+  // 先写临时文件再 rename：中途崩溃/断电不会留下半截 engine 被下次误当缓存。
+  // tmp 名带 pid：两个进程同时首次构建同一 engine 时不会互相写坏对方的临时文件
+  // （rename 到同一目标是原子的，谁最后到谁生效，内容一致所以无所谓）。
+  const std::string tmp = out + "." + std::to_string(SWIM_GETPID()) + ".tmp";
   {
     std::ofstream f(tmp, std::ios::binary);
     SWIM_CHECK(f.good(), "无法写入 " + tmp);
@@ -219,7 +243,8 @@ void TrtEngine::init_bindings(int max_batch) {
 
 void TrtEngine::set_batch(int batch) {
   SWIM_CHECK(batch >= 1 && batch <= max_batch_, "batch 超出 profile 范围");
-  if (dyn_input_.empty()) return;
+  if (dyn_input_.empty() || batch == cur_batch_) return;   // 形状未变则无需重设
+  cur_batch_ = batch;
   for (auto& b : bindings_) {
     if (b.name != dyn_input_) continue;
     auto d = b.dims;
@@ -232,6 +257,16 @@ void TrtEngine::set_batch(int batch) {
     b.dims = ctx_->getTensorShape(b.name.c_str());
     b.bytes = volume(b.dims, b.name) *
               elem_size(engine_->getTensorDataType(b.name.c_str()));
+  }
+  // 工作区只按 max_batch 分配一次。实测激活量随 batch 单调（max 是上界），但
+  // 那是观察而非 API 契约 —— 加多 profile 或 weight streaming 后可能不成立，
+  // 故每次改形状后核一次。workspace_bytes_==0 表示还在 init_bindings 里，跳过。
+  if (workspace_bytes_) {
+    const size_t need = ctx_->updateDeviceMemorySizeForShapes();
+    SWIM_CHECK(need <= workspace_bytes_,
+               "batch " + std::to_string(batch) + " 需要工作区 " +
+                   std::to_string(need >> 20) + " MB，超过按最大 batch 预留的 " +
+                   std::to_string(workspace_bytes_ >> 20) + " MB");
   }
 }
 

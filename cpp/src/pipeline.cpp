@@ -66,6 +66,30 @@ Pipeline::Pipeline(const PipelineOptions& opt, double fps)
                           opt_.engine_dir + "/pose.engine", "input",
                           1, std::min(8, P), P, opt_.fp16);
 
+  // 形状契约：kernel 按 CLI/常量写，engine 按 ONNX 分配，两者不校验就会越界。
+  // detect 输入是 ONNX 里写死的静态形状，engine 缓存的身份戳只跟 ONNX 绑定，
+  // 不含 --detect-size —— 所以这里必须当场比对（--detect-size 1280 曾意味着
+  // 往 640² 的缓冲写 1280² 的数据）。
+  const auto& din = det_->input().dims;
+  SWIM_CHECK(din.nbDims == 4 && int(din.d[2]) == opt_.detect_size &&
+                 int(din.d[3]) == opt_.detect_size,
+             "--detect-size " + std::to_string(opt_.detect_size) +
+                 " 与 detect.onnx 的输入 " + std::to_string(din.d[3]) + "x" +
+                 std::to_string(din.d[2]) + " 不一致（改这个参数不会重建 engine，"
+                 "请改传正确的值或重新导出 ONNX）");
+  const auto& dout = det_->output().dims;
+  SWIM_CHECK(dout.nbDims == 3 && int(dout.d[1]) == kMaxDet && int(dout.d[2]) == 6,
+             "detect.onnx 输出应为 [1," + std::to_string(kMaxDet) +
+                 ",6]（max_det 变了就要同步 kMaxDet），实际第 1/2 维为 " +
+                 std::to_string(dout.d[1]) + "/" + std::to_string(dout.d[2]));
+  // simcc_x/simcc_y 靠 IO 索引区分，TRT 未承诺该顺序等于 ONNX 输出顺序；
+  // 两条轴的长度不同（384 vs 512），据此就能确认没被互换
+  SWIM_CHECK(pose_->num_outputs() == 2 &&
+                 int(pose_->output(0).dims.d[2]) == int(kPoseW * kSimccRatio) &&
+                 int(pose_->output(1).dims.d[2]) == int(kPoseH * kSimccRatio),
+             "pose.onnx 的两个输出不是 simcc_x[.,384] + simcc_y[.,512]，"
+             "顺序可能被 TRT 调换，会导致 x/y 轴互换");
+
   // boxes/conf/kpts/scores 连成一块：D2H 从 4 次合成 1 次（约 9 KB，一次就够）
   blob_n_ = size_t(P) * (5 + 3 * kNumKpts);
   d_blob_ = dev_alloc<float>(blob_n_);

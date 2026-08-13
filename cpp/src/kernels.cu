@@ -89,12 +89,17 @@ __global__ void k_crop_affine(const uint8_t* src, int sw, int sh,
   const float* bx = boxes + b * 4;
   float cx, cy, wwin, hwin;
   box_to_window(bx[0], bx[1], bx[2], bx[3], cx, cy, wwin, hwin);
-  // 采样窗左上角 -> 源坐标（窗口尺寸 wwin×hwin 映射到 kPoseW×kPoseH）
-  const float fx = cx - wwin * 0.5f + (px + 0.5f) * wwin / kPoseW;
-  const float fy = cy - hwin * 0.5f + (py + 0.5f) * hwin / kPoseH;
+  // 采样窗 -> 源坐标，用**索引约定**（输出下标 px 直接映射，不加半像素）：
+  // mmpose 的 TopdownAffine 走 cv2.warpAffine，而 warpAffine 就是把整数目标
+  // 下标代进逆矩阵采样。这条也正是 k_simcc_decode 里逆映射的逆，两者严格互逆
+  // （若这里改用半像素约定，窗宽偏离 kPoseW 时会留下 0.5*(wwin/kPoseW-1) 的
+  // 系统性偏移，且与训练时的裁切不一致）。preprocess 那边是 cv2.resize 语义，
+  // 半像素才对 —— 两个 kernel 的约定不同是有意的。
+  const float fx = cx - wwin * 0.5f + px * wwin / kPoseW;
+  const float fy = cy - hwin * 0.5f + py * hwin / kPoseH;
 
   float rgb[3];
-  sample_rgb(src, sw, sh, fx - 0.5f, fy - 0.5f, 0.f, rgb);
+  sample_rgb(src, sw, sh, fx, fy, 0.f, rgb);
   const int plane = kPoseH * kPoseW;
   const int off   = b * 3 * plane + py * kPoseW + px;
 #pragma unroll
@@ -160,16 +165,28 @@ __global__ void k_simcc_decode(const float* sx, const float* sy,
 
 /// end2end 输出 -> 紧凑框数组。名次由"前面通过阈值的个数"决定：无原子操作，
 /// 结果与 det 的原始顺序严格一致（可复现），也天然复刻 Python 的先后语义。
+///
+/// 判据必须与前缀计数完全同式，否则名次与写入不自洽 —— 故抽成 device 函数。
+/// conf > 0 这一条不可省：max_det=300 走的是 topk，真实目标不足时余下槽位是
+/// 极低分候选（常量恰为 0）。--conf 0 合法（validate 允许 [0,1)），若只判
+/// >= thr，300 个空槽会全部"通过"，尾部塞满零面积框：dedup 去不掉（交集/1e-6
+/// 恒为 0），tracker 也永不匹配（并集面积 0 -> IoU 0），于是每帧新建 40 个
+/// track，人次与 summary 单调膨胀。
+__device__ inline bool det_pass(const float* det, int i, float thr) {
+  const float c = det[i * 6 + 4];
+  return c > 0.f && c >= thr;
+}
+
 __global__ void k_filter_boxes(const float* det, int max_det, float thr,
                                Letterbox lb, int sw, int sh, int max_keep,
                                float* boxes, float* conf, int* count) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= max_det) return;
   const float* d = det + i * 6;               // x1,y1,x2,y2,conf,cls
-  const bool pass = d[4] >= thr;
+  const bool pass = det_pass(det, i, thr);
 
   int k = 0;
-  for (int j = 0; j < i; ++j) if (det[j * 6 + 4] >= thr) ++k;
+  for (int j = 0; j < i; ++j) if (det_pass(det, j, thr)) ++k;
   // 末尾线程统一写总数并按预留量夹紧：下游只会看到 <= max_keep，无需再 clamp
   if (i == max_det - 1) *count = min(k + (pass ? 1 : 0), max_keep);
 

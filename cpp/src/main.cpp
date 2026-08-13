@@ -117,7 +117,8 @@ bool parse(int argc, char** argv, Args& a) {
              "                     cpu=强制 OpenCV; nvdec 已废弃，等价 auto)\n"
              "  --no-kpts          不画骨架\n"
              "  --show-fps         实时打印吞吐\n"
-             "  --fp32             engine 用 fp32 (默认 fp16)\n",
+             "  --fp32             engine 算子用 fp32 (默认 fp16)。注意 ONNX 若是\n"
+             "                     fp16 权重导出的，这只放宽算子精度，不等于真 fp32\n",
              kMaxPersons, kMaxPersons, kStrokeTypes);
       return false;
     } else {

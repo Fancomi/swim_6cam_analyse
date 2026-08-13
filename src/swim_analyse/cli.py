@@ -70,7 +70,9 @@ def parse_args(argv=None):
 
     g = p.add_argument_group("检测与跟踪")
     g.add_argument("--conf", type=float, default=0.25)
-    g.add_argument("--iou", type=float, default=0.3, help="检测 NMS 的 IoU")
+    g.add_argument("--iou", type=float, default=0.3,
+                   help="检测 NMS 的 IoU；yolo26 end2end 权重下无效（NMS 已在图内，"
+                        "ultralytics 会短路该参数），仅对传统 NMS 权重生效")
     g.add_argument("--containment", type=float, default=0.7,
                    help="包含率去重阈值：交集/自身面积 超过此值视为重复框")
     g.add_argument("--track-iou", type=float, default=0.3)
@@ -132,16 +134,22 @@ _KEY_FILES = ("yolo_model", "pose_model", "pose_checkpoint", "pose_config", "mes
 
 
 def _stamp(path):
-    """文件指纹 (路径, 大小, mtime)；不存在时后两项为 None。"""
+    """文件指纹 (路径, 大小, mtime_ns)；不存在时后两项为 None。
+
+    mtime 取纳秒：秒级精度下"同一秒内被同尺寸文件覆盖"会算出相同 key 而静默
+    复用旧缓存 —— 同架构 checkpoint 重训后字节数往往一模一样，并非纯理论风险。
+    """
     if not path or not os.path.exists(path):
         return [path, None, None]
     st = os.stat(path)
-    return [path, st.st_size, int(st.st_mtime)]
+    return [path, st.st_size, st.st_mtime_ns]
 
 
 def cache_key(args, total):
     """Stage1/2 缓存键：相关参数 + 输入视频/权重文件指纹 的稳定哈希。"""
-    payload = {k: getattr(args, k) for k in _KEY_ARGS["*"] + _KEY_ARGS[args.plan]}
+    # .get：新增 plan 未登记时按"只用公共参数"处理，不让 cache_key 崩在 Stage1 前
+    payload = {k: getattr(args, k)
+               for k in _KEY_ARGS["*"] + _KEY_ARGS.get(args.plan, ())}
     for k in _KEY_FILES:
         if k in payload:
             payload[k] = _stamp(payload[k])
@@ -163,11 +171,15 @@ def load_cache(path, key):
     except Exception as e:                      # 截断、pickle 版本不兼容等
         print(f"[Cache] {path} 无法读取（{e}），重新计算")
         return None
-    if not isinstance(cached, dict) or "all_boxes" not in cached:
-        print(f"[Cache] {path} 格式不认识（旧版本产物），重新计算")
+    # 下游要取 all_boxes 与 raw_seq 两项，缺任一都不能算命中
+    if not isinstance(cached, dict) or not {"all_boxes", "raw_seq"} <= cached.keys():
+        print(f"[Cache] {path} 内容不完整（写入中断或非本程序产物），重新计算")
         return None
-    if cached.get("key") != key:
-        print(f"[Cache] 参数或输入文件已变（缓存 key={cached.get('key')}，"
+    if "key" not in cached:                     # 无 key 字段：早于缓存校验的产物
+        print(f"[Cache] {path} 是旧版本产物（无校验键），重新计算")
+        return None
+    if cached["key"] != key:
+        print(f"[Cache] 参数或输入文件已变（缓存 key={cached['key']}，"
               f"当前 {key}），重新计算")
         return None
     return cached
@@ -265,7 +277,8 @@ def render(canvas_video, out_path, all_boxes, cum_map, meta, canvas_kpts=None,
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
         except ImportError:
-            print("[Render] 未安装 imageio-ffmpeg，回退 mp4v")
+            print("[Render] 警告：未安装 imageio-ffmpeg，回退 mp4v（体积约翻倍）。"
+                  "装回：pip install imageio-ffmpeg==0.6.0")
     if proc is None:
         writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 

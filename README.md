@@ -104,11 +104,11 @@ src/swim_analyse/
   tracking.py    检测框去重 + IoU 贪心跟踪
   pose.py        RTMPose 封装、COCO17 定义、关键点插值
   metrics.py     划水信号与计数、瞬时速度、信号图
-  draw.py        骨架 / 标签 / 调试裁剪视频
+  draw.py        骨架 / 标签绘制
   video.py       多路视频的帧级随机读取（带帧缓存），Plan A 用
 tests/test_core.py               纯逻辑单元测试（无需 GPU 和数据）
 cpp/                             C++/CUDA 实时实现（Plan C，全程 GPU 驻留）
-                                 Windows 实测 65~71 fps 纯分析，见 cpp/README.md
+                                 Windows 实测 65~78 fps 纯分析，见 cpp/README.md
 ```
 
 三套方案共享同一份数据约定，因此新增方案只需在 `plans.py` 里实现 `run()`：
@@ -152,7 +152,9 @@ DRAW_KEYPOINTS= bash run.sh C                 # 关掉骨架叠加（渲染更�
 ```
 
 调参时不必重跑 GPU：`output_dir/cache.pkl` 存在时会跳过 Stage1/2，直接从 Stage3 起算
-（缓存记录了 plan 名，换 plan 会自动失效重算）。需要强制重跑推理时删掉该文件。
+（缓存键是「影响 Stage1/2 的参数 + 输入视频与权重文件的大小/mtime」哈希，换 plan、
+换权重、改检测阈值都会自动失效；只改 `--signal`/`--stroke-type`/绘制选项则照旧命中）。
+需要强制重跑推理时删掉该文件。
 
 ## 环境说明
 
@@ -189,5 +191,5 @@ bash install.sh
 ### C++ 实时实现
 
 同一套 Plan C 用 C++/CUDA 重写后（全程 GPU 驻留，只回读关键点），
-RTX 4080 Laptop 上 3000 帧实测 **65~71 fps 纯分析 / 27~35 fps 渲染**，
+RTX 4080 Laptop 上 3000 帧实测 **65~78 fps 纯分析 / 27~35 fps 渲染**，
 瓶颈已从 GPU 推理转到 CPU 解码。构建、参数与逐段耗时见 [`cpp/README.md`](cpp/README.md)。

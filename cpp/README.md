@@ -62,8 +62,14 @@ engine 由程序首次运行时自动构建并缓存。文件名带**身份戳**
 `pose.engine` → `pose.sm89-trt101100-b40-fp16-<onnx mtime>-<size>.engine`。
 戳里含 GPU 架构、运行期 TRT 版本、`--max-persons`、精度与 ONNX 的 mtime/size，
 所以换机器 / 换 `--max-persons` / 换 `--fp32` 各存一份，既不会互相覆盖，也不会
-静默复用不匹配的 engine，无需手动删文件。写盘走临时文件 + rename，中途崩溃不会
-留下半个 engine 冒充缓存；反序列化失败会自动删除并重建一次。
+静默复用不匹配的 engine，无需手动删文件。写盘走临时文件（名字带 pid）+ rename，
+中途崩溃或两个进程同时首次构建都不会留下半个 engine 冒充缓存；反序列化失败会
+自动删除并重建一次。
+
+输入形状不进身份戳 —— 它由 ONNX 写死，而 ONNX 的 mtime/size 已在戳里。因此
+`--detect-size` 与 ONNX 不符时不会（也不该）触发重建，而是在启动时直接报错：
+kernel 按该参数写、engine 按 ONNX 分配，不校验就是越界写。detect 输出的 `max_det`
+与 `kMaxDet`、pose 两个输出的 simcc 轴长也一并核对，都在 `Pipeline` 构造里一次挡掉。
 
 ## 运行
 
@@ -160,19 +166,19 @@ host 侧另有锁页缓冲：解码环 4×31.5 MB、关键点回读环 5×9 KB�
 
 | 阶段 | 纯分析 | 渲染 |
 | --- | --- | --- |
-| `0_src_wait`（等解码） | 7.1–8.0 ms | 18.6–25.2 ms |
-| `1_pre+detect` | 5.3–5.6 ms | 7.4–9.0 ms |
+| `0_src_wait`（等解码） | 6.0–8.0 ms | 18.6–25.2 ms |
+| `1_pre+detect` | 5.1–5.6 ms | 7.4–9.0 ms |
 | `2_crop+pose+decode` | 1.7–2.0 ms | 2.8–3.5 ms |
-| `7_track_metrics` | 0.26–0.35 ms | 0.24–0.47 ms |
+| `7_track_metrics` | 0.22–0.35 ms | 0.22–0.47 ms |
 | `8_frame_d2h` | — | 0.02 ms |
-| **端到端** | **14.2–15.5 ms（65–71 fps）** | **29.0–37.6 ms（27–35 fps）** |
+| **端到端** | **12.8–15.5 ms（65–78 fps）** | **29.0–37.6 ms（27–35 fps）** |
 
 给区间而非单值：这是笔记本，同一条命令连跑三次差 10% 属常态（散热与后台进程），
-渲染模式波动更大因为它多起一个 libx264 进程抢 CPU。GPU 段（`1_`+`2_`）稳定在 7.0–8 ms。
+渲染模式波动更大因为它多起一个 libx264 进程抢 CPU。GPU 段（`1_`+`2_`）稳定在 6.8–8 ms。
 
-一致性：24107 人次、63 track、381 次划水；**纯分析与渲染两种模式的 JSON 与 `--dump` CSV
+一致性：24107 人次、63 track、376 次划水；**纯分析与渲染两种模式的 JSON 与 `--dump` CSV
 逐字节相同**，同一路径重复跑也逐字节可复现。
-`--decoder cpu` 是另一组数（24245 人次、63 track、379 次划水），差异来自 MSMF 的
+`--decoder cpu` 是另一组数（24245 人次、63 track），差异来自 MSMF 的
 像素换算，不是随机性，见「输入源」。
 显存（Windows 实测）：整进程约 1.0 GB，含 CUDA context；engine 工作区 detect 56.2 MB /
 pose 153.4 MB（比 H800 的 56/94 MB 大，TRT 按 GPU 选 kernel，属正常差异）。
@@ -198,11 +204,12 @@ NVDEC 在这里帮不上：CUVID 的 H.264 8bit 上限 4096×4096，画布宽 50
 
 | 项 | 状态 |
 | --- | --- |
-| letterbox（scale/pad） | 与 ultralytics 逐值一致 |
+| letterbox（scale/pad） | 与 ultralytics 逐值一致（半像素约定，同 `cv2.resize`） |
 | 解码像素 | 默认 ffmpeg 管道与 Python `cv2.VideoCapture` **逐字节相同**；`--decoder cpu`(MSMF) 不同，见「输入源」 |
 | 检出数 | 8.0/帧（3000 帧 24107 人次）。Python 侧记录过 10.85/帧，但那份数字的统计口径已无法复现（本机无 torch，未重测），暂不作为对齐依据 |
 | track 数（1000 帧） | 34 vs Python 36 |
 | 包含率去重 | 复刻 `filter_contained_boxes` 的顺序语义（含 `break`），保序 |
+| 裁切/解码坐标 | 两者都用**索引约定**（输出下标直接代入逆映射，无半像素偏移），与 `cv2.warpAffine` 及 mmpose 的 `keypoints/input_size*scale + center - 0.5*scale` 严格互逆。注意这与 letterbox 的半像素约定不同，是两套 OpenCV 语义各自对应的正确写法 |
 | 划水信号 | `elbow_angle` / `wrist_x_head` 两路，同 `metrics.py` 的 `SIGNALS`（`--signal`） |
 | 平滑 | 缺帧线性插值 → 中值(5) → Savitzky-Golay(11,3)，常数表实现。与 scipy 的 `median_filter`+`savgol_filter` 在支撑完整区间逐点差 < 1e-14 rad |
 | 波谷判据 | 局部均值 + **拓扑** prominence（同 scipy 定义），窗宽 `max(distance*2, fps*6)` |
@@ -210,10 +217,16 @@ NVDEC 在这里帮不上：CUVID 的 H.264 8bit 上限 4096×4096，画布宽 50
 | 左右分侧 | 自由泳/仰泳分开计数取 min，其余取均值（`--stroke-type`） |
 | 速度 | 每 0.2 s 一个采样点、窗口 2 s、帧间前向填充。与 Python 逐 track 相对差 < 5.4e-4（纯 float32 vs float64 舍入，复算可逐位吻合） |
 
+**关键点数值本身不可能逐字节对齐**（上表只保证下游算法逻辑一致）：Python Plan C 的
+`configs/rtmpose-m_canvas-192x256.py` 开了 `flip_test=True`，做左右翻转取平均，而
+`export_onnx.py` 导出的是裸 backbone+head，C++ 没有翻转平均；另外 C++ 的 SimCC 解码多做
+一次二次插值，mmpose 侧 `use_dark=False`。所以两边关键点存在系统性小差，做 `--dump`
+对照时应比对下游统计量（划水次数、速度）而非关键点原值。
+
 **实测对齐幅度**（同一份 `--dump` 关键点喂两边，3000 帧 / 63 track）：
-`elbow_angle` C++ 381 次 vs Python 379 次（+0.5%），逐 track 平均绝对差 0.44、最大 3；
-`wrist_x_head` C++ 231 vs Python 229（+0.9%），平均绝对差 0.13、最大 3。
-差异集中在长 track（≥300 帧的 19 个平均差 0.9，其余 44 个 0.25），全部来自下面这条在线约束。
+`elbow_angle` C++ 376 次 vs Python 379 次（−0.8%），逐 track 平均绝对差 0.52、最大 4；
+`wrist_x_head` C++ 234 vs Python 232（+0.9%），平均绝对差 0.13、最大 1。
+差异集中在长 track（≥300 帧），全部来自下面这条在线约束。
 
 刻意保留的差异只有一条，源自在线约束（live 不能等全序列结束）：Python 用
 `scipy.find_peaks` 扫全序列并按峰高优先解 `distance` 冲突；C++ 是滑窗内逐帧因果判定，
