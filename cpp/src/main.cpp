@@ -7,6 +7,14 @@
 // 不拷图像，全链路只回读关键点）。
 #include <opencv2/opencv.hpp>
 
+#ifdef _WIN32
+// windows.h 默认定义 min/max 宏，会打断 std::max / cv:: 里的模板调用
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -84,21 +92,63 @@ bool parse(int argc, char** argv, Args& a) {
   return true;
 }
 
-/// H.264 写出器：优先 avc1，失败回退 mp4v。
+/// H.264 写出器：先试 OpenCV(avc1→mp4v)，都开不了则退到外部 ffmpeg 管道。
+///
+/// 回退存在的原因：Windows 上 vcpkg 的 opencv4 未启用 ffmpeg 特性，videoio 只剩
+/// MSMF。MSMF 的 H.264 编码器在 1080p/4K 能开，但画布分辨率 5002x2102 直接
+/// isOpened()==false。同机 NVENC 也用不了（驱动 571.96 只提供 NVENC API 13.0，
+/// ffmpeg 8.1 要求 13.1），所以编码器定为 libx264。
+/// 走独立进程还有个附带好处：编码与本进程的 GPU 推理天然并行。
 class Writer {
  public:
   Writer(const std::string& path, int w, int h, double fps) {
     for (const char* cc : {"avc1", "mp4v"}) {
       w_.open(path, cv::VideoWriter::fourcc(cc[0], cc[1], cc[2], cc[3]), fps,
               {w, h});
-      if (w_.isOpened()) { printf("[Writer] %s codec=%s\n", path.c_str(), cc); return; }
+      if (w_.isOpened()) {
+        printf("[Writer] %s codec=%s (opencv)\n", path.c_str(), cc);
+        return;
+      }
     }
-    throw std::runtime_error("无法打开输出 " + path);
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd,
+             "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pix_fmt bgr24 "
+             "-s %dx%d -r %.4f -i - -c:v libx264 -preset veryfast -crf 23 "
+             "-pix_fmt yuv420p \"%s\"", w, h, fps, path.c_str());
+#ifdef _WIN32
+    pipe_ = _popen(cmd, "wb");            // 必须 "wb"：文本模式会把 0x0A 换成 CRLF
+#else
+    pipe_ = popen(cmd, "w");
+#endif
+    SWIM_CHECK(pipe_, "无法打开输出 " + path + "（OpenCV 与 ffmpeg 管道均失败）");
+    bytes_ = size_t(w) * h * 3;
+    printf("[Writer] %s codec=libx264 (ffmpeg 管道)\n", path.c_str());
   }
-  void write(const cv::Mat& m) { w_.write(m); }
+
+  ~Writer() { close(); }
+
+  void write(const cv::Mat& m) {
+    if (!pipe_) { w_.write(m); return; }
+    SWIM_CHECK(m.isContinuous(), "帧数据非连续，无法直接写管道");
+    SWIM_CHECK(fwrite(m.data, 1, bytes_, pipe_) == bytes_,
+               "写 ffmpeg 管道失败：ffmpeg 已退出（PATH 里有 ffmpeg 吗？）");
+  }
+
+  /// 显式关闭：管道要等 ffmpeg 落完 moov 才算写完，别拖到 main 结束后。
+  void close() {
+    if (!pipe_) return;
+#ifdef _WIN32
+    _pclose(pipe_);
+#else
+    pclose(pipe_);
+#endif
+    pipe_ = nullptr;
+  }
 
  private:
   cv::VideoWriter w_;
+  FILE*  pipe_  = nullptr;
+  size_t bytes_ = 0;
 };
 
 void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts) {
@@ -137,6 +187,10 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+#ifdef _WIN32
+  // 源码是 UTF-8（/utf-8 编译），控制台默认 936 会把中文输出成乱码
+  SetConsoleOutputCP(CP_UTF8);
+#endif
   Args a;
   if (!parse(argc, argv, a)) return 0;
 
@@ -197,6 +251,7 @@ int main(int argc, char** argv) try {
 
   const double total = now_ms() - t0;
   printf("\n");
+  if (writer) writer->close();          // 等 ffmpeg 收尾，否则 mp4 缺 moov
   pipe.timers().report("GPU 流水线", total, pipe.frames_done());
   printf("[Summary] %lld 帧, 累计 %lld 人次, %zu 个 track\n",
          static_cast<long long>(pipe.frames_done()),

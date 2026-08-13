@@ -24,9 +24,10 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 
 | 组件 | 版本 | 说明 |
 | --- | --- | --- |
-| CUDA | 12.x | 本机 12.9 |
-| **TensorRT** | **10.11.0.33** | cuda-12.0~12.9 变体。TRT 11 移除了 `BuilderFlag::kFP16`（强类型恒开），本代码只针对 10.x |
-| OpenCV | 4.x | 解码与渲染；apt 版未编 `cudacodec`，故 NVDEC 暂走 CPU 回退 |
+| CUDA | 12.x | Linux 机 12.9，Windows 机 12.8 |
+| **TensorRT** | **10.11.0.33** | cuda-12.0~12.9 变体。TRT 11 移除了 `BuilderFlag::kFP16`（强类型恒开），本代码只针对 10.x。Windows 导入库名带后缀：`nvinfer_10.lib` |
+| OpenCV | 4.x | 解码与渲染；apt / vcpkg 版都未编 `cudacodec`，故 NVDEC 暂走 CPU 回退 |
+| ffmpeg CLI | 任意近期版本 | 仅 `--out` 需要，且仅当 OpenCV 开不了写出器时（Windows 必然走这条，见「渲染写出」） |
 | cmake | ≥3.18 | |
 
 ## 构建
@@ -36,12 +37,14 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 cmake -B build -DTRT_ROOT=/opt/trt/TensorRT-10.11.0.33 -DCMAKE_CUDA_ARCHITECTURES=90
 cmake --build build -j
 
-# Windows（VS 2022 + CUDA + TRT 官方 zip）
-cmake -B build -G "Visual Studio 17 2022" -DTRT_ROOT=C:/TensorRT-10.11.0.33
+# Windows（VS 2022 + CUDA + TRT 官方 zip + vcpkg 的 OpenCV）
+cmake -B build -G "Visual Studio 17 2022" -DTRT_ROOT=C:/TensorRT-10.11.0.33 ^
+      -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake ^
+      -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build --config Release
 ```
 
-`CMAKE_CUDA_ARCHITECTURES`：H800=90，RTX40xx=89，RTX30xx=86。
+`CMAKE_CUDA_ARCHITECTURES`：H800=90，RTX40xx=89，RTX30xx=86，RTX50xx=120。
 
 ## 准备模型
 
@@ -84,6 +87,18 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib
 
 NVDEC 位置已留好：装了带 CUDA 的 OpenCV 后在 `FrameSource::open()` 里接
 `cv::cudacodec::createVideoReader` 即可。若 live 场景走 `RawSource`，则完全绕过解码。
+（探测已跨平台：Linux `dlopen("libnvcuvid.so")`，Windows `LoadLibraryA("nvcuvid.dll")`。）
+
+## 渲染写出（`--out`）
+
+`Writer` 两级：先试 `cv::VideoWriter`（`avc1` → `mp4v`），都开不了则起 `ffmpeg` 子进程，
+用管道喂 rawvideo（`-c:v libx264 -preset veryfast -crf 23`）。
+
+回退是 Windows 必需的：vcpkg 的 opencv4 没有 ffmpeg 特性，videoio 只剩 MSMF，
+而 MSMF 的 H.264 编码器在 1080p/4K 能开，**在 5002×2102 直接 `isOpened()==false`**。
+NVENC 本可以更快，但实测机（驱动 571.96）只提供 NVENC API 13.0，ffmpeg 8.1 要求 13.1，
+所以编码器定为 libx264；驱动升级后把命令里的编码器换成 `h264_nvenc` 即可。
+走独立进程的附带好处：编码与本进程的 GPU 推理天然并行。
 
 ## 显存
 
@@ -101,7 +116,11 @@ NVDEC 位置已留好：装了带 CUDA 的 OpenCV 后在 `FrameSource::open()` �
 
 超过 40 人的框会被丢弃以保持显存恒定（实测该数据每帧最多 13 人）。
 
-## 性能（H800，5002×2102 画布，约 10 人/帧）
+## 性能
+
+3000 帧 5002×2102 画布，约 10 人/帧。
+
+### H800（Linux，CUDA 12.9）
 
 | 阶段 | 每帧 |
 | --- | --- |
@@ -112,10 +131,24 @@ NVDEC 位置已留好：装了带 CUDA 的 OpenCV 后在 `FrameSource::open()` �
 | 纯分析端到端 | 12.4 ms（**80 fps**） |
 | 加渲染端到端 | 41.6 ms（24 fps，瓶颈在 CPU H.264 编码） |
 
-与 Python 版 Plan C 的 55 ms（detect+pose）相比，GPU 段快 **8.8×**；pose 部分从
+### RTX 4080 Laptop（Windows 11，CUDA 12.8，驱动 571.96）
+
+| 阶段 | 纯分析 | 渲染 |
+| --- | --- | --- |
+| `1_pre+detect` | 8.27 ms | 9.55 ms |
+| `2_crop+pose+decode` | 3.58 ms | 4.32 ms |
+| `8_frame_d2h` | — | 3.24 ms |
+| `7_track_metrics` | 0.11 ms | 0.15 ms |
+| **端到端** | **19.8 ms（50.5 fps）** | **32.8 ms（30.5 fps）** |
+
+两机结果一致性：24249 人次、64 track、592 次划水；纯分析与渲染两种模式的 JSON 逐字节相同。
+显存（Windows 实测）：整进程约 1.0 GB，含 CUDA context；engine 工作区 detect 61.1 MB /
+pose 153.4 MB（比 H800 的 56/94 MB 大，TRT 按 GPU 选 kernel，属正常差异）。
+
+与 Python 版 Plan C 的 55 ms（detect+pose）相比，GPU 段快 **8.8×**（H800）；pose 部分从
 34 ms 降到 1.7 ms，因为裁切的仿射采样与 SimCC 解码都进了 kernel。
 
-纯分析模式下剩余的 6 ms 是 CPU 解码残留（5002×2102 约 19 ms/帧，已被预取部分掩盖）。
+纯分析模式下剩余开销是 CPU 解码残留（5002×2102 约 19 ms/帧，已被预取部分掩盖）。
 **当前瓶颈在 CPU 解码，不在 GPU 推理**——NVDEC 或 `RawSource` 可去掉这部分。
 
 ## 与 Python 版的对齐

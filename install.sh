@@ -98,7 +98,7 @@ import mmcv, mmdet, mmengine, mmpose, torch, ultralytics, cv2, numpy, scipy, mat
 from mmcv.ops import nms                      # 验证 CUDA 算子已编译进 wheel
 from mmpose.apis import init_model, inference_topdown
 from ultralytics import YOLO
-import swim_analyse.pipeline
+import swim_analyse.cli, swim_analyse.plans
 print(f"[install] mmcv {mmcv.__version__}  mmengine {mmengine.__version__}  "
       f"mmpose {mmpose.__version__}  mmdet {mmdet.__version__}")
 print(f"[install] ultralytics {ultralytics.__version__}  opencv {cv2.__version__}  "

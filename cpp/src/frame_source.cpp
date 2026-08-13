@@ -1,6 +1,13 @@
 #include "swim/frame_source.h"
 
+#ifdef _WIN32
+// NOMINMAX：windows.h 的 min/max 宏会打断 std:: 与 OpenCV 的模板调用
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <opencv2/opencv.hpp>
 
 #include <atomic>
@@ -190,14 +197,20 @@ class RawSource final : public FrameSource {
   int64_t      idx_     = 0;
 };
 
-/// NVDEC 可用性探测：依赖驱动侧 libnvcuvid，容器常未挂载。
+/// NVDEC 可用性探测：依赖驱动侧的 nvcuvid（Linux 容器常未挂载，
+/// Windows 由显卡驱动装进 System32）。
 bool nvdec_available() {
   static const bool ok = [] {
     // 用 OpenCV 的 cudacodec 作为 NVDEC 入口时需 contrib 模块；
     // 这里只探测驱动库是否存在，缺失即回退，避免链接期硬依赖。
+#ifdef _WIN32
+    if (HMODULE h = LoadLibraryA("nvcuvid.dll")) { FreeLibrary(h); return true; }
+    printf("[Source] 未找到 nvcuvid.dll（NVDEC 不可用），回退 CPU 解码\n");
+#else
     if (void* h = dlopen("libnvcuvid.so.1", RTLD_LAZY)) { dlclose(h); return true; }
     if (void* h = dlopen("libnvcuvid.so", RTLD_LAZY))   { dlclose(h); return true; }
     printf("[Source] 未找到 libnvcuvid（NVDEC 不可用），回退 CPU 解码\n");
+#endif
     return false;
   }();
   return ok;
@@ -211,11 +224,11 @@ std::unique_ptr<FrameSource> FrameSource::open(const std::string& uri,
   const bool want_nvdec = pref == DecoderPref::Nvdec ||
                           (pref == DecoderPref::Auto && nvdec_available());
   if (want_nvdec && !nvdec_available())
-    throw std::runtime_error("指定了 --decoder nvdec 但 libnvcuvid 不可用");
-  // NVDEC 路径待补：当前 OpenCV(apt 版) 未编译 cudacodec，统一走 CPU 解码。
+    throw std::runtime_error("指定了 --decoder nvdec 但 nvcuvid 不可用");
+  // NVDEC 路径待补：当前 OpenCV(apt/vcpkg 版) 未编译 cudacodec，统一走 CPU 解码。
   // 台式机若装了带 CUDA 的 OpenCV，可在此接 cv::cudacodec::createVideoReader。
   if (want_nvdec)
-    printf("[Source] libnvcuvid 可用，但本构建未启用 cudacodec，仍走 CPU 解码\n");
+    printf("[Source] nvcuvid 可用，但本构建未启用 cudacodec，仍走 CPU 解码\n");
   return std::make_unique<CpuSource>(uri, ring, prefetch);
 }
 
