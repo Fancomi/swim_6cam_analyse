@@ -9,40 +9,46 @@ IoU 匹配已足够，且行为完全可预期、没有外部跟踪器的隐藏�
 import numpy as np
 
 
+def _inter_area(a, b):
+    """两组 xyxy 框的交集面积矩阵：a:(N,4) b:(M,4) -> (N,M)。"""
+    a, b = np.asarray(a, float)[:, None, :], np.asarray(b, float)[None, :, :]
+    return (np.maximum(0, np.minimum(a[..., 2], b[..., 2]) - np.maximum(a[..., 0], b[..., 0])) *
+            np.maximum(0, np.minimum(a[..., 3], b[..., 3]) - np.maximum(a[..., 1], b[..., 1])))
+
+
+def _box_area(boxes):
+    """xyxy 框面积：(N,4) -> (N,)。"""
+    arr = np.asarray(boxes, float)
+    return (arr[:, 2] - arr[:, 0]) * (arr[:, 3] - arr[:, 1])
+
+
 def _iou_matrix(a, b):
     """a:(N,4) b:(M,4) -> IoU 矩阵 (N,M)。空输入返回形状正确的空矩阵。"""
     if len(a) == 0 or len(b) == 0:
         return np.zeros((len(a), len(b)))
-    a, b = np.asarray(a, float)[:, None, :], np.asarray(b, float)[None, :, :]
-    inter = (np.maximum(0, np.minimum(a[..., 2], b[..., 2]) - np.maximum(a[..., 0], b[..., 0])) *
-             np.maximum(0, np.minimum(a[..., 3], b[..., 3]) - np.maximum(a[..., 1], b[..., 1])))
-    area_a = (a[..., 2] - a[..., 0]) * (a[..., 3] - a[..., 1])
-    area_b = (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
-    return inter / (area_a + area_b - inter + 1e-6)
+    inter = _inter_area(a, b)
+    return inter / (_box_area(a)[:, None] + _box_area(b)[None, :] - inter + 1e-6)
 
 
-def filter_contained_boxes(boxes, thresh=0.7):
+def contained_keep_mask(boxes, thresh=0.7):
     """
-    去掉"几乎完全被另一个框包住"的重复检测（保留置信度高的那个）。
+    "几乎完全被另一个框包住"的重复检测判定，返回保留掩码 (N,) bool。
 
     用 交集/自身面积 而不是 IoU：同一个游泳者常被同时框出一大一小两个框，
-    这种情况下 IoU 偏低会被 NMS 漏掉，而包含率接近 1。
+    这种情况下 IoU 偏低会被 NMS 漏掉，而包含率接近 1。重复对里保留置信度高的。
 
-    boxes: list of (x1,y1,x2,y2,conf)。
+    boxes: list of (x1,y1,x2,y2,conf)。调用方若还持有与 boxes 同序的其他数组
+    （如关键点），用本掩码同步索引即可，不必按坐标反查下标。
     """
     n = len(boxes)
+    keep = np.ones(n, bool)
     if n <= 1:
-        return boxes
+        return keep
     arr = np.array([b[:4] for b in boxes], float)
     conf = np.array([b[4] for b in boxes], float)
-    a = arr[:, None, :]
-    b = arr[None, :, :]
-    inter = (np.maximum(0, np.minimum(a[..., 2], b[..., 2]) - np.maximum(a[..., 0], b[..., 0])) *
-             np.maximum(0, np.minimum(a[..., 3], b[..., 3]) - np.maximum(a[..., 1], b[..., 1])))
-    self_area = ((arr[:, 2] - arr[:, 0]) * (arr[:, 3] - arr[:, 1]))[:, None]
-    contained = inter / np.maximum(self_area, 1e-6)          # contained[i,j]: i 被 j 包住的比例
+    # contained[i,j]: i 被 j 包住的比例
+    contained = _inter_area(arr, arr) / np.maximum(_box_area(arr), 1e-6)[:, None]
 
-    keep = np.ones(n, bool)
     for i in range(n):
         if not keep[i]:
             continue
@@ -55,7 +61,12 @@ def filter_contained_boxes(boxes, thresh=0.7):
                 else:
                     keep[i] = False
                     break
-    return [box for box, k in zip(boxes, keep) if k]
+    return keep
+
+
+def filter_contained_boxes(boxes, thresh=0.7):
+    """去重后的框列表（保序）；掩码语义见 contained_keep_mask。"""
+    return [box for box, k in zip(boxes, contained_keep_mask(boxes, thresh)) if k]
 
 
 class SimpleTracker:
@@ -103,26 +114,3 @@ class SimpleTracker:
                 if self.tracks[tid]["lost"] > self.max_lost:
                     del self.tracks[tid]
         return results
-
-
-class SwimmerTracker:
-    """YOLO 检测 + SimpleTracker 的封装。必须按视频真实顺序逐帧调用 update()。"""
-
-    def __init__(self, model_path, device="0", conf=0.25, iou=0.3,
-                 containment_thresh=0.7, track_iou=0.3, track_max_lost=30):
-        from ultralytics import YOLO
-        self.model = YOLO(model_path)
-        self.model.to(f"cuda:{device}" if str(device).isdigit() else device)
-        self.conf, self.iou = conf, iou
-        self.containment_thresh = containment_thresh
-        self.tracker = SimpleTracker(track_iou, track_max_lost)
-
-    def update(self, frame):
-        """输入画布帧，返回 [(tid, x1, y1, x2, y2, conf)]（画布像素坐标）。"""
-        result = self.model(frame, conf=self.conf, iou=self.iou, verbose=False)[0]
-        boxes = []
-        if result.boxes is not None and len(result.boxes):
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-            boxes = [(*map(float, xy), float(c)) for xy, c in zip(xyxy, confs)]
-        return self.tracker.update(filter_contained_boxes(boxes, self.containment_thresh))

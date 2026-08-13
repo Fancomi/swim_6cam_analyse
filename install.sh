@@ -18,16 +18,23 @@ PY_VERSION=3.10
 
 TORCH=2.1.0
 TORCHVISION=0.16.0
-NUMPY=1.26.4
+NUMPY=1.26.4          # 须与 requirements.txt 中的 numpy 版本一致
 SETUPTOOLS="<81"
 MMCV=2.1.0
 MMPOSE=1.3.1
-MMCV_WHEEL="https://download.openmmlab.com/mmcv/dist/cu121/torch${TORCH}/mmcv-${MMCV}-cp310-cp310-manylinux1_x86_64.whl"
+# 走官方索引页而不是写死 wheel 文件名，由 pip 按平台/解释器挑对应 wheel
+MMCV_INDEX="https://download.openmmlab.com/mmcv/dist/cu121/torch${TORCH}/index.html"
 
 log() { printf '\033[1;32m[install]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[install] %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ── 1. 前置检查 ──────────────────────────────────────────────────────────────
+# Windows/Git Bash 下 nvidia-smi 能通过，但 venv 路径、python3 存根、numpy 与
+# setuptools 的安装顺序都不一样，不是换个路径能覆盖的，故直接早退
+case "$(uname -s)" in
+  Linux) ;;
+  *) die "install.sh 仅支持 Linux；Windows 见 docs/迁移交接.md §4" ;;
+esac
 command -v nvidia-smi >/dev/null || die "未找到 nvidia-smi，本项目需要 NVIDIA GPU"
 log "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 
@@ -74,7 +81,7 @@ sys.exit(0 if torch.cuda.is_available() else 1)
 EOF
 
 log "安装 mmcv $MMCV (预编译 wheel)"
-pip_install -q "$MMCV_WHEEL" \
+pip_install -q "mmcv==$MMCV" -f "$MMCV_INDEX" \
   || die "mmcv wheel 下载失败。若在内网请先设置代理：export https_proxy=... http_proxy=..."
 
 log "安装其余依赖"

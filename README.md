@@ -107,6 +107,8 @@ src/swim_analyse/
   draw.py        骨架 / 标签 / 调试裁剪视频
   video.py       多路视频的帧级随机读取（带帧缓存），Plan A 用
 tests/test_core.py               纯逻辑单元测试（无需 GPU 和数据）
+cpp/                             C++/CUDA 实时实现（Plan C，全程 GPU 驻留）
+                                 Windows 实测 65~71 fps 纯分析，见 cpp/README.md
 ```
 
 三套方案共享同一份数据约定，因此新增方案只需在 `plans.py` 里实现 `run()`：
@@ -183,3 +185,9 @@ bash install.sh
 - Stage4 的 463 秒里**绘制只占约 4%**，85% 是视频编码——与算法无关。
 
 有 `cache.pkl` 时跳过 Stage1+2，可省掉全程的 64%。
+
+### C++ 实时实现
+
+同一套 Plan C 用 C++/CUDA 重写后（全程 GPU 驻留，只回读关键点），
+RTX 4080 Laptop 上 3000 帧实测 **65~71 fps 纯分析 / 27~35 fps 渲染**，
+瓶颈已从 GPU 推理转到 CPU 解码。构建、参数与逐段耗时见 [`cpp/README.md`](cpp/README.md)。

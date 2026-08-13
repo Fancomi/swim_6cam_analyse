@@ -13,13 +13,15 @@
     Stage3    关键点插值 -> 划水次数（肘角度波谷 / 手腕过零）+ 瞬时速度
     Stage4    叠加框/标签/骨架，H264 编码输出
 
-Stage1/2 的结果缓存到 output_dir/cache.pkl（含 plan 名），重跑时若缓存存在
-且 plan 一致则直接跳到 Stage3 —— 调信号参数、换绘制选项都不必重跑 GPU。
+Stage1/2 的结果缓存到 output_dir/cache.pkl，键是"所有影响该结果的参数 + 输入
+视频/权重文件的 (大小, mtime)"的哈希：键一致才复用 —— 调信号参数、换绘制选项
+都不必重跑 GPU，而换模型或改阈值一定会重算（见 cache_key）。
 
 用法见 run.sh，或 `python -m swim_analyse.cli --help`。
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pickle
@@ -33,7 +35,7 @@ from .draw import draw_label, draw_skeleton, id_color
 from .metrics import (SIGNALS, compute_speed, count_strokes, cumulative_counts,
                       save_signal_plots)
 from .plans import PLANS
-from .pose import KPT_THR, interpolate_keypoints
+from .pose import KPT_THR, POSE_SCORE_THR, interpolate_keypoints
 from .video import video_meta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,7 +86,10 @@ def parse_args(argv=None):
     g.add_argument("--stroke-type", default="freestyle",
                    choices=["freestyle", "backstroke", "butterfly", "breaststroke", "unknown"])
     g.add_argument("--signal", default="elbow_angle", choices=sorted(SIGNALS))
-    g.add_argument("--kpt-thr", type=float, default=KPT_THR)
+    g.add_argument("--kpt-thr", type=float, default=KPT_THR,
+                   help="单个关键点的置信度阈值（绘制骨架用）")
+    g.add_argument("--pose-score-thr", type=float, default=POSE_SCORE_THR,
+                   help="Plan A 换相机门限：17 点平均置信度低于此值改用次清晰相机重推")
 
     g = p.add_argument_group("输出")
     g.add_argument("--output-dir", required=True)
@@ -113,6 +118,61 @@ def _check(parser, a):
             parser.error("Plan C 需要 --pose-config 与 --pose-checkpoint（画布 RTMPose）")
 
 
+# Stage1/2 的结果只取决于这些参数：按 plan 取它真正用到的那几项，Stage3/4 的
+# 参数（signal、stroke-type、kpt-thr、绘制、codec）改动不会失效缓存。
+_KEY_ARGS = {
+    "*": ("plan", "device", "conf", "containment", "track_iou", "track_max_lost"),
+    "A": ("yolo_model", "iou", "pose_config", "pose_checkpoint", "pose_score_thr",
+          "mesh", "ppm", "unit_scale", "neg_v"),
+    "B": ("pose_model",),
+    "C": ("yolo_model", "iou", "pose_config", "pose_checkpoint"),
+}
+# 上述参数里指向文件的项：额外把 (大小, mtime) 计入，同名权重被覆盖也能发现
+_KEY_FILES = ("yolo_model", "pose_model", "pose_checkpoint", "pose_config", "mesh")
+
+
+def _stamp(path):
+    """文件指纹 (路径, 大小, mtime)；不存在时后两项为 None。"""
+    if not path or not os.path.exists(path):
+        return [path, None, None]
+    st = os.stat(path)
+    return [path, st.st_size, int(st.st_mtime)]
+
+
+def cache_key(args, total):
+    """Stage1/2 缓存键：相关参数 + 输入视频/权重文件指纹 的稳定哈希。"""
+    payload = {k: getattr(args, k) for k in _KEY_ARGS["*"] + _KEY_ARGS[args.plan]}
+    for k in _KEY_FILES:
+        if k in payload:
+            payload[k] = _stamp(payload[k])
+    payload["total"] = total
+    payload["canvas_video"] = _stamp(args.canvas_video)
+    if PLANS[args.plan].needs_cameras:
+        payload["camera_videos"] = [_stamp(p) for p in args.camera_videos]
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
+def load_cache(path, key):
+    """读缓存，key 不符/旧格式/读不出来都当作 miss 返回 None（不抛异常）。"""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+    except Exception as e:                      # 截断、pickle 版本不兼容等
+        print(f"[Cache] {path} 无法读取（{e}），重新计算")
+        return None
+    if not isinstance(cached, dict) or "all_boxes" not in cached:
+        print(f"[Cache] {path} 格式不认识（旧版本产物），重新计算")
+        return None
+    if cached.get("key") != key:
+        print(f"[Cache] 参数或输入文件已变（缓存 key={cached.get('key')}，"
+              f"当前 {key}），重新计算")
+        return None
+    return cached
+
+
 def main(argv=None):
     args = parse_args(argv)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -125,14 +185,8 @@ def main(argv=None):
     print(f"[Plan {args.plan}] {plan.description}")
     print(f"[Meta] {w}x{h} {fps:.2f}fps 处理 {total} 帧 -> {args.canvas_video}")
 
-    cached = None
-    if os.path.exists(cache_path):
-        with open(cache_path, "rb") as f:
-            cached = pickle.load(f)
-        if cached.get("plan") != args.plan:
-            print(f"[Cache] 缓存来自 Plan {cached.get('plan')}，与当前 Plan "
-                  f"{args.plan} 不符，重新计算")
-            cached = None
+    key = cache_key(args, total)
+    cached = load_cache(cache_path, key)
 
     if cached:
         print(f"[Cache] 复用 {cache_path}（删除该文件可强制重跑）")
@@ -147,8 +201,9 @@ def main(argv=None):
         all_boxes, raw_seq = plan.run(args.canvas_video, total)
         plan.report(time.time() - t0, total)
         with open(cache_path, "wb") as f:
-            pickle.dump({"plan": args.plan, "all_boxes": all_boxes,
-                         "raw_seq": raw_seq, "meta": (w, h, fps, total)}, f)
+            pickle.dump({"key": key, "plan": args.plan,
+                         "all_boxes": all_boxes, "raw_seq": raw_seq,
+                         "meta": (w, h, fps, total)}, f)
         print(f"[Cache] 已写 {cache_path}")
     print(f"[Stage1/2] {len(all_boxes)} 帧有检测，{len(raw_seq)} 个 track 有关键点")
 

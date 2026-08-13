@@ -1,7 +1,7 @@
 """三套关键点方案（Plan A/B/C）的统一封装。
 
 三者的差别只在"如何从画布视频得到每个人的框与关键点"，之后的划水计数、速度、
-渲染完全共用（见 pipeline.py 的 Stage3/4）。因此这里把它们抽象成同一个接口：
+渲染完全共用（见 cli.py 的 Stage3/4）。因此这里把它们抽象成同一个接口：
 
     plan.run(canvas_video, total) -> (all_boxes, raw_seq)
     plan.to_canvas(raw_seq, interp) -> canvas_kpts        # 关键点转画布坐标供绘制
@@ -22,14 +22,12 @@
 实测对比见 docs/plans.md。
 """
 
-import os
 import time
 
 import cv2
-import numpy as np
 
 from .geometry import MultiCameraProjector
-from .tracking import SimpleTracker, filter_contained_boxes
+from .tracking import SimpleTracker, contained_keep_mask, filter_contained_boxes
 from .video import MultiVideoReader
 
 CANVAS_CAM = -1          # cam_idx 哨兵：关键点已在画布坐标系
@@ -137,7 +135,7 @@ class PlanA_CrossCamera(Plan):
                         continue
                     res = self._timeit("pose", pose, cf, [b for _, b in entries])
                     for (tid, box), (kp, sc) in zip(entries, res):
-                        if float(sc.mean()) < a.kpt_thr:
+                        if float(sc.mean()) < a.pose_score_thr:
                             low.append((tid, ci, box, kp, sc))
                         else:
                             raw_seq.setdefault(tid, []).append((fi, kp, sc, ci))
@@ -150,7 +148,7 @@ class PlanA_CrossCamera(Plan):
                         cf2 = reader.read(second[0], fi)
                         if cf2 is not None:
                             (kp2, sc2), = pose(cf2, [second[1]])
-                            if float(sc2.mean()) >= a.kpt_thr:
+                            if float(sc2.mean()) >= a.pose_score_thr:
                                 ci, kp, sc = second[0], kp2, sc2
                                 n_retry += 1
                         self.timings["retry"] = self.timings.get("retry", 0.0) + time.time() - t0
@@ -206,22 +204,18 @@ class PlanB_UnifiedCanvas(Plan):
             boxes = [(*map(float, b), float(c)) for b, c in
                      zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy())]
             # yolo-pose 的 data 是 (N,17,3)：x, y, 可见性；只取 x,y
-            kpts = [k[:, :2] for k in r.keypoints.data.cpu().numpy()]
-            scores = list(r.keypoints.conf.cpu().numpy())
+            kpts = r.keypoints.data.cpu().numpy()[:, :, :2]       # (N,17,2)
+            scores = r.keypoints.conf.cpu().numpy()               # (N,17)
 
-            # 去重后要同步丢弃对应关键点：filter 保序，按坐标回查下标
-            kept = filter_contained_boxes(boxes, a.containment)
-            idx = []
-            for kb in kept:
-                for i, db in enumerate(boxes):
-                    if all(abs(kb[j] - db[j]) < 1e-6 for j in range(5)):
-                        idx.append(i)
-                        break
+            # 去重掩码直接用于同步筛掉对应关键点（不做浮点相等反查下标）
+            keep = contained_keep_mask(boxes, a.containment)
+            kept = [b for b, k in zip(boxes, keep) if k]
+            kpts, scores = kpts[keep], scores[keep]
 
             tracked = tracker.update(kept)
             all_boxes[fi] = tracked
-            for (tid, *_), i in zip(tracked, idx):
-                raw_seq.setdefault(tid, []).append((fi, kpts[i], scores[i], CANVAS_CAM))
+            for (tid, *_), kp, sc in zip(tracked, kpts, scores):
+                raw_seq.setdefault(tid, []).append((fi, kp, sc, CANVAS_CAM))
         cap.release()
         return all_boxes, raw_seq
 

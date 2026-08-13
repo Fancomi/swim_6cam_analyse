@@ -4,6 +4,7 @@
 """
 
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -11,12 +12,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+from swim_analyse.cli import cache_key, load_cache, parse_args
 from swim_analyse.geometry import MeshProjector, _Grid, _in_triangle
 from swim_analyse.metrics import (_detect_valleys, _detect_zero_crossings, _fill_nan,
                                   _local_stats, _smooth, compute_speed, count_strokes,
                                   cumulative_counts)
-from swim_analyse.pose import KPT_THR, interpolate_keypoints
-from swim_analyse.tracking import SimpleTracker, filter_contained_boxes
+from swim_analyse.pose import interpolate_keypoints
+from swim_analyse.tracking import (SimpleTracker, contained_keep_mask,
+                                   filter_contained_boxes)
 
 FPS = 30.0
 
@@ -90,6 +93,18 @@ def test_filter_contained_boxes():
     # 小框置信度更高时保留小框
     assert filter_contained_boxes([big, (10, 10, 30, 30, 0.99)])[0][4] == 0.99
     assert filter_contained_boxes([]) == []
+
+
+def test_contained_keep_mask_indexes_parallel_arrays():
+    """掩码要能直接索引与 boxes 同序的关键点数组，且分数重复时不错配。"""
+    boxes = [(0, 0, 100, 100, 0.5), (10, 10, 30, 30, 0.5),
+             (500, 500, 600, 600, 0.5)]     # 三个 conf 完全相同
+    keep = contained_keep_mask(boxes)
+    assert keep.dtype == bool and keep.shape == (3,)
+    assert list(keep) == [True, False, True], "conf 相等时丢弃被包住的那个"
+    kpts = np.arange(3 * 17 * 2, dtype=float).reshape(3, 17, 2)
+    assert np.array_equal(kpts[keep], kpts[[0, 2]])
+    assert [b for b, k in zip(boxes, keep) if k] == filter_contained_boxes(boxes)
 
 
 def test_tracker_keeps_id_across_frames():
@@ -297,6 +312,54 @@ def test_compute_speed_constant_motion():
 def test_compute_speed_ignores_single_frame_track():
     samples, frame_map = compute_speed({0: [(9, 0, 0, 10, 10, 0.9)]}, FPS, 100.0, 10)
     assert 9 not in samples and 9 not in frame_map
+
+
+# ── cli: Stage1/2 缓存键 ────────────────────────────────────────────────────
+
+def _args(tmp_path, weight, *extra):
+    """构造一份 Plan C 的最小参数（不触碰视频，只要路径存在即可算指纹）。"""
+    return parse_args([
+        "--plan", "C", "--canvas-video", str(tmp_path / "canvas.mp4"),
+        "--output-dir", str(tmp_path), "--yolo-model", str(weight),
+        "--pose-config", str(weight), "--pose-checkpoint", str(weight), *extra])
+
+
+def test_cache_key_covers_params_and_weight_mtime(tmp_path):
+    weight = tmp_path / "w.pt"
+    weight.write_bytes(b"v1")
+    base = cache_key(_args(tmp_path, weight), 100)
+
+    assert cache_key(_args(tmp_path, weight), 100) == base, "同参同文件应稳定命中"
+    assert cache_key(_args(tmp_path, weight), 200) != base, "帧数不同应 miss"
+    assert cache_key(_args(tmp_path, weight, "--conf", "0.5"), 100) != base
+    assert cache_key(_args(tmp_path, weight, "--containment", "0.5"), 100) != base
+    # Stage3/4 的参数不该影响 Stage1/2 缓存
+    assert cache_key(_args(tmp_path, weight, "--kpt-thr", "0.9"), 100) == base
+    assert cache_key(_args(tmp_path, weight, "--signal", "wrist_x_head"), 100) == base
+
+    other = tmp_path / "w2.pt"
+    other.write_bytes(b"v1")
+    assert cache_key(_args(tmp_path, other), 100) != base, "换权重路径应 miss"
+    weight.write_bytes(b"version-2-longer")             # 同名覆盖 -> 大小变化
+    assert cache_key(_args(tmp_path, weight), 100) != base, "权重内容变了应 miss"
+
+
+def test_load_cache_hit_miss_and_legacy(tmp_path):
+    path = tmp_path / "cache.pkl"
+    assert load_cache(str(path), "k1") is None, "文件不存在 -> miss"
+
+    payload = {"key": "k1", "all_boxes": {}, "raw_seq": {}}
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+    assert load_cache(str(path), "k1") == payload
+    assert load_cache(str(path), "k2") is None, "key 不符 -> miss"
+
+    with open(path, "wb") as f:                        # 旧格式：只有 plan，无 key
+        pickle.dump({"plan": "C", "all_boxes": {}, "raw_seq": {}}, f)
+    assert load_cache(str(path), "k1") is None, "旧格式 -> miss 而非异常"
+
+    path.write_bytes(b"not a pickle")                  # 损坏文件也只能 miss
+    assert load_cache(str(path), "k1") is None
 
 
 if __name__ == "__main__":

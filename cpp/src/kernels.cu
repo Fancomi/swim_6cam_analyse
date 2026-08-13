@@ -4,9 +4,27 @@ namespace swim {
 namespace {
 
 constexpr int kBlock = 256;
+constexpr int kWarp  = 32;      // k_simcc_decode 的 blockDim，必须与之一致
 inline int grid(int n, int b = kBlock) { return (n + b - 1) / b; }
 
-// device 侧不能访问 host 的 std::array 常量，这里复制一份（值与 common.h 一致）
+// ── 本文件的检查宏（文案必须 ASCII）───────────────────────────────────────
+// nvcc 的前端（EDG）在中文 ACP(936) 机器上按 ANSI 解 .cu 源码，UTF-8 的中文
+// **字面量**会被拆成非法字节序列并吞掉右引号，报 `missing closing quote`；
+// -Xcompiler=/utf-8 只作用于 cl，加 BOM 也无效（实测「的/须/为/正/查/失/败」
+// 均触发）。中文**注释**不受影响，因此本文件注释照旧中文、字面量一律 ASCII，
+// 也因此不能在 .cu 里用 common.h 的 SWIM_CHECK（它的前缀是中文）。
+#define KCHECK(cond, msg)                                                     \
+  do {                                                                        \
+    if (!(cond)) throw std::runtime_error(std::string("kernels: ") + (msg));   \
+  } while (0)
+
+/// kernel 启动后立刻取错误：配置错误（grid/block 非法、共享内存超限）在这里就能
+/// 暴露，否则要等到下一次同步才报，且错误现场已丢失。
+#define KLAUNCHED(name) KCHECK(cudaPeekAtLastError() == cudaSuccess,           \
+    std::string(name) + " launch failed: " + cudaGetErrorString(cudaGetLastError()))
+
+// device 侧不能访问 host 的 constexpr 聚合，归一化参数只在这里定义一份
+// （值与 RTMPose data_preprocessor 一致，RGB 顺序）
 __device__ __constant__ float d_mean[3] = {123.675f, 116.28f, 103.53f};
 __device__ __constant__ float d_std[3]  = {58.395f, 57.12f, 57.375f};
 
@@ -97,7 +115,22 @@ __device__ inline float refine_peak(const float* p, int a, int len) {
   return fabsf(d) < 1e-9f ? static_cast<float>(a) : a + 0.5f * (l - r) / d;
 }
 
-/// 一个 block 处理一个 (person, keypoint)：先对 x 轴、再对 y 轴求 argmax。
+/// 一个 warp 处理一个 (person, keypoint)：两条轴各做一次跨步扫描 + warp 归约。
+/// 平票取小下标，与单线程顺序扫描（严格 >）的 argmax 结果逐值一致。
+/// 步长与归约都用编译期常量 kWarp（而非内置 warpSize），归约循环才能真正展开。
+__device__ inline void warp_argmax(const float* p, int len, float& best, int& arg) {
+  best = -1e30f;
+  arg  = 0;
+  for (int i = threadIdx.x; i < len; i += kWarp)
+    if (p[i] > best) { best = p[i]; arg = i; }
+#pragma unroll
+  for (int off = kWarp / 2; off > 0; off >>= 1) {
+    const float v = __shfl_down_sync(0xffffffffu, best, off);
+    const int   a = __shfl_down_sync(0xffffffffu, arg, off);
+    if (v > best || (v == best && a < arg)) { best = v; arg = a; }
+  }
+}
+
 __global__ void k_simcc_decode(const float* sx, const float* sy,
                                int n, int K, int wx, int wy,
                                const float* centers, const float* scales,
@@ -106,14 +139,13 @@ __global__ void k_simcc_decode(const float* sx, const float* sy,
   if (idx >= n * K) return;
   const int b = idx / K;
 
-  // 分别在两条轴上找峰值（长度 wx/wy 均 <= 1024，单线程扫描足够快且无需同步）
-  if (threadIdx.x != 0) return;
-  float best_x = -1e30f, best_y = -1e30f;
-  int   arg_x = 0, arg_y = 0;
   const float* px = sx + static_cast<size_t>(idx) * wx;
   const float* py = sy + static_cast<size_t>(idx) * wy;
-  for (int i = 0; i < wx; ++i) if (px[i] > best_x) { best_x = px[i]; arg_x = i; }
-  for (int i = 0; i < wy; ++i) if (py[i] > best_y) { best_y = py[i]; arg_y = i; }
+  float best_x, best_y;
+  int   arg_x, arg_y;
+  warp_argmax(px, wx, best_x, arg_x);
+  warp_argmax(py, wy, best_y, arg_y);
+  if (threadIdx.x != 0) return;               // 归约结果在 lane 0
 
   const float fx = refine_peak(px, arg_x, wx) / kSimccRatio;   // pose 输入坐标
   const float fy = refine_peak(py, arg_y, wy) / kSimccRatio;
@@ -126,15 +158,22 @@ __global__ void k_simcc_decode(const float* sx, const float* sy,
   scores[idx] = fminf(best_x, best_y);
 }
 
+/// end2end 输出 -> 紧凑框数组。名次由"前面通过阈值的个数"决定：无原子操作，
+/// 结果与 det 的原始顺序严格一致（可复现），也天然复刻 Python 的先后语义。
 __global__ void k_filter_boxes(const float* det, int max_det, float thr,
                                Letterbox lb, int sw, int sh, int max_keep,
                                float* boxes, float* conf, int* count) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= max_det) return;
   const float* d = det + i * 6;               // x1,y1,x2,y2,conf,cls
-  if (d[4] < thr) return;
-  const int k = atomicAdd(count, 1);
-  if (k >= max_keep) return;                  // 超出预留则丢弃（保持显存恒定）
+  const bool pass = d[4] >= thr;
+
+  int k = 0;
+  for (int j = 0; j < i; ++j) if (det[j * 6 + 4] >= thr) ++k;
+  // 末尾线程统一写总数并按预留量夹紧：下游只会看到 <= max_keep，无需再 clamp
+  if (i == max_det - 1) *count = min(k + (pass ? 1 : 0), max_keep);
+
+  if (!pass || k >= max_keep) return;         // 超出预留则丢弃（保持显存恒定）
   float* b = boxes + k * 4;
   b[0] = fmaxf(0.f, fminf(lb.to_src_x(d[0]), sw - 1.f));
   b[1] = fmaxf(0.f, fminf(lb.to_src_y(d[1]), sh - 1.f));
@@ -143,11 +182,14 @@ __global__ void k_filter_boxes(const float* det, int max_det, float thr,
   conf[k] = d[4];
 }
 
-/// 包含率去重 + 就地压缩。单线程：n<=40，O(n²) 仅约 1600 次比较，
+/// 包含率去重 + 就地压缩。单线程：n<=cap<=40，O(n²) 仅约 1600 次比较，
 /// 且要严格复刻 Python filter_contained_boxes 的顺序语义（含 break）。
-__global__ void k_dedup_boxes(float* boxes, float* conf, int* count, float thr) {
+/// cap 是调用方为 boxes/conf 预留的容量（--max-persons），不能用编译期上限代替，
+/// 否则 cap<40 时 keep[] 与 boxes[] 都会越界（曾表现为 0xC0000409 直接崩进程）。
+__global__ void k_dedup_boxes(float* boxes, float* conf, int* count, int cap,
+                              float thr) {
   if (threadIdx.x || blockIdx.x) return;
-  const int n = min(*count, kMaxPersons);
+  const int n = min(min(*count, cap), kMaxPersons);
   if (n <= 1) { *count = n; return; }
 
   bool keep[kMaxPersons];
@@ -190,6 +232,7 @@ void launch_preprocess(const uint8_t* src, int sw, int sh, __half* dst,
                        int size, Letterbox lb, cudaStream_t s) {
   const int n = size * size;
   k_preprocess<<<grid(n), kBlock, 0, s>>>(src, sw, sh, dst, size, lb);
+  KLAUNCHED("k_preprocess");
 }
 
 void launch_crop_affine(const uint8_t* src, int sw, int sh, const float* boxes,
@@ -199,6 +242,7 @@ void launch_crop_affine(const uint8_t* src, int sw, int sh, const float* boxes,
   const int total = n * kPoseH * kPoseW;
   k_crop_affine<<<grid(total), kBlock, 0, s>>>(src, sw, sh, boxes, n, dst,
                                                centers, scales);
+  KLAUNCHED("k_crop_affine");
 }
 
 void launch_simcc_decode(const float* sx, const float* sy, int n, int K,
@@ -206,21 +250,25 @@ void launch_simcc_decode(const float* sx, const float* sy, int n, int K,
                          const float* scales, float* kpts, float* scores,
                          cudaStream_t s) {
   if (n <= 0) return;
-  k_simcc_decode<<<n * K, 32, 0, s>>>(sx, sy, n, K, wx, wy, centers, scales,
-                                      kpts, scores);
+  k_simcc_decode<<<n * K, kWarp, 0, s>>>(sx, sy, n, K, wx, wy, centers, scales,
+                                         kpts, scores);
+  KLAUNCHED("k_simcc_decode");
 }
 
 void launch_filter_boxes(const float* det, int max_det, float thr, Letterbox lb,
                          int sw, int sh, int max_keep, float* boxes,
                          float* conf, int* count, cudaStream_t s) {
-  SWIM_CUDA(cudaMemsetAsync(count, 0, sizeof(int), s));
+  KCHECK(max_det > 0 && max_keep > 0, "filter_boxes: max_det/max_keep must be positive");
   k_filter_boxes<<<grid(max_det), kBlock, 0, s>>>(det, max_det, thr, lb, sw, sh,
                                                   max_keep, boxes, conf, count);
+  KLAUNCHED("k_filter_boxes");
 }
 
-void launch_dedup_boxes(float* boxes, float* conf, int* count, float thresh,
-                        cudaStream_t s) {
-  k_dedup_boxes<<<1, 1, 0, s>>>(boxes, conf, count, thresh);
+void launch_dedup_boxes(float* boxes, float* conf, int* count, int cap,
+                        float thresh, cudaStream_t s) {
+  KCHECK(cap > 0 && cap <= kMaxPersons, "dedup_boxes: cap must be within 1..kMaxPersons");
+  k_dedup_boxes<<<1, 1, 0, s>>>(boxes, conf, count, cap, thresh);
+  KLAUNCHED("k_dedup_boxes");
 }
 
 }  // namespace swim

@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.pytest_cache/
 # 虚拟环境
 .venv/
 # 数据与产物（体积大，不入库）
@@ -13,8 +14,6 @@ output/
 *.pkl
 # 模型权重：开发机训练产物，由 zip/外部交付，不入库
 weights/
-weights/*.pt
-weights/*.pth
 # 交接原版代码与对照脚本（仅本地验收用）
 .probe/
 .exp/
@@ -23,7 +22,7 @@ yolo/
 .vscode/
 .idea/
 .DS_Store
+.claude/settings.local.json
 # C++ 构建产物与模型中间物
-cpp/build/
 cpp/models/*.onnx
 cpp/models/*.engine

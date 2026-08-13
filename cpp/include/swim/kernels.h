@@ -57,7 +57,8 @@ void launch_simcc_decode(const float* simcc_x, const float* simcc_y,
 
 /// 辅助：把 detect 的 end2end 输出 [1,max_det,6](x1,y1,x2,y2,conf,cls)
 /// 按 conf 阈值筛选并映射回画布坐标，写入紧凑数组 boxes_d[n,4]+conf_d[n]。
-/// n 写入 count_d（device 上一个 int），调用方读回后决定 pose 的 batch。
+/// n 写入 count_d（device 上一个 int，已按 max_keep 夹紧），调用方读回后决定
+/// pose 的 batch。名次由前缀计数确定，与 det 原始顺序一致（无原子操作，可复现）。
 void launch_filter_boxes(const float* det, int max_det, float conf_thr,
                          Letterbox lb, int src_w, int src_h, int max_keep,
                          float* boxes_d, float* conf_d, int* count_d,
@@ -70,9 +71,10 @@ void launch_filter_boxes(const float* det, int max_det, float conf_thr,
 /// 残留的重复框会在跟踪时抢占 IoU 匹配、迫使新建 ID：实测不做此去重，
 /// 1000 帧的 track 数从 36 涨到 163（4.5 倍），表现为框"一下有一下没"。
 ///
-/// 就地压缩 boxes_d/conf_d 并更新 count_d。n<=40，单线程串行即可
+/// cap = 调用方为 boxes_d/conf_d 预留的容量（--max-persons），用于夹紧 count_d。
+/// 就地压缩 boxes_d/conf_d 并更新 count_d。n<=cap<=40，单线程串行即可
 /// （严格复刻 Python filter_contained_boxes 的顺序语义，含提前 break）。
-void launch_dedup_boxes(float* boxes_d, float* conf_d, int* count_d,
+void launch_dedup_boxes(float* boxes_d, float* conf_d, int* count_d, int cap,
                         float thresh, cudaStream_t stream);
 
 }  // namespace swim

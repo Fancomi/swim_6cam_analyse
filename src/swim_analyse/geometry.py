@@ -60,35 +60,37 @@ class MeshProjector:
 
     def __init__(self, mesh, tex_wh, xmin, ymin, ppm, canvas_h):
         tex_w, tex_h = tex_wh
-        self.dst, self.M, self.M_inv, self.offset = [], [], [], []
-        src_tris = []
+        # canvas_tris/M 的方向约定：M 把（去掉包围盒偏移的）画布点映射到相机原图，
+        # M_inv 反之。故三角形按所在坐标系命名，不用 src/dst（方向随调用而异）。
+        self.canvas_tris, self.M, self.M_inv, self.offset = [], [], [], []
+        source_tris = []
         for tri in mesh["triangles"]:
-            dst = np.array([[(v["pos"][0] - xmin) * ppm,
-                             canvas_h - 1 - (v["pos"][1] - ymin) * ppm]
-                            for v in tri], np.float32)
-            src = np.array([[v["uv"][0] * tex_w, (1.0 - v["uv"][1]) * tex_h]
-                            for v in tri], np.float32)
-            x, y, w, h = cv2.boundingRect(dst)
+            canvas = np.array([[(v["pos"][0] - xmin) * ppm,
+                                canvas_h - 1 - (v["pos"][1] - ymin) * ppm]
+                               for v in tri], np.float32)
+            source = np.array([[v["uv"][0] * tex_w, (1.0 - v["uv"][1]) * tex_h]
+                               for v in tri], np.float32)
+            x, y, w, h = cv2.boundingRect(canvas)
             if w <= 0 or h <= 0:
                 continue
             offset = np.float32([x, y])
             try:
-                M = cv2.getAffineTransform(dst - offset, src)
+                M = cv2.getAffineTransform(canvas - offset, source)
                 M_inv = cv2.invertAffineTransform(M)
             except cv2.error:      # 退化三角形（三点共线），面积为 0 直接丢弃
                 continue
-            self.dst.append(dst)
+            self.canvas_tris.append(canvas)
             self.M.append(M)
             self.M_inv.append(M_inv)
             self.offset.append(offset)
-            src_tris.append(src)
-        self._canvas_grid = _Grid([_tri_bbox(t) for t in self.dst])
-        self._source_grid = _Grid([_tri_bbox(t) for t in src_tris])
+            source_tris.append(source)
+        self._canvas_grid = _Grid([_tri_bbox(t) for t in self.canvas_tris])
+        self._source_grid = _Grid([_tri_bbox(t) for t in source_tris])
 
     def canvas_to_source(self, cx, cy):
         """画布点 -> 该相机原图点；点不在本相机覆盖范围内返回 None。"""
         for i in self._canvas_grid.candidates(cx, cy):
-            if _in_triangle(cx, cy, self.dst[i]):
+            if _in_triangle(cx, cy, self.canvas_tris[i]):
                 off = self.offset[i]
                 return _affine(self.M[i], cx - off[0], cy - off[1])
         return None
@@ -99,7 +101,7 @@ class MeshProjector:
             lx, ly = _affine(self.M_inv[i], sx, sy)
             off = self.offset[i]
             cx, cy = lx + off[0], ly + off[1]
-            if _in_triangle(cx, cy, self.dst[i]):
+            if _in_triangle(cx, cy, self.canvas_tris[i]):
                 return cx, cy
         return None
 

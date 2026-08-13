@@ -1,7 +1,7 @@
 // 公共类型、CUDA/TRT 错误检查、计时器。
 //
 // 全链路的核心约束：图像数据进 GPU 后不再回 CPU。
-// 只有三处小量 D2H：有效框数(4B)、框(≤300*5*4B)、关键点(≤40*17*3*4B)。
+// 只有两处小量 D2H：有效框数(4B) + 框与关键点合并成的一块(约 9KB)。
 #pragma once
 
 #include <cuda_runtime.h>
@@ -27,10 +27,7 @@ constexpr float kSimccRatio  = 2.0f;    // simcc_split_ratio
 constexpr float kBoxPadding  = 1.25f;   // GetBBoxCenterScale 的 padding
 constexpr int   kMaxDet      = 300;     // yolo26 end2end 的 max_det
 constexpr int   kMaxPersons  = 40;      // pose 的最大 batch（显存按此预留）
-
-// RTMPose data_preprocessor 的归一化参数（RGB 顺序）
-constexpr std::array<float, 3> kMean{123.675f, 116.28f, 103.53f};
-constexpr std::array<float, 3> kStd{58.395f, 57.12f, 57.375f};
+// 归一化参数（RGB 顺序）只在 device 侧用到，定义在 kernels.cu 的 __constant__ 里。
 
 // ── 错误检查 ──────────────────────────────────────────────────────────────
 #define SWIM_CUDA(call)                                                       \
@@ -84,7 +81,7 @@ struct FrameResult {
 // ── 分段计时（线程安全，用于耗时拆解）────────────────────────────────────
 class Timers {
  public:
-  void add(const std::string& key, double ms) {
+  void add(const char* key, double ms) {
     std::lock_guard<std::mutex> lk(mu_);
     auto& s = stat_[key];
     s.first += ms;
@@ -99,11 +96,11 @@ class Timers {
   std::map<std::string, std::pair<double, int64_t>> stat_;   // key -> (总ms, 次数)
 };
 
-/// RAII 计时：析构时把耗时写入 Timers。
+/// RAII 计时：析构时把耗时写入 Timers。key 恒为字面量，不持有字符串。
 class ScopedTimer {
  public:
-  ScopedTimer(Timers& t, std::string key)
-      : t_(t), key_(std::move(key)), t0_(std::chrono::steady_clock::now()) {}
+  ScopedTimer(Timers& t, const char* key)
+      : t_(t), key_(key), t0_(std::chrono::steady_clock::now()) {}
   ~ScopedTimer() {
     using namespace std::chrono;
     t_.add(key_, duration<double, std::milli>(steady_clock::now() - t0_).count());
@@ -111,11 +108,14 @@ class ScopedTimer {
 
  private:
   Timers&     t_;
-  std::string key_;
+  const char* key_;
   std::chrono::steady_clock::time_point t0_;
 };
 
-#define SWIM_TIME(timers, key) swim::ScopedTimer _st_##__LINE__((timers), (key))
+// 两级展开才能让 __LINE__ 先求值（单级时变量名恒为 _st___LINE__，同作用域两次即重定义）
+#define SWIM_TIME_CAT_(a, b) a##b
+#define SWIM_TIME_(t, k, ln) swim::ScopedTimer SWIM_TIME_CAT_(_st_, ln)((t), (k))
+#define SWIM_TIME(timers, key) SWIM_TIME_(timers, key, __LINE__)
 
 inline double now_ms() {
   using namespace std::chrono;

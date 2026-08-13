@@ -1,10 +1,15 @@
 // GPU 推理流水线：detect + crop + pose 全程显存驻留，一次 D2H 只取关键点。
 //
 // 三段线程并行（段间有界队列，深度小以形成自然背压）：
-//   [解码线程]  FrameSource -> GpuFrame          (H2D 或 NVDEC，独立 stream)
+//   [解码线程]  FrameSource -> GpuFrame          (解码 + H2D，独立 stream)
 //   [推理线程]  preprocess -> detect -> filter -> crop -> pose -> simcc_decode
-//               全部在同一 CUDA stream 上排队，只在取 count/关键点时同步
+//               全部在同一 CUDA stream 上排队
 //   [后处理线程] 跟踪 -> 划水/速度 -> 回调（渲染或落盘）
+//
+// 跨帧重叠：每帧的回读缓冲取自一个环，推理线程排完 cudaMemcpyAsync 只记一个
+// cudaEvent 就去处理下一帧，由后处理线程在真正读之前 eventSynchronize。
+// 于是「GPU 算第 n+1 帧」与「CPU 跟踪第 n 帧」天然并行。唯一必须当帧等待的是
+// 框数（pose 的 batch 取决于它，4 字节）。
 //
 // 为什么 detect 与 pose 不再拆两个线程：二者有数据依赖（pose 的 batch 取决于
 // detect 的框数），拆开只会引入跨线程同步，收益为负。同 stream 内 GPU 自身
@@ -13,6 +18,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -24,6 +30,16 @@
 #include "swim/trt_engine.h"
 
 namespace swim {
+
+/// 合法泳姿（与 cli.py 的 --stroke-type choices 一致）。一处定义，参数校验、
+/// 错误信息与 --help 共用，避免三处各写一份而漂移。
+constexpr const char* kStrokeTypes =
+    "freestyle backstroke butterfly breaststroke unknown";
+
+inline bool valid_stroke(const std::string& s) {
+  const std::string all = std::string(" ") + kStrokeTypes + " ";
+  return !s.empty() && all.find(" " + s + " ") != std::string::npos;
+}
 
 /// 有界阻塞队列：满则阻塞生产者（背压），close() 后消费者取空即退出。
 template <typename T>
@@ -76,12 +92,19 @@ struct PipelineOptions {
   float  track_iou        = 0.3f;
   int    track_max_lost   = 30;
   float  ppm              = 100.f;         // 画布每米像素数
+  /// 泳姿：只影响"左右是否分开计数"（对齐 metrics.py 的 split_sides）
+  std::string  stroke_type = "freestyle";
+  StrokeSignal signal      = StrokeSignal::ElbowAngle;
   int    queue_depth      = 3;
   bool   fp16             = true;
   int64_t max_frames      = 0;             // 0 = 不限
   /// 需要图像（渲染/预览）时置 true：每帧多一次整帧 D2H。
-  /// 纯分析模式保持 false —— 全链路只回读关键点，约 5 KB/帧。
+  /// 纯分析模式保持 false —— 全链路只回读关键点，约 9 KB/帧。
   bool   need_image       = false;
+
+  /// 参数区间自检（构造前调用；越界参数会在 kernel 里表现为越界或死循环，
+  /// 在这里一次性挡掉比在 GPU 上崩溃好定位）。
+  void validate() const;
 };
 
 class Pipeline {
@@ -99,19 +122,30 @@ class Pipeline {
   int64_t frames_done() const { return frames_done_; }
 
  private:
-  /// 一帧的推理产物（关键点已在 CPU）。
+  /// 回读环的一格：锁页 host 缓冲 + 该格 D2H 的完成事件。
+  /// 有了事件，推理线程排完拷贝即可继续下一帧，由消费者在真正用之前等待，
+  /// 从而让「GPU 算下一帧」与「CPU 处理上一帧」重叠。
+  template <typename T>
+  struct Slot {
+    T*          host  = nullptr;
+    cudaEvent_t ready = nullptr;
+  };
+
+  /// 一帧的推理产物（指向回读环，尚未落地；消费者等 ready 后再读）。
   struct Raw {
-    int64_t             index = -1;
-    std::vector<Person> persons;
-    /// 仅 need_image 时有效：指向锁页帧缓冲中的一格。
-    uint8_t*            bgr = nullptr;
-    int                 w = 0, h = 0;
+    int64_t      index = -1;
+    int          n     = 0;          // 本帧人数
+    Slot<float>* blob  = nullptr;    // 框+关键点，n>0 时非空
+    Slot<uint8_t>* frame = nullptr;  // 整帧 BGR，仅 need_image 时非空
+    int          w = 0, h = 0;
   };
 
   void infer_loop(FrameSource& src);
   void post_loop(const Sink& sink);
-  /// 单帧 GPU 链路，返回本帧人数。
-  int  infer_frame(const GpuFrame& f);
+  /// 单帧 GPU 链路，结果异步写入 blob，返回本帧人数。
+  int  infer_frame(const GpuFrame& f, Slot<float>& blob);
+  /// 渲染路径的整帧回读环：run() 开始时一次性分配，运行期不再分配。
+  void alloc_frame_ring(int w, int h);
 
   PipelineOptions opt_;
   double          fps_;
@@ -120,30 +154,32 @@ class Pipeline {
   std::unique_ptr<TrtEngine> det_, pose_;
   cudaStream_t               stream_ = nullptr;
 
-  // 预分配的 device 中间缓冲（运行期不再分配）
-  float* d_boxes_   = nullptr;   // [max_persons, 4]
-  float* d_conf_    = nullptr;   // [max_persons]
+  // 预分配的 device 中间缓冲（运行期不再分配）。
+  // boxes/conf/kpts/scores 连成一块 d_blob_，回读只需一次 D2H（约 9 KB）。
+  float* d_blob_    = nullptr;
+  float* d_boxes_   = nullptr;   // [max_persons, 4]  ┐
+  float* d_conf_    = nullptr;   // [max_persons]     ├ 指向 d_blob_ 内部
+  float* d_kpts_    = nullptr;   // [max_persons,K,2] │
+  float* d_scores_  = nullptr;   // [max_persons,K]   ┘
   int*   d_count_   = nullptr;   // 有效框数
   float* d_centers_ = nullptr;   // [max_persons, 2] 采样窗中心
   float* d_scales_  = nullptr;   // [max_persons, 2] 采样窗尺度
-  float* d_kpts_    = nullptr;   // [max_persons, K, 2]
-  float* d_scores_  = nullptr;   // [max_persons, K]
-  // 锁页 host 侧回读缓冲
-  int*   h_count_   = nullptr;
-  float* h_boxes_   = nullptr;
-  float* h_conf_    = nullptr;
-  float* h_kpts_    = nullptr;
-  float* h_scores_  = nullptr;
-  // need_image 时的整帧回读环（深度与队列一致，避免消费者还在用就被覆写）
-  std::vector<uint8_t*> h_frames_;
-  size_t                frame_bytes_ = 0;
-  size_t                frame_cursor_ = 0;
+  int*   h_count_   = nullptr;   // 唯一必须当帧同步的回读（决定 pose batch）
+  size_t blob_n_    = 0;         // d_blob_/h_blob_ 的 float 个数
+
+  // 深度 = 队列容量 + 消费者手上 1 + 生产者正在写 1，少一格会覆写在用的数据
+  std::vector<Slot<float>>   blob_ring_;
+  std::vector<Slot<uint8_t>> frame_ring_;
+  size_t                     frame_bytes_ = 0;
+  size_t                     cursor_      = 0;   // 两个环共用（仅推理线程访问）
 
   Channel<Raw>              chan_;
   Tracker                   tracker_;
   MetricsTracker            metrics_;
-  std::atomic<int64_t>       frames_done_{0};
-  std::atomic<bool>          stop_{false};
+  cudaEvent_t               ev_count_ = nullptr;   // 框数 D2H 完成
+  std::atomic<int64_t>      frames_done_{0};
+  std::atomic<bool>         stop_{false};
+  std::exception_ptr        err_;                  // 后处理线程的异常，join 后重抛
 };
 
 }  // namespace swim

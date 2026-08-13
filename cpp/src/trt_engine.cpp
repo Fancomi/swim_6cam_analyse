@@ -2,6 +2,7 @@
 
 #include <NvOnnxParser.h>
 
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sys/stat.h>
@@ -11,21 +12,60 @@ namespace {
 
 class Logger : public nvinfer1::ILogger {
   void log(Severity s, const char* msg) noexcept override {
-    if (s <= Severity::kWARNING) printf("[TRT] %s\n", msg);
+    // 错误走 stderr 并带级别前缀：构建失败时日志常被重定向，混在 stdout 里难定位
+    switch (s) {
+      case Severity::kINTERNAL_ERROR:
+      case Severity::kERROR:   fprintf(stderr, "[TRT/E] %s\n", msg); break;
+      case Severity::kWARNING: fprintf(stderr, "[TRT/W] %s\n", msg); break;
+      default: break;                       // kINFO/kVERBOSE 太啰嗦，丢弃
+    }
   }
 };
 Logger g_logger;
 
-/// 文件修改时间；不存在返回 0
-time_t mtime_of(const std::string& p) {
+struct FileStamp {
+  int64_t mtime = 0, size = 0;
+  bool exists() const { return size >= 0 && mtime != 0; }
+};
+
+FileStamp stamp_of(const std::string& p) {
   struct stat st{};
-  return stat(p.c_str(), &st) == 0 ? st.st_mtime : 0;
+  if (stat(p.c_str(), &st) != 0) return {};
+  return {static_cast<int64_t>(st.st_mtime), static_cast<int64_t>(st.st_size)};
 }
 
 std::vector<char> read_file(const std::string& p) {
   std::ifstream f(p, std::ios::binary);
   SWIM_CHECK(f.good(), "打不开文件 " + p);
   return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+/// engine 缓存的身份戳：engine 与「ONNX 内容 + TRT 版本 + GPU 架构 + 精度 +
+/// batch 上限」全部绑定，任一变化都必须重建。只比 mtime 会静默复用错的 engine
+/// （换 GPU、换 --max-persons、换 --fp32 都不会碰 onnx 的 mtime）。
+/// 版本用 getInferLibVersion()（运行期实际加载的 TRT）而非编译期宏 —— engine
+/// 是给运行期反序列化用的，且 10.x 头文件里并无 NV_TENSORRT_VERSION 这个宏。
+std::string engine_tag(const std::string& onnx, int max_b, bool fp16) {
+  const FileStamp s = stamp_of(onnx);
+  cudaDeviceProp prop{};
+  int dev = 0;
+  SWIM_CUDA(cudaGetDevice(&dev));
+  SWIM_CUDA(cudaGetDeviceProperties(&prop, dev));
+  char buf[128];
+  snprintf(buf, sizeof buf, "sm%d%d-trt%d-b%d-%s-%llx-%llx", prop.major, prop.minor,
+           getInferLibVersion(), max_b, fp16 ? "fp16" : "fp32",
+           static_cast<unsigned long long>(s.mtime),
+           static_cast<unsigned long long>(s.size));
+  return buf;
+}
+
+/// 把身份戳插进文件名：cpp/models/pose.engine -> cpp/models/pose.<tag>.engine
+std::string tagged_path(const std::string& base, const std::string& tag) {
+  const size_t dot = base.find_last_of('.');
+  const size_t sep = base.find_last_of("/\\");
+  return (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+             ? base + "." + tag
+             : base.substr(0, dot) + "." + tag + base.substr(dot);
 }
 
 size_t elem_size(nvinfer1::DataType t) {
@@ -40,9 +80,13 @@ size_t elem_size(nvinfer1::DataType t) {
   }
 }
 
-size_t volume(const nvinfer1::Dims& d) {
+/// 元素数。负维（未解析的动态/符号维）必须报错——当成 1 会静默少分配显存。
+size_t volume(const nvinfer1::Dims& d, const std::string& who) {
   size_t v = 1;
-  for (int i = 0; i < d.nbDims; ++i) v *= static_cast<size_t>(d.d[i] < 0 ? 1 : d.d[i]);
+  for (int i = 0; i < d.nbDims; ++i) {
+    SWIM_CHECK(d.d[i] >= 0, who + " 存在未确定维度，无法计算显存大小");
+    v *= static_cast<size_t>(d.d[i]);
+  }
   return v;
 }
 
@@ -64,6 +108,12 @@ void build_engine(const std::string& onnx, const std::string& out,
   if (fp16) cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
 
   if (!dyn_input.empty()) {
+    // profile 非法（如 opt > max）时 buildSerializedNetwork 只会返回空指针，
+    // 报"engine 构建失败"看不出因果，在这里先挡住
+    SWIM_CHECK(1 <= min_b && min_b <= opt_b && opt_b <= max_b,
+               "动态 batch profile 非法：须 1 <= min <= opt <= max，收到 " +
+                   std::to_string(min_b) + "/" + std::to_string(opt_b) + "/" +
+                   std::to_string(max_b));
     auto* prof = builder->createOptimizationProfile();
     for (int i = 0; i < net->getNbInputs(); ++i) {
       auto* t = net->getInput(i);
@@ -79,10 +129,17 @@ void build_engine(const std::string& onnx, const std::string& out,
 
   TrtPtr<nvinfer1::IHostMemory> plan(builder->buildSerializedNetwork(*net, *cfg));
   SWIM_CHECK(plan, "engine 构建失败");
-  std::ofstream f(out, std::ios::binary);
-  SWIM_CHECK(f.good(), "无法写入 " + out);
-  f.write(static_cast<const char*>(plan->data()), plan->size());
-  printf("[TRT] engine %.1f MB 已写入\n", plan->size() / 1e6);
+  // 先写临时文件再 rename：中途崩溃/断电不会留下半截 engine 被下次误当缓存
+  const std::string tmp = out + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary);
+    SWIM_CHECK(f.good(), "无法写入 " + tmp);
+    f.write(static_cast<const char*>(plan->data()), plan->size());
+    SWIM_CHECK(f.good(), "写入未完成 " + tmp + "（磁盘满？）");
+  }
+  std::remove(out.c_str());                   // Windows 的 rename 不覆盖已存在文件
+  SWIM_CHECK(std::rename(tmp.c_str(), out.c_str()) == 0, "重命名失败 " + tmp);
+  printf("[TRT] engine %.1f MB 已写入 %s\n", plan->size() / 1e6, out.c_str());
 }
 
 }  // namespace
@@ -90,16 +147,30 @@ void build_engine(const std::string& onnx, const std::string& out,
 std::unique_ptr<TrtEngine> TrtEngine::load(
     const std::string& onnx_path, const std::string& engine_path,
     const std::string& dynamic_input, int min_b, int opt_b, int max_b, bool fp16) {
-  // engine 与 GPU 型号/TRT 版本绑定，不可跨机复制；比 onnx 旧则重建
-  if (mtime_of(engine_path) < mtime_of(onnx_path))
-    build_engine(onnx_path, engine_path, dynamic_input, min_b, opt_b, max_b, fp16);
+  SWIM_CHECK(stamp_of(onnx_path).exists(), "找不到 ONNX " + onnx_path +
+             "（先跑 cpp/tools/export_onnx.py）");
+  // engine 缓存按身份戳独立命名：换 GPU/TRT/精度/batch 各存一份，互不覆盖
+  const std::string path = tagged_path(engine_path, engine_tag(onnx_path, max_b, fp16));
+  if (!stamp_of(path).exists())
+    build_engine(onnx_path, path, dynamic_input, min_b, opt_b, max_b, fp16);
 
   auto e = std::unique_ptr<TrtEngine>(new TrtEngine());
   e->dyn_input_ = dynamic_input;
   e->runtime_.reset(nvinfer1::createInferRuntime(g_logger));
-  auto blob = read_file(engine_path);
-  e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
-  SWIM_CHECK(e->engine_, "engine 反序列化失败（GPU 型号或 TRT 版本不匹配？）");
+  SWIM_CHECK(e->runtime_, "createInferRuntime 失败");
+  {
+    auto blob = read_file(path);
+    e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
+  }
+  if (!e->engine_) {
+    // 身份戳一致却反序列化失败 = 文件损坏，删掉重建一次；再失败才抛
+    printf("[TRT] %s 反序列化失败，删除并重建\n", path.c_str());
+    std::remove(path.c_str());
+    build_engine(onnx_path, path, dynamic_input, min_b, opt_b, max_b, fp16);
+    auto blob = read_file(path);
+    e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
+    SWIM_CHECK(e->engine_, "engine 反序列化失败 " + path);
+  }
   // kUSER_MANAGED：显存自管，避免运行时重分配
   e->ctx_.reset(e->engine_->createExecutionContext(
       nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
@@ -127,15 +198,20 @@ void TrtEngine::init_bindings(int max_batch) {
     // 按 max_batch 分配：动态维填 max_batch，后续 set_batch 只改逻辑尺寸
     b.dims = engine_->getTensorShape(b.name.c_str());
     if (b.dims.d[0] < 0) b.dims.d[0] = max_batch;
-    b.bytes = volume(b.dims) * elem_size(engine_->getTensorDataType(b.name.c_str()));
-    SWIM_CUDA(cudaMalloc(&b.ptr, b.bytes));
+    b.bytes = volume(b.dims, b.name) *
+              elem_size(engine_->getTensorDataType(b.name.c_str()));
+    SWIM_CHECK(cudaMalloc(&b.ptr, b.bytes) == cudaSuccess,
+               "绑定 " + b.name + " 分配 " + std::to_string(b.bytes / (1 << 20)) +
+                   " MB 显存失败（显存不足？可降 --max-persons）");
     SWIM_CHECK(ctx_->setTensorAddress(b.name.c_str(), b.ptr),
                std::string("setTensorAddress 失败 ") + b.name);
   }
   set_batch(max_batch);   // 先按最大形状问一次工作区大小
   workspace_bytes_ = ctx_->updateDeviceMemorySizeForShapes();
   SWIM_CHECK(workspace_bytes_ > 0, "updateDeviceMemorySizeForShapes 返回 0");
-  SWIM_CUDA(cudaMalloc(&workspace_, workspace_bytes_));
+  SWIM_CHECK(cudaMalloc(&workspace_, workspace_bytes_) == cudaSuccess,
+             "engine 工作区 " + std::to_string(workspace_bytes_ / (1 << 20)) +
+                 " MB 分配失败（显存不足？）");
   ctx_->setDeviceMemoryV2(workspace_, static_cast<int64_t>(workspace_bytes_));
   printf("[TRT] %zu 输入 / %zu 输出, batch<=%d, 工作区 %.1f MB\n",
          in_idx_.size(), out_idx_.size(), max_batch, workspace_bytes_ / 1e6);
@@ -154,7 +230,8 @@ void TrtEngine::set_batch(int batch) {
   // 输入形状变化会传播到输出，同步各绑定的逻辑字节数（显存不动）
   for (auto& b : bindings_) {
     b.dims = ctx_->getTensorShape(b.name.c_str());
-    b.bytes = volume(b.dims) * elem_size(engine_->getTensorDataType(b.name.c_str()));
+    b.bytes = volume(b.dims, b.name) *
+              elem_size(engine_->getTensorDataType(b.name.c_str()));
   }
 }
 

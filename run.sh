@@ -21,13 +21,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${VENV:-$ROOT/.venv}/bin/python"
-[[ -x "$PYTHON" ]] || { echo "未找到 $PYTHON，请先执行 bash install.sh" >&2; exit 1; }
+VENV="${VENV:-$ROOT/.venv}"
+# venv 的解释器：Linux 在 bin/python，Windows 在 Scripts/python.exe
+PYTHON="$VENV/bin/python"
+[[ -x "$PYTHON" ]] || PYTHON="$VENV/Scripts/python.exe"
+[[ -x "$PYTHON" ]] || { echo "[run] 未找到 $VENV 下的 Python，请先执行 bash install.sh" >&2; exit 1; }
 
 PLAN="${1:-C}"
 case "$PLAN" in
   A|B|C) shift ;;
-  *) echo "用法: bash run.sh {A|B|C} [其他参数...]" >&2; exit 1 ;;
+  *) echo "[run] 用法: bash run.sh {A|B|C} [其他参数...]" >&2; exit 1 ;;
 esac
 
 DATA_DIR="${DATA_DIR:-$ROOT/data/20260629}"

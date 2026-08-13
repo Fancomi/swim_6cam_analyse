@@ -38,8 +38,10 @@ struct Binding {
 
 class TrtEngine {
  public:
-  /// onnx_path 存在且 engine_path 不存在或更旧时，自动构建并缓存 engine。
-  /// dynamic_input/min/opt/max：需要动态 batch 时给出，否则留空。
+  /// engine 缓存按身份戳命名（ONNX mtime/size + TRT 版本 + SM + 精度 + batch
+  /// 上限），engine_path 只作为基名：pose.engine -> pose.<tag>.engine。
+  /// 缺文件才构建，因此换 GPU / 换 --max-persons / 换 --fp32 都会各存一份，
+  /// 不会互相覆盖，也不会静默复用不匹配的 engine。
   static std::unique_ptr<TrtEngine> load(
       const std::string& onnx_path, const std::string& engine_path,
       const std::string& dynamic_input = "", int min_b = 1, int opt_b = 1,

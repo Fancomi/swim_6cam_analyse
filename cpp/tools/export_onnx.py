@@ -7,7 +7,9 @@ TensorRT 11 起强类型模式恒开、`BuilderFlag::kFP16` 已移除 —— 精
 
   detect  yolo26 (ultralytics)
       in   images     [1, 3, H, W]        fp16, RGB, /255, letterbox
-      out  output0    [1, 4+nc, N]        cx,cy,w,h + 类别分数（未做 NMS）
+      out  output0    [1, 300, 6]         x1,y1,x2,y2,conf,cls（letterbox 坐标系）
+                                          yolo26 是 end2end 结构，NMS 已在图内，
+                                          300 = max_det，不足处以 conf=0 填充
   pose    RTMPose-m
       in   input      [B, 3, 256, 192]    fp16, RGB, ImageNet 归一化
       out  simcc_x    [B, 17, 384]        384 = 192 * simcc_split_ratio
