@@ -17,7 +17,7 @@ Stage1/2 的结果缓存到 output_dir/cache.pkl，键是"所有影响该结果�
 视频/权重文件的 (大小, mtime)"的哈希：键一致才复用 —— 调信号参数、换绘制选项
 都不必重跑 GPU，而换模型或改阈值一定会重算（见 cache_key）。
 
-用法见 run.sh，或 `python -m swim_analyse.cli --help`。
+用法见 scripts/run.sh，或 `python -m swim_analyse.cli --help`。
 """
 
 import argparse

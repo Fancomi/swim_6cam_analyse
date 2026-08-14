@@ -17,7 +17,7 @@ Windows 特有的环境要求、编码规则与已知坑；每条坑的修复都
 | CMake | ≥3.18 | |
 | ffmpeg CLI | 任意近期版本 | 在 `PATH` 里。**默认解码路径与 `--out` 编码都要它** |
 
-`build.bat` 里三个可覆盖的环境变量：`SWIM_TRT_ROOT`、`SWIM_VCPKG`、`SWIM_CUDA_ARCH`
+`scripts/build.bat` 里三个可覆盖的环境变量：`SWIM_TRT_ROOT`、`SWIM_VCPKG`、`SWIM_CUDA_ARCH`
 （RTX40=`89`，RTX50=`120`，RTX30=`86`；不要用 CMake 默认的 `86 89 90`，多架构编译慢很多）。
 运行期还要让 TRT 的 DLL 可见 —— `scripts/env.bat` 会把 `SWIM_TRT_LIB`（默认
 `<TRT_ROOT>\lib`）加进 `PATH`，三个 `.bat` 都 `call` 它。
@@ -26,7 +26,7 @@ Windows 特有的环境要求、编码规则与已知坑；每条坑的修复都
 Linux 是 `libnvinfer.so`。`cpp/CMakeLists.txt` 两套名字都找。
 
 **engine 与 GPU + TRT 版本绑定**：Linux 上构建的 `.engine` 在 Windows 无效，
-首次运行会自动重建（几分钟）。`.onnx` 也不入库，`build.bat` 会从 `weights/` 导出。
+首次运行会自动重建（几分钟）。`.onnx` 也不入库，`scripts/build.bat` 会从 `weights/` 导出。
 
 ## 2. 脚本编码规则（改脚本前必读）
 
@@ -75,15 +75,15 @@ powershell.exe -NoProfile -Command "[System.Management.Automation.Language.Parse
    换新驱动后把 `Writer` 的命令改 `-c:v h264_nvenc` 即可提速。
 5. **装 torch 会把 numpy 顶到 2.x** —— `import torch` 报
    `Failed to initialize NumPy: _ARRAY_API not found`（torch 的 C 扩展按 numpy1 ABI 编译）。
-   必须在装 mmcv/mmpose **之前** `pip install numpy==1.26.4 "setuptools<81"`。`install.sh` 已按序处理。
-6. **`python3` 可能是 WindowsApps 空壳**（只会弹应用商店）—— `install.sh` 逐个候选试
+   必须在装 mmcv/mmpose **之前** `pip install numpy==1.26.4 "setuptools<81"`。`scripts/install.sh` 已按序处理。
+6. **`python3` 可能是 WindowsApps 空壳**（只会弹应用商店）—— `scripts/install.sh` 逐个候选试
    3.10 并在最后回退 `py -3.10`。
 7. **`export_onnx.py` 会在 `weights/` 下留一个中间 `yolo_swim_detect.onnx`** ——
    ultralytics 先写在 `.pt` 旁边再 `os.replace`，可手动删掉。
 
 ## 4. Python 环境（参考实现用，Windows 实测顺序）
 
-**Python 必须 3.10**（mmcv 预编译 wheel 只提供 cp310）。`install.sh` 在 Git Bash 里可直接跑，
+**Python 必须 3.10**（mmcv 预编译 wheel 只提供 cp310）。`scripts/install.sh` 在 Git Bash 里可直接跑，
 它会自动选 `Scripts/python.exe`。想手动装就照这个顺序（**顺序不能乱**，第 3 步是关键）：
 
 ```powershell
@@ -97,12 +97,12 @@ python -m venv .venv
 ```
 
 实测组合：Python 3.10.11 / torch 2.1.0+cu121 / opencv-python 4.10.0 / mmcv 2.1.0 /
-mmpose 1.3.1 / mmdet 3.2.0。自检 `bash test.sh`。
+mmpose 1.3.1 / mmdet 3.2.0。自检 `bash scripts/test.sh`。
 
 ## 5. 调试技巧（Windows 特有）
 
 - **中文输出乱码**：先查是不是漏了 `/utf-8`、`SetConsoleOutputCP`，或 Python 侧忘了
-  `PYTHONUTF8=1`（`run.sh`/`install.sh`/`test.sh` 都已导出）。
+  `PYTHONUTF8=1`（`scripts/` 下的三个 `.sh` 都已导出）。
 - **显存量**：用运行前后 `nvidia-smi --query-gpu=memory.used` 的差值。
   `--query-compute-apps=used_memory` 在 Windows WDDM 下返回 `[N/A]`，别用它。
 - **渲染产物校验**：`ffprobe` 看帧数/分辨率，再 `ffmpeg -i out.mp4 -f null -` 全量解码

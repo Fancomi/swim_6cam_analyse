@@ -9,8 +9,8 @@
 
 | | 用途 | 入口 | 速度 |
 | --- | --- | --- | --- |
-| **C++/CUDA** | 实时、上线、看效果 | 双击 `run_preview.bat` | 65–78 fps |
-| **Python** | 换模型、Plan A/B/C 对比、评测 | `bash run.sh C` | 约 13 倍实时 |
+| **C++/CUDA** | 实时、上线、看效果 | 双击 `scripts/preview.bat` | 65–78 fps |
+| **Python** | 换模型、Plan A/B/C 对比、评测 | `bash scripts/run.sh C` | 约 13 倍实时 |
 
 C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边靠数值对照保持一致。
 **Agent / 新人先读 [`CLAUDE.md`](CLAUDE.md)** —— 它说明该走哪条线、只读哪些文件、
@@ -18,25 +18,25 @@ C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边
 
 ## 快速开始
 
-**Windows（推荐，C++ 实时链路）** —— 双击即可，无需命令行：
+**Windows（推荐，C++ 实时链路）** —— 双击 `scripts\` 里的三个 `.bat` 即可，无需命令行：
 
 ```
-build.bat          构建 + 从 weights/ 导出 ONNX（首次一次）
-run_preview.bat    实时预览窗口（也可把视频拖到它上面，或传 rtsp:// 流）
-run_analyse.bat    批处理出 json，加 --out o.mp4 出标注视频
+scripts\build.bat      构建 + 从 weights/ 导出 ONNX（首次一次）
+scripts\preview.bat    实时预览窗口（也可把视频拖到它上面，或传 rtsp:// 流）
+scripts\analyse.bat    批处理出 json，加 --out o.mp4 出标注视频
 ```
 
-首次运行 `run_preview.bat` 会构建 TensorRT engine（几分钟），之后秒开。
+首次运行 `scripts\preview.bat` 会构建 TensorRT engine（几分钟），之后秒开。
 环境要求与踩过的坑见 [`docs/windows.md`](docs/windows.md)。
 
 **Python 参考链路（Linux 或 Git Bash）**：
 
 ```bash
-bash install.sh                # 建 .venv、装依赖、跑自检
-bash run.sh C                  # Plan C（推荐），默认数据
-bash run.sh C --max-frames 300 # 先跑 300 帧确认链路
-bash run.sh A                  # Plan A（交接原版，需六路原相机视频）
-bash test.sh                   # 秒级自检；--full 加 30 帧 GPU 冒烟
+bash scripts/install.sh                # 建 .venv、装依赖、跑自检
+bash scripts/run.sh C                  # Plan C（推荐），默认数据
+bash scripts/run.sh C --max-frames 300 # 先跑 300 帧确认链路
+bash scripts/run.sh A                  # Plan A（交接原版，需六路原相机视频）
+bash scripts/test.sh                   # 秒级自检；--full 加 30 帧 GPU 冒烟
 ```
 
 Python 结果落在 `output/<视频名>_plan<X>/`：
@@ -118,9 +118,10 @@ Plan B/C 把 Stage1+2 换成画布单遍或画布两阶段，Stage3/4 不变。
 
 ```
 CLAUDE.md                        导航：该走哪条线、同步契约、验证方法（先读这个）
-build.bat run_preview.bat run_analyse.bat   Windows C++ 入口（双击）
-scripts/env.bat                  三个 bat 共用的前置检查（TRT/exe/onnx/ffmpeg）
-install.sh run.sh test.sh        Python 入口（Linux / Git Bash）
+scripts/                         全部用户入口，脚本自己 cd 到仓库根，从哪调都一样
+  build.bat preview.bat analyse.bat   Windows C++ 入口（双击）
+  env.bat                        三个 bat 共用的前置检查（TRT/exe/onnx/ffmpeg），不单独跑
+  install.sh run.sh test.sh      Python 入口（Linux / Git Bash）
 configs/
   pool_mesh.json                 泳池 mesh 标定（六路相机三角面片 + UV），仅 Plan A 用
   rtmpose-m_swim-256x192.py      Plan A 的原相机 RTMPose 推理配置
@@ -136,6 +137,9 @@ src/swim_analyse/                Python 参考实现
   draw.py        骨架 / 标签绘制
   video.py       多路视频的帧级随机读取（带帧缓存），Plan A 用
 cpp/                             C++/CUDA 实时实现（Plan C），见 cpp/README.md
+  src/ include/swim/             实现与头文件
+  tools/export_onnx.py           weights/ -> ONNX（scripts/build.bat 会调）
+  models/                        ONNX 与 TRT engine（除 pose_meta.json 外不入库）
 tests/test_core.py               纯逻辑单元测试（无需 GPU 和数据）
 docs/
   windows.md                     Windows 环境要求、脚本编码规则、踩过的坑
@@ -171,8 +175,8 @@ cam1.mp4 ... cam6.mp4 六路原始相机视频（3840x2160）
 用其他数据时通过环境变量指定：
 
 ```bash
-CANVAS=/path/to/merged.mp4 bash run.sh C          # Plan B/C 只要画布
-DATA_DIR=/path/to/20260629 bash run.sh A          # Plan A 还要同目录下的 cam*.mp4
+CANVAS=/path/to/merged.mp4 bash scripts/run.sh C   # Plan B/C 只要画布
+DATA_DIR=/path/to/20260629 bash scripts/run.sh A   # Plan A 还要同目录下的 cam*.mp4
 ```
 
 > **相机顺序（仅 Plan A）**：`--camera-videos` 必须按 `pool_mesh.json` 里 `meshes` 数组的
@@ -182,13 +186,13 @@ DATA_DIR=/path/to/20260629 bash run.sh A          # Plan A 还要同目录下的
 ## 常用参数
 
 ```bash
-bash run.sh --help                            # 全部参数
-bash run.sh C --signal wrist_x_head           # 换划水信号
-bash run.sh C --stroke-type breaststroke      # 换泳姿
-bash run.sh C --kpt-thr 0.5                   # 提高单点置信度门槛（影响信号/插值/绘制）
-bash run.sh C --pose-score-thr 0.5            # 仅 Plan A：17 点均值低于此值才换相机补检
-bash run.sh C --codec mp4v                    # 换编码（默认 h264）
-DRAW_KEYPOINTS= bash run.sh C                 # 关掉骨架叠加（渲染更快）
+bash scripts/run.sh --help                        # 全部参数
+bash scripts/run.sh C --signal wrist_x_head       # 换划水信号
+bash scripts/run.sh C --stroke-type breaststroke  # 换泳姿
+bash scripts/run.sh C --kpt-thr 0.5               # 提高单点置信度门槛（影响信号/插值/绘制）
+bash scripts/run.sh C --pose-score-thr 0.5        # 仅 Plan A：17 点均值低于此值才换相机补检
+bash scripts/run.sh C --codec mp4v                # 换编码（默认 h264）
+DRAW_KEYPOINTS= bash scripts/run.sh C             # 关掉骨架叠加（渲染更快）
 ```
 
 `--kpt-thr` 与 `--pose-score-thr` 是**两个不同的东西**，只是默认值都是 0.4：前者是单个
@@ -204,11 +208,11 @@ DRAW_KEYPOINTS= bash run.sh C                 # 关掉骨架叠加（渲染更�
 Python 侧版本被锁在 **Python 3.10 + torch 2.1.0(cu121) + mmcv 2.1.0 + mmpose 1.3.1**，
 原因是 mmcv 的 CUDA 算子只有预编译 wheel 可用，而 OpenMMLab 只为特定 torch/CUDA
 组合发布 wheel；`cu121/torch2.1.0` 是同时满足 mmpose 1.3.1 与 mmdet 3.2.0
-（两者都要求 `mmcv<2.2.0`）的组合。内网环境下 `install.sh` 需要代理才能取到 mmcv wheel：
+（两者都要求 `mmcv<2.2.0`）的组合。内网环境下 `scripts/install.sh` 需要代理才能取到 mmcv wheel：
 
 ```bash
 export https_proxy=http://<proxy>:<port> http_proxy=http://<proxy>:<port>
-bash install.sh
+bash scripts/install.sh
 ```
 
 C++ 侧只需 CUDA 12.x + TensorRT 10.11 + OpenCV 4.x + ffmpeg CLI，不依赖上面这套 Python

@@ -5,19 +5,21 @@ rem Notes live in cpp/README.md, not here.
 rem
 rem   double-click              -> preview the default canvas video
 rem   drag a video onto me      -> preview that file
-rem   run_preview.bat URL       -> rtsp:// / rtmp:// / http:// live stream
-rem   run_preview.bat --preview-scale 0.5   -> flags are passed through
+rem   preview.bat URL           -> rtsp:// / rtmp:// / http:// live stream
+rem   preview.bat --preview-scale 0.5       -> flags are passed through
 rem
 rem Every frame runs detect + pose + tracking live; nothing is replayed.
 rem Press q or ESC on the window to stop.
 rem
-rem Write json / mp4 instead of a window: run_analyse.bat
+rem Write json / mp4 instead of a window: analyse.bat
 rem Build / export ONNX first:            build.bat
 rem Override the TensorRT lib dir:        set SWIM_TRT_LIB=<dir>
 
 setlocal
-cd /d "%~dp0"
-call scripts\env.bat || goto :end
+rem This script lives in scripts\ but all paths below are repo-root relative,
+rem so cd to the parent of %~dp0. Double-click still works from anywhere.
+cd /d "%~dp0.."
+call "%~dp0env.bat" || goto :end
 
 rem Arg 1 is the input only when it does not start with "-"; everything else is
 rem passed through. Collected with a shift loop (not %1..%9) so quoting survives

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # 一条命令验证仓库还好用。默认只跑秒级检查，加 --full 才跑 GPU 冒烟。
 #
-#   bash test.sh              # 单元测试 + 入口脚本语法（无需 GPU/权重，约 2 秒）
-#   bash test.sh --full       # 再加 Python Plan C 与 C++ 各 30 帧的真实冒烟
+#   bash scripts/test.sh          # 单元测试 + 入口脚本语法（无需 GPU/权重，约 2 秒）
+#   bash scripts/test.sh --full   # 再加 Python Plan C 与 C++ 各 30 帧的真实冒烟
 #
 # 冒烟的产物全部落在 output/_smoke_*，跑完自动删除。
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # scripts/ 的上一级 = 仓库根
 cd "$ROOT"
 export PYTHONUTF8=1
 FULL=0; [[ "${1:-}" == "--full" ]] && FULL=1
@@ -27,13 +27,15 @@ PYTHON="$ROOT/.venv/bin/python"
 [[ -x "$PYTHON" ]] || PYTHON="$ROOT/.venv/Scripts/python.exe"
 
 # ── 1. 入口脚本语法 ─────────────────────────────────────────────────────────
-for f in run.sh install.sh test.sh; do run "语法 $f" bash -n "$f"; done
+for f in scripts/run.sh scripts/install.sh scripts/test.sh; do
+  run "语法 $(basename "$f")" bash -n "$f"
+done
 
 # ── 2. 单元测试（纯逻辑，无需 GPU 与数据）───────────────────────────────────
 if [[ -x "$PYTHON" ]]; then
   run "单元测试 pytest tests" "$PYTHON" -m pytest tests -q
 else
-  skip "单元测试" "未找到 .venv，先跑 bash install.sh"
+  skip "单元测试" "未找到 .venv，先跑 bash scripts/install.sh"
 fi
 
 # ── 3. GPU 冒烟（--full）────────────────────────────────────────────────────
@@ -47,7 +49,7 @@ else
   if [[ -x "$PYTHON" && -f weights/plans/planC_rtmpose_m_canvas.pth ]]; then
     rm -rf "$SMOKE"
     run "Python Plan C 30 帧" env CANVAS="$CANVAS" OUTPUT_DIR="$SMOKE" \
-      bash run.sh C --max-frames 30
+      bash scripts/run.sh C --max-frames 30
     [[ -f "$SMOKE/result.json" ]] && ok "Plan C 产出 result.json" \
                                   || bad "Plan C 未产出 result.json"
     rm -rf "$SMOKE"
@@ -68,7 +70,7 @@ else
     [[ -s "$JSON" ]] && ok "C++ 产出 json" || bad "C++ 未产出 json"
     rm -f "$JSON"
   else
-    skip "C++ 冒烟" "未构建（双击 build.bat）或缺少 cpp/models/*.onnx"
+    skip "C++ 冒烟" "未构建（双击 scripts/build.bat）或缺少 cpp/models/*.onnx"
   fi
 fi
 

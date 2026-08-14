@@ -5,16 +5,18 @@ rem Notes live in cpp/README.md, not here.
 rem
 rem   double-click              -> analyse the default canvas, write json only
 rem   drag a video onto me      -> analyse that file
-rem   run_analyse.bat f --out o.mp4     -> also write an annotated video
-rem   run_analyse.bat --max-frames 300  -> default input, flags passed through
+rem   analyse.bat f --out o.mp4     -> also write an annotated video
+rem   analyse.bat --max-frames 300  -> default input, flags passed through
 rem
-rem Live preview instead of batch: run_preview.bat
+rem Live preview instead of batch: preview.bat
 rem Build / export ONNX first:     build.bat
 rem Override the TensorRT lib dir: set SWIM_TRT_LIB=<dir>
 
 setlocal
-cd /d "%~dp0"
-call scripts\env.bat || goto :end
+rem This script lives in scripts\ but all paths below are repo-root relative,
+rem so cd to the parent of %~dp0. Double-click still works from anywhere.
+cd /d "%~dp0.."
+call "%~dp0env.bat" || goto :end
 
 rem Arg 1 is the input only when it does not start with "-"; everything else is
 rem passed through. Collected with a shift loop (not %1..%9) so quoting survives
@@ -45,7 +47,7 @@ rem Substring test via pure batch expansion: calling find/where here would pick
 rem up the Unix tools when launched from a Git Bash shell.
 if not "%INPUT%"=="%INPUT://=%" (
   echo [error] batch mode needs a file, not a stream: %INPUT%
-  echo         use run_preview.bat for rtsp:// / rtmp:// / http:// input.
+  echo         use preview.bat for rtsp:// / rtmp:// / http:// input.
   goto :end
 )
 if not exist "%INPUT%" (

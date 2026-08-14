@@ -41,7 +41,7 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 
 ## 构建
 
-**Windows 双击 `build.bat`**（在仓库根目录）即可：它做 configure + 编译 + 导出 ONNX，
+**Windows 双击 `scripts\build.bat`** 即可：它做 configure + 编译 + 导出 ONNX，
 路径用环境变量覆盖（`SWIM_TRT_ROOT` / `SWIM_VCPKG` / `SWIM_CUDA_ARCH`，`SWIM_FRESH=1` 重来）。
 下面是它实际执行的命令，Linux 或想手工控制时用：
 
@@ -71,7 +71,8 @@ OpenCV 由 vcpkg 提供（`vcpkg install opencv4:x64-windows`）时传它的 too
 python cpp/tools/export_onnx.py --out cpp/models
 ```
 
-Windows 上 `build.bat` 已包含这一步（用 `.venv\Scripts\python.exe`，需先跑 `install.sh`）。
+Windows 上 `scripts\build.bat` 已包含这一步（用 `.venv\Scripts\python.exe`，
+需先跑 `scripts/install.sh`）。
 `.onnx` 与 `.engine` 都不入库；权重来源见 [`../docs/权重来源与复现.md`](../docs/权重来源与复现.md)。
 
 engine 由程序首次运行时自动构建并缓存。文件名带**身份戳**：
@@ -89,9 +90,9 @@ kernel 按该参数写、engine 按 ONNX 分配，不校验就是越界写。det
 
 ## 运行
 
-Windows 双击即可，不必记命令：**`run_preview.bat`**（实时窗口，可拖视频进去或传
-rtsp URL）、**`run_analyse.bat`**（批处理出 json，加 `--out o.mp4` 出标注视频）。
-两者共用 `scripts/env.bat` 做前置检查（TensorRT / exe / onnx / ffmpeg）。
+Windows 双击即可，不必记命令：**`scripts\preview.bat`**（实时窗口，可拖视频进去或传
+rtsp URL）、**`scripts\analyse.bat`**（批处理出 json，加 `--out o.mp4` 出标注视频）。
+两者共用 `scripts\env.bat` 做前置检查（TensorRT / exe / onnx / ffmpeg）。
 Linux 或要自定义参数时直接调二进制：
 
 ```bash
@@ -125,8 +126,8 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目
 
 两条路各自独立，可单开也可同用。**两者显示/写出的都是当帧刚算出来的结果** ——
 没有任何结果缓存，每一帧都现场跑 detect + pose + 跟踪 + 划水/速度，
-`--preview` 只是把这帧的框与骨架画到窗口上（Windows 上双击 `run_preview.bat`
-即可启动，见仓库根目录）。
+`--preview` 只是把这帧的框与骨架画到窗口上（Windows 上双击 `scripts\preview.bat`
+即可启动）。
 
 | 开关 | 做什么 | 实测（RTX 4080 Laptop） |
 | --- | --- | --- |

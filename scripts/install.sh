@@ -2,8 +2,8 @@
 # 一键安装 Python 参考链路的运行环境（Linux 与 Windows/Git Bash 通用）。
 # 默认在项目下创建 .venv，不污染系统 Python。
 #
-#   bash install.sh              # 安装 + 自检
-#   bash install.sh --skip-test  # 只安装
+#   bash scripts/install.sh              # 安装 + 自检
+#   bash scripts/install.sh --skip-test  # 只安装
 #
 # 环境要求：NVIDIA GPU（驱动支持 CUDA 12.1）+ Python 3.10。
 # C++ 实时链路不需要本脚本（只需 CUDA/TensorRT/OpenCV），见 cpp/README.md；
@@ -16,7 +16,7 @@
 # Python 必须 3.10：mmcv wheel 只发 cp310。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # scripts/ 的上一级 = 仓库根
 VENV="${VENV:-$ROOT/.venv}"
 PY_VERSION=3.10
 export PYTHONUTF8=1          # Windows 默认 GBK，中文日志会乱码
@@ -152,4 +152,4 @@ print("[install] YOLO 就绪")
 EOF
 fi
 
-log "完成。运行分析：bash run.sh --help"
+log "完成。运行分析：bash scripts/run.sh --help"

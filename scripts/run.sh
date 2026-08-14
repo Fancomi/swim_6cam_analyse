@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Python 参考链路入口（离线批处理，Plan A/B/C）。
-# 想要实时/最快，用 C++ 链路：双击 run_preview.bat，或见 cpp/README.md。
+# 想要实时/最快，用 C++ 链路：双击 scripts/preview.bat，或见 cpp/README.md。
 #
-#   bash run.sh                       # Plan C（推荐），默认数据
-#   bash run.sh C --max-frames 300    # 先跑 300 帧确认链路
-#   bash run.sh B                     # Plan B
-#   bash run.sh A                     # Plan A（需六路原相机视频）
-#   bash run.sh --help                # 透传给 CLI 的全部参数
+#   bash scripts/run.sh                     # Plan C（推荐），默认数据
+#   bash scripts/run.sh C --max-frames 300  # 先跑 300 帧确认链路
+#   bash scripts/run.sh B                   # Plan B
+#   bash scripts/run.sh A                   # Plan A（需六路原相机视频）
+#   bash scripts/run.sh --help              # 透传给 CLI 的全部参数
 #
 # 三套方案只在「如何从画布得到每人的框与关键点」上不同，下游共用，指标可直接对比：
 #   A  画布 detect + 原相机 RTMPose + mesh 反投影（交接原版）
@@ -27,12 +27,12 @@
 #   VENV          venv 位置（默认 .venv）
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # scripts/ 的上一级 = 仓库根
 VENV="${VENV:-$ROOT/.venv}"
 # venv 的解释器：Linux 在 bin/python，Windows 在 Scripts/python.exe
 PYTHON="$VENV/bin/python"
 [[ -x "$PYTHON" ]] || PYTHON="$VENV/Scripts/python.exe"
-[[ -x "$PYTHON" ]] || { echo "[run] 未找到 $VENV 下的 Python，请先执行 bash install.sh" >&2; exit 1; }
+[[ -x "$PYTHON" ]] || { echo "[run] 未找到 $VENV 下的 Python，请先执行 bash scripts/install.sh" >&2; exit 1; }
 # Windows 的默认 stdout 是 GBK，中文日志会乱码
 export PYTHONUTF8=1
 
@@ -42,7 +42,7 @@ case "${1:-}" in
   A|B|C) PLAN="$1"; shift ;;
   -h|--help) exec "$PYTHON" -m swim_analyse.cli --help ;;
   ""|-*) ;;                       # 无 plan 或直接给参数：走默认 Plan C
-  *) echo "[run] 用法: bash run.sh [A|B|C] [透传参数...]（见 bash run.sh --help）" >&2; exit 1 ;;
+  *) echo "[run] 用法: bash scripts/run.sh [A|B|C] [透传参数...]（见 --help）" >&2; exit 1 ;;
 esac
 
 # Plan A 要六路原相机视频，只有旧数据集 20260629 有；B/C 只要画布，

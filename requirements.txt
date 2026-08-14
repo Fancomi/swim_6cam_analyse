@@ -1,6 +1,6 @@
 # 运行时依赖。
 #
-# 不含 torch / torchvision / mmcv / mmpose —— 见 install.sh：
+# 不含 torch / torchvision / mmcv / mmpose —— 见 scripts/install.sh：
 #   torch/mmcv  必须与 CUDA 版本匹配，mmcv 只能用官方预编译 wheel
 #   mmpose      用 --no-deps 安装以跳过 chumpy（下面已列出它其余的依赖）
 #

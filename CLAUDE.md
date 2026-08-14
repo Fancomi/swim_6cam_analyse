@@ -16,19 +16,35 @@
 重写，用同一份权重（`weights/` → `cpp/tools/export_onnx.py` → ONNX → TRT engine）。
 Python 侧还有 Plan A（跨相机 mesh）与 Plan B（一体模型），C++ 没有也不打算有。
 
-## 入口脚本（改这些之前先看 `docs/windows.md` 的编码规则）
+## 入口脚本（全在 `scripts/`；改之前先看 `docs/windows.md` 的编码规则）
 
 | 入口 | 干什么 | 平台 |
 | --- | --- | --- |
-| `build.bat` | 构建 C++ + 导出 ONNX（双击） | Windows |
-| `run_preview.bat` | C++ 实时预览窗口（双击 / 拖视频 / 传 rtsp URL） | Windows |
-| `run_analyse.bat` | C++ 批处理出 json，加 `--out` 出标注视频（双击） | Windows |
-| `install.sh` | 建 `.venv` 装 Python 依赖 + 自检 | Linux / Git Bash |
-| `run.sh` | Python 链路，`bash run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
-| `test.sh` | `bash test.sh` 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
+| `scripts/build.bat` | 构建 C++ + 导出 ONNX（双击） | Windows |
+| `scripts/preview.bat` | C++ 实时预览窗口（双击 / 拖视频 / 传 rtsp URL） | Windows |
+| `scripts/analyse.bat` | C++ 批处理出 json，加 `--out` 出标注视频（双击） | Windows |
+| `scripts/install.sh` | 建 `.venv` 装 Python 依赖 + 自检 | Linux / Git Bash |
+| `scripts/run.sh` | Python 链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
+| `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
 
-三个 `.bat` 共用 `scripts/env.bat`（定位 TensorRT、检查 exe/onnx/ffmpeg）。
+`scripts/env.bat` 是三个 `.bat` 共用的前置检查（定位 TensorRT、检查 exe/onnx/ffmpeg），
+不单独运行。**所有脚本都自己 `cd` 到仓库根**（`.bat` 用 `%~dp0..`，`.sh` 用
+`BASH_SOURCE/..`），所以从任何目录双击或调用都一样，脚本内部的相对路径一律以根为基准。
 C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/README.md` 有命令）。
+
+## 目录职责（放新文件前先对一眼）
+
+| 目录 | 只放什么 |
+| --- | --- |
+| `scripts/` | 用户入口脚本（`.bat` / `.sh`）。不放 Python 模块，也不放构建产物 |
+| `src/swim_analyse/` | Python 参考链路的库代码，唯一入口是 `cli.py` 的 `main()` |
+| `cpp/src` `cpp/include/swim` | C++ 实现与其头文件 |
+| `cpp/tools/` | 服务 C++ 链路的一次性 Python 工具（目前只有 `export_onnx.py`） |
+| `cpp/models/` | ONNX 与 TRT engine（除 `pose_meta.json` 外都不入库） |
+| `configs/` | 模型推理配置与泳池 mesh 标定 |
+| `tests/` | pytest，纯逻辑、无需 GPU 与数据 |
+| `docs/` | 环境与推导类文档；性能数字归属见下面『文档归属』 |
+| `data/` `output/` `weights/` | 输入、产物、权重，均不入库 |
 
 ## Python 侧速查
 
@@ -68,15 +84,15 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
    便于两边对照跑。新增参数请照此命名。
 4. **权重与 ONNX**：改了 `weights/` 里的模型，必须重跑 `cpp/tools/export_onnx.py`；
    engine 会因 ONNX 的 mtime/size 变化自动重建（身份戳机制，不必手删）。
-5. **默认数据集**：Python `run.sh` 与三个 `.bat` 默认都指向 `data/20260730/merged_3000f.mp4`，
+5. **默认数据集**：`scripts/run.sh` 与三个 `.bat` 默认都指向 `data/20260730/merged_3000f.mp4`，
    这样两条线的数字可直接比。**Plan A 例外**，它需要六路原相机视频，只有 `data/20260629/` 有
    （该目录未随包分发，本机没有 → Plan A 本机跑不了）。
 
 ## 怎么验证一处改动
 
 ```bash
-bash test.sh                 # 语法 + 单元测试（约 2 秒，无需 GPU）
-bash test.sh --full          # 再加 Python Plan C 与 C++ 各 30 帧真实冒烟
+bash scripts/test.sh         # 语法 + 单元测试（约 2 秒，无需 GPU）
+bash scripts/test.sh --full  # 再加 Python Plan C 与 C++ 各 30 帧真实冒烟
 ```
 
 改了 C++ 且要证明"没改数值"，跑全量 3000 帧对基线：
@@ -92,7 +108,7 @@ cpp/build/Release/swim_analyse.exe --input data/20260730/merged_3000f.mp4 \
 `--decoder cpu`（OpenCV/MSMF）是**另一组合法数字**（24245 人次、63 track），
 因为 MSMF 与 swscale 的 YUV→BGR 换算不同，不是回归。
 
-改了 Python 侧，用同一段跑 `bash run.sh C --max-frames N` 前后对比 `result.json`。
+改了 Python 侧，用同一段跑 `bash scripts/run.sh C --max-frames N` 前后对比 `result.json`。
 注意 `output/*/cache.pkl` 会跳过 Stage1/2，验证推理改动前先删。
 
 ## 数字的口径（引用性能数据必须带上这三项）
