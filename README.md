@@ -191,5 +191,6 @@ bash install.sh
 ### C++ 实时实现
 
 同一套 Plan C 用 C++/CUDA 重写后（全程 GPU 驻留，只回读关键点），
-RTX 4080 Laptop 上 3000 帧实测 **65~78 fps 纯分析 / 27~35 fps 渲染**，
-瓶颈已从 GPU 推理转到 CPU 解码。构建、参数与逐段耗时见 [`cpp/README.md`](cpp/README.md)。
+RTX 4080 Laptop 上 3000 帧实测 **65~78 fps 纯分析 / 65~67 fps 实时预览窗口
+（`--preview`）/ 27~35 fps 渲染落盘**，瓶颈已从 GPU 推理转到 CPU 解码与编码。
+构建、参数与逐段耗时见 [`cpp/README.md`](cpp/README.md)。

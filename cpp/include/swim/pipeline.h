@@ -118,6 +118,11 @@ class Pipeline {
   /// 阻塞运行到流结束或达到 max_frames。
   void run(FrameSource& src, const Sink& sink);
 
+  /// 请求提前结束（预览窗口按 q 时由 Sink 调用）。幂等、可从任意线程调：
+  /// 置停止位让推理线程退出，close() 唤醒可能阻塞在 push 的它；已入队的几帧
+  /// 仍会被后处理线程取空，因此不会丢结果、也不会死锁。
+  void request_stop() { stop_ = true; chan_.close(); }
+
   const Timers& timers() const { return timers_; }
   int64_t frames_done() const { return frames_done_; }
 

@@ -1,10 +1,10 @@
 // CLI：离线视频 / live 流的实时游泳分析。
 //
 //   swim_analyse --input data/xxx.mp4 --models cpp/models [--out out.mp4] [--json r.json]
-//   swim_analyse --input rtsp://...   --models cpp/models --show-fps
+//   swim_analyse --input rtsp://...   --models cpp/models --preview --show-fps
 //
 // 可视化用 OpenCV 在 CPU 侧画（只在需要落盘/预览时才 D2H 整帧；纯分析模式
-// 不拷图像，全链路只回读关键点）。
+// 不拷图像，全链路只回读关键点）。--out 落盘、--preview 开窗，两者可独立或同用。
 #include <opencv2/opencv.hpp>
 
 #ifdef _WIN32
@@ -14,12 +14,14 @@
 #include <windows.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 
 #include "swim/frame_source.h"
@@ -43,7 +45,8 @@ cv::Scalar id_color(int id) {           // 与 Python 版同思路：按 id 稳�
 struct Args {
   PipelineOptions opt;                  // 参数默认值只在 pipeline.h 定义一份
   std::string input, out, json, dump;
-  bool        draw_kpts = true, show_fps = false;
+  bool        draw_kpts = true, show_fps = false, preview = false;
+  float       preview_scale = 0.f;      // 0 = 自适应到 1600x900 以内
   DecoderPref decoder   = DecoderPref::Auto;
 };
 
@@ -92,6 +95,11 @@ bool parse(int argc, char** argv, Args& a) {
     }
     else if (k == "--no-kpts")     a.draw_kpts = false;
     else if (k == "--show-fps")    a.show_fps = true;
+    else if (k == "--preview")     a.preview = true;
+    else if (k == "--preview-scale") {
+      a.preview = true;                 // 给了比例显然是要预览，免得漏加 --preview
+      a.preview_scale = num(i, k, 0.05, 1.0);
+    }
     else if (k == "--fp32")        o.fp16 = false;
     else if (k == "--decoder") {
       const std::string v = need(i);
@@ -116,6 +124,8 @@ bool parse(int argc, char** argv, Args& a) {
              "  --decoder MODE     auto|cpu (默认 auto=ffmpeg 管道，探测失败回退 OpenCV;\n"
              "                     cpu=强制 OpenCV; nvdec 已废弃，等价 auto)\n"
              "  --no-kpts          不画骨架\n"
+             "  --preview          开实时窗口（画布会缩放后显示，按 q/ESC 退出）\n"
+             "  --preview-scale F  预览缩放比 0.05~1（默认自适应 1600x900 以内）\n"
              "  --show-fps         实时打印吞吐\n"
              "  --fp32             engine 算子用 fp32 (默认 fp16)。注意 ONNX 若是\n"
              "                     fp16 权重导出的，这只放宽算子精度，不等于真 fp32\n",
@@ -126,7 +136,8 @@ bool parse(int argc, char** argv, Args& a) {
     }
   }
   SWIM_CHECK(!a.input.empty(), "必须指定 --input");
-  o.need_image = !a.out.empty();        // 只有要写视频才付整帧 D2H
+  // 只有要图像（落盘或预览）才付整帧 D2H；纯分析模式保持只回读关键点
+  o.need_image = !a.out.empty() || a.preview;
   o.validate();
   return true;
 }
@@ -209,10 +220,20 @@ class Writer {
   int64_t frames_ = 0;
 };
 
-void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts) {
+/// 画标注。`s` 是画面缩放比（预览窗口 <1，落盘视频为 1）：坐标乘 s，字号与
+/// 线宽跟着降但留下限，否则缩到 1/3 后文字糊成一团。
+void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts,
+          float s = 1.f) {
+  const double fs = std::max(0.4, double(s));   // 字号下限，保证小窗仍可读
+  const int    th = s < 0.6f ? 1 : 2;           // 线宽/字宽
+  const int    r  = s < 0.6f ? 2 : 3;           // 关键点半径
+  auto pt = [s](float x, float y) {
+    return cv::Point(int(x * s), int(y * s));
+  };
+
   for (const auto& p : fr.persons) {
     const auto col = id_color(p.track_id);
-    cv::rectangle(img, {int(p.x1), int(p.y1)}, {int(p.x2), int(p.y2)}, col, 2);
+    cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, th);
 
     char buf[96];
     if (std::isnan(p.speed))
@@ -221,26 +242,60 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts) {
       snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s", p.track_id, p.strokes,
                p.speed);
     int base = 0;
-    const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, 1.0, 2, &base);
-    const int ty = std::max(int(p.y1) - 6, sz.height + 4);
-    cv::rectangle(img, {int(p.x1), ty - sz.height - 4},
-                  {int(p.x1) + sz.width + 4, ty + 2}, col, cv::FILLED);
-    cv::putText(img, buf, {int(p.x1) + 2, ty}, cv::FONT_HERSHEY_SIMPLEX, 1.0,
-                {255, 255, 255}, 2, cv::LINE_AA);
+    const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, fs, th, &base);
+    const int tx = int(p.x1 * s);
+    const int ty = std::max(int(p.y1 * s) - 6, sz.height + 4);
+    cv::rectangle(img, {tx, ty - sz.height - 4}, {tx + sz.width + 4, ty + 2},
+                  col, cv::FILLED);
+    cv::putText(img, buf, {tx + 2, ty}, cv::FONT_HERSHEY_SIMPLEX, fs,
+                {255, 255, 255}, th, cv::LINE_AA);
 
     if (!draw_kpts) continue;
     for (const auto& e : kSkel) {
       if (p.scores[e[0]] < kpt_thr || p.scores[e[1]] < kpt_thr) continue;
-      cv::line(img, {int(p.kpts[e[0] * 2]), int(p.kpts[e[0] * 2 + 1])},
-               {int(p.kpts[e[1] * 2]), int(p.kpts[e[1] * 2 + 1])},
-               {0, 255, 0}, 2, cv::LINE_AA);
+      cv::line(img, pt(p.kpts[e[0] * 2], p.kpts[e[0] * 2 + 1]),
+               pt(p.kpts[e[1] * 2], p.kpts[e[1] * 2 + 1]),
+               {0, 255, 0}, th, cv::LINE_AA);
     }
     for (int k = 0; k < kNumKpts; ++k)
       if (p.scores[k] >= kpt_thr)
-        cv::circle(img, {int(p.kpts[k * 2]), int(p.kpts[k * 2 + 1])}, 3,
+        cv::circle(img, pt(p.kpts[k * 2], p.kpts[k * 2 + 1]), r,
                    {0, 0, 255}, cv::FILLED, cv::LINE_AA);
   }
 }
+
+/// 实时预览窗口。画布 5002x2102 装不进任何屏幕，先缩到 --preview-scale
+/// （默认自适应 1600x900 以内）再画标注，所以窗口里的字号/线宽是原生清晰度。
+///
+/// 必须在**后处理线程**里构造与使用：Win32 的消息队列按线程分，窗口只能由
+/// 创建它的线程 pump（waitKey 做的就是 pump），跨线程会不刷新甚至卡住。
+/// 也因此不调 destroyWindow —— 该线程退出时 OS 自动销毁其窗口，而此时若从
+/// main 线程 SendMessage(WM_CLOSE) 反而会等一个已死的线程。
+class Preview {
+ public:
+  Preview(int w, int h, float scale)
+      : s_(scale > 0 ? scale : std::min(1.f, std::min(1600.f / float(w),
+                                                     900.f / float(h)))) {
+    cv::namedWindow(kWin, cv::WINDOW_AUTOSIZE);
+    printf("[Preview] 窗口 %dx%d (x%.3f)，焦点在窗口上按 q / ESC 提前结束\n",
+           int(float(w) * s_), int(float(h) * s_), s_);
+    fflush(stdout);
+  }
+
+  /// 返回 false 表示用户要求退出。raw 必须是**未画过**的原始帧。
+  bool show(const cv::Mat& raw, const FrameResult& fr, float kpt_thr, bool kpts) {
+    cv::resize(raw, view_, {}, s_, s_, cv::INTER_AREA);
+    draw(view_, fr, kpt_thr, kpts, s_);
+    cv::imshow(kWin, view_);
+    const int k = cv::waitKey(1);
+    return k != 27 && k != 'q' && k != 'Q';
+  }
+
+ private:
+  static constexpr const char* kWin = "swim_analyse";
+  float   s_;
+  cv::Mat view_;
+};
 
 }  // namespace
 
@@ -259,7 +314,7 @@ int main(int argc, char** argv) try {
   Pipeline pipe(a.opt, src->fps());
 
   std::unique_ptr<Writer> writer;
-  if (a.opt.need_image)
+  if (!a.out.empty())
     writer = std::make_unique<Writer>(a.out, src->width(), src->height(), src->fps());
 
   // 逐帧 dump：定位框消失发生在哪一层，并把关键点一并导出供 Python 侧复算
@@ -280,6 +335,9 @@ int main(int argc, char** argv) try {
   int64_t n_person = 0;
   const double t0 = now_ms();
   double last_log = t0;
+  // 在 Sink 里首帧惰性构造：窗口必须由 pump 它的线程（后处理线程）创建
+  std::unique_ptr<Preview> preview;
+  bool quit = false;
 
   pipe.run(*src, [&](const FrameResult& fr) {
     n_person += static_cast<int64_t>(fr.persons.size());
@@ -294,10 +352,22 @@ int main(int argc, char** argv) try {
         dump << '\n';
       }
 
-    if (writer && fr.bgr) {
+    if (fr.bgr) {
       cv::Mat img(fr.h, fr.w, CV_8UC3, const_cast<uint8_t*>(fr.bgr));
-      draw(img, fr, a.opt.kpt_thr, a.draw_kpts);
-      writer->write(img);
+      // 预览必须先做：它要的是未画过的原图（缩小后再画，字才不糊），
+      // 而 writer 的 draw 是在整帧上原地画的。
+      if (a.preview && !quit) {
+        if (!preview) preview = std::make_unique<Preview>(fr.w, fr.h, a.preview_scale);
+        if (!preview->show(img, fr, a.opt.kpt_thr, a.draw_kpts)) {
+          quit = true;
+          printf("\n[Preview] 收到退出键，停止取帧（已入队的帧仍会处理完）\n");
+          pipe.request_stop();
+        }
+      }
+      if (writer) {
+        draw(img, fr, a.opt.kpt_thr, a.draw_kpts);
+        writer->write(img);
+      }
     }
     if (a.show_fps && now_ms() - last_log > 1000) {
       const double el = (now_ms() - t0) / 1000.0;

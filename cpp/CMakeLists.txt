@@ -33,7 +33,7 @@ if(NOT CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio highgui)
 
 # ── TensorRT（无官方 find module，手动定位）───────────────────────────────
 # Windows 版的库名带版本后缀（nvinfer_10.lib / nvonnxparser_10.lib），

@@ -19,7 +19,7 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 ```
 
 渲染（`--out`）才额外付一次整帧 D2H（31.5 MB/帧），但它被 `cudaEvent` 完全重叠掉，
-计时里只剩 0.02 ms/帧。
+计时里只剩 0.02 ms/帧。`--preview` 走同一次 D2H，因此两者同开不会拷两遍。
 
 跨帧重叠：关键点与整帧的 D2H 都只记一个 `cudaEvent` 就返回，由后处理线程在真正读
 之前 `cudaEventSynchronize`，所以「GPU 算第 n+1 帧」与「CPU 跟踪第 n 帧」并行。
@@ -31,7 +31,7 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 | --- | --- | --- |
 | CUDA | 12.x | Linux 机 12.9，Windows 机 12.8 |
 | **TensorRT** | **10.11.0.33** | cuda-12.0~12.9 变体。TRT 11 移除了 `BuilderFlag::kFP16`（强类型恒开），本代码只针对 10.x。Windows 导入库名带后缀：`nvinfer_10.lib` |
-| OpenCV | 4.x | 解码与渲染。apt / vcpkg 版都未编 `cudacodec`；不过本画布（5002 宽）超出 CUVID H.264 的 4096 上限，硬解本就不可用，见「输入源」 |
+| OpenCV | 4.x | 解码、渲染与 `--preview` 窗口（需 `highgui`）。apt / vcpkg 版都未编 `cudacodec`；不过本画布（5002 宽）超出 CUVID H.264 的 4096 上限，硬解本就不可用，见「输入源」 |
 | ffmpeg CLI | 任意近期版本 | **默认解码路径就要它**（`ffmpeg` + `ffprobe`），`--out` 的编码也要（Windows 必然走这条，见「渲染写出」）。找不到则回退 OpenCV |
 | cmake | ≥3.18 | |
 
@@ -79,15 +79,44 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib
 # 离线视频，纯分析（最快，只回读关键点）
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models --json out.json
 
+# 实时预览窗口（不落盘，按 q/ESC 提前结束）
+./build/swim_analyse --input data/xxx.mp4 --models cpp/models --preview --show-fps
+
 # 加标注视频输出
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models \
     --out out.mp4 --json out.json --show-fps
 
 # live 流
-./build/swim_analyse --input rtsp://... --models cpp/models --show-fps
+./build/swim_analyse --input rtsp://... --models cpp/models --preview --show-fps
 ```
 
 `--help` 看全部参数。
+
+## 可视化（`--preview` / `--out`）
+
+两条路各自独立，可单开也可同用：
+
+| 开关 | 做什么 | 实测（RTX 4080 Laptop） |
+| --- | --- | --- |
+| 无 | 纯分析，不拷图像 | 12.8–15.5 ms/帧（65–78 fps） |
+| `--preview` | 缩放后开窗实时显示 | 14.9–15.5 ms/帧（65–67 fps） |
+| `--out` | 标注视频落盘 | 29.0–37.6 ms/帧（27–35 fps） |
+
+预览几乎免费（约 +1 ms/帧）：整帧 D2H 已被 `cudaEvent` 重叠到 0.01 ms，
+真正的开销只是 `cv::resize` + `imshow`。落盘贵是因为 libx264 与解码抢 CPU。
+
+画布 5002×2102 装不进任何屏幕，所以**先缩再画**：默认自适应到 1600×900 以内
+（本数据 ×0.320 → 1600×672），`--preview-scale 0.05~1` 可手动指定（给了它就
+等于开了 `--preview`）。缩放在画标注之前做，因此框线与文字是原生清晰度而非
+被一起缩糊；字号与线宽按比例降但有下限，小窗仍可读。
+
+窗口在**后处理线程**里惰性构造 —— Win32 消息队列按线程分，`waitKey` 就是
+pump，跨线程创建会不刷新甚至卡死。按 q/ESC 触发 `Pipeline::request_stop()`：
+置停止位 + `close()` 唤醒可能阻塞在 push 的推理线程，已入队的几帧仍会处理完，
+所以提前退出不会丢结果也不会死锁。
+
+预览不改变任何分析结果：3000 帧带 `--preview` 与纯分析的 JSON 逐字节相同
+（md5 `5b143434…`）。
 
 ## 输入源
 
@@ -141,9 +170,9 @@ NVENC 本可以更快，但实测机（驱动 571.96）只提供 NVENC API 13.0�
 | pose engine 工作区 | 153.4 MB |
 | 关键点等小缓冲 | <2 MB |
 
-host 侧另有锁页缓冲：解码环 4×31.5 MB、关键点回读环 5×9 KB，`--out` 时再加整帧回读环
-5×31.5 MB。回读环深度 = `queue_depth + 2`（队列 + 消费者手上 1 + 生产者正在写 1），
-有了环，推理线程排完 D2H 就能去排下一帧，不必等拷贝落地。
+host 侧另有锁页缓冲：解码环 4×31.5 MB、关键点回读环 5×9 KB，`--out`/`--preview` 时
+再加整帧回读环 5×31.5 MB。回读环深度 = `queue_depth + 2`（队列 + 消费者手上 1 +
+生产者正在写 1），有了环，推理线程排完 D2H 就能去排下一帧，不必等拷贝落地。
 
 超过 40 人的框会被丢弃以保持显存恒定（实测该数据每帧最多 13 人）。
 
