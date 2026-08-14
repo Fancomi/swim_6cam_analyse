@@ -46,6 +46,19 @@ void PipelineOptions::validate() const {
   SWIM_CHECK(max_frames >= 0, "--max-frames 不能为负");
 }
 
+/// 分配一个回读环（锁页 host 缓冲 + 完成事件）。关键点环与整帧环只差元素类型
+/// 与格子大小，其余（环深、事件标志、错误检查）完全一致，故并成一个模板。
+/// 做成 Pipeline 的成员是因为 Slot<T> 是它的私有嵌套类型；只在本 TU 实例化，
+/// 不需要显式实例化声明。
+template <typename T>
+void Pipeline::alloc_ring(std::vector<Slot<T>>& ring, size_t elems) {
+  ring.resize(ring_depth());
+  for (auto& s : ring) {
+    s.host  = host_alloc<T>(elems);
+    s.ready = make_event();
+  }
+}
+
 Pipeline::Pipeline(const PipelineOptions& opt, double fps)
     : opt_(opt), fps_(fps), chan_(opt.queue_depth),
       tracker_(opt.track_iou, opt.track_max_lost),
@@ -102,13 +115,9 @@ Pipeline::Pipeline(const PipelineOptions& opt, double fps)
   d_scales_  = dev_alloc<float>(size_t(P) * 2);
   h_count_ = host_alloc<int>(1);
 
-  // host 侧回读环：容量 = 队列 + 消费者手上 1 + 生产者正在写 1。
+  // host 侧回读环：容量见 ring_depth()（队列 + 消费者手上 1 + 生产者正在写 1）。
   // 有了环，推理线程排完 D2H 就能去做下一帧，不必等拷贝完成（跨帧重叠）。
-  blob_ring_.resize(size_t(opt_.queue_depth) + 2);
-  for (auto& s : blob_ring_) {
-    s.host  = host_alloc<float>(blob_n_);
-    s.ready = make_event();
-  }
+  alloc_ring(blob_ring_, blob_n_);
 
   printf("[Pipeline] detect 工作区 %.1f MB, pose 工作区 %.1f MB (batch<=%d), "
          "回读 %.1f KB/帧 x%zu\n",
@@ -136,11 +145,7 @@ Pipeline::~Pipeline() {
 void Pipeline::alloc_frame_ring(int w, int h) {
   SWIM_CHECK(w > 0 && h > 0, "整帧回读需要有效的画面尺寸");
   frame_bytes_ = size_t(w) * h * 3;
-  frame_ring_.resize(size_t(opt_.queue_depth) + 2);
-  for (auto& s : frame_ring_) {
-    s.host  = host_alloc<uint8_t>(frame_bytes_);
-    s.ready = make_event();
-  }
+  alloc_ring(frame_ring_, frame_bytes_);
   printf("[Pipeline] 整帧回读环 %zu x %.1f MB\n", frame_ring_.size(),
          frame_bytes_ / 1e6);
 }

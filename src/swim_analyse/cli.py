@@ -262,6 +262,9 @@ def render(canvas_video, out_path, all_boxes, cum_map, meta, canvas_kpts=None,
 
     codec='h264' 走 ffmpeg libx264（文件约为 mp4v 的一半，画质更好，且
     浏览器/播放器兼容性好）；imageio-ffmpeg 不可用时自动回退 opencv mp4v。
+
+    这里用 -preset medium -crf 20（离线出片，画质优先）；C++ 实时链路的 Writer
+    用 veryfast/crf23（编码不能拖慢采集），故两者产物的体积与画质不可直接对比。
     """
     w, h, fps, total = meta
     cap = cv2.VideoCapture(canvas_video)

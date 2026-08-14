@@ -3,6 +3,10 @@
 把 Python 版 Plan C（画布 detect + 画布 RTMPose）重写为 C++/CUDA，目标是台式机上
 实时处理 live 画布流。核心约束：**图像进 GPU 后不再回 CPU**，全链路只回读关键点。
 
+本页是 C++ 链路的唯一权威文档（数据流、依赖、构建、显存、性能、与 Python 的对齐）。
+项目总览与 Python 链路见 [`../README.md`](../README.md)；改动前的导航与同步契约见
+[`../CLAUDE.md`](../CLAUDE.md)；Windows 环境坑见 [`../docs/windows.md`](../docs/windows.md)。
+
 ## 数据流
 
 ```
@@ -37,19 +41,28 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 
 ## 构建
 
+**Windows 双击 `build.bat`**（在仓库根目录）即可：它做 configure + 编译 + 导出 ONNX，
+路径用环境变量覆盖（`SWIM_TRT_ROOT` / `SWIM_VCPKG` / `SWIM_CUDA_ARCH`，`SWIM_FRESH=1` 重来）。
+下面是它实际执行的命令，Linux 或想手工控制时用：
+
 ```bash
 # Linux
 cmake -B build -DTRT_ROOT=/opt/trt/TensorRT-10.11.0.33 -DCMAKE_CUDA_ARCHITECTURES=90
 cmake --build build -j
 
 # Windows（VS 2022 + CUDA + TRT 官方 zip + vcpkg 的 OpenCV）
-cmake -B build -G "Visual Studio 17 2022" -DTRT_ROOT=C:/TensorRT-10.11.0.33 ^
-      -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake ^
+cmake -S cpp -B cpp/build -G "Visual Studio 17 2022" \
+      -DTRT_ROOT=D:/WindowsProject/workspace/TRT/TensorRT-10.11.0.33 \
+      -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake \
       -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build --config Release
+cmake --build cpp/build --config Release
 ```
 
 `CMAKE_CUDA_ARCHITECTURES`：H800=90，RTX40xx=89，RTX30xx=86，RTX50xx=120。
+默认值 `86 89 90` 不含 50 系且多架构编译慢很多，台式机务必显式指定。
+OpenCV 由 vcpkg 提供（`vcpkg install opencv4:x64-windows`）时传它的 toolchain file 即可，
+`find_package(OpenCV)` 会自动解析；用官方预编译包则改传 `-DOpenCV_DIR=C:/opencv/build`。
+多配置生成器（VS）**必须加 `--config Release`**，否则拿到的是慢一个量级的 Debug 二进制。
 
 ## 准备模型
 
@@ -57,6 +70,9 @@ cmake --build build --config Release
 # 从 .pt/.pth 导出 fp16 ONNX（detect 必须用训练时的 imgsz=640）
 python cpp/tools/export_onnx.py --out cpp/models
 ```
+
+Windows 上 `build.bat` 已包含这一步（用 `.venv\Scripts\python.exe`，需先跑 `install.sh`）。
+`.onnx` 与 `.engine` 都不入库；权重来源见 [`../docs/权重来源与复现.md`](../docs/权重来源与复现.md)。
 
 engine 由程序首次运行时自动构建并缓存。文件名带**身份戳**：
 `pose.engine` → `pose.sm89-trt101100-b40-fp16-<onnx mtime>-<size>.engine`。
@@ -73,8 +89,13 @@ kernel 按该参数写、engine 按 ONNX 分配，不校验就是越界写。det
 
 ## 运行
 
+Windows 双击即可，不必记命令：**`run_preview.bat`**（实时窗口，可拖视频进去或传
+rtsp URL）、**`run_analyse.bat`**（批处理出 json，加 `--out o.mp4` 出标注视频）。
+两者共用 `scripts/env.bat` 做前置检查（TensorRT / exe / onnx / ffmpeg）。
+Linux 或要自定义参数时直接调二进制：
+
 ```bash
-export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib
+export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目录加进 PATH
 
 # 离线视频，纯分析（最快，只回读关键点）
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models --json out.json
@@ -88,9 +109,17 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib
 
 # live 流
 ./build/swim_analyse --input rtsp://... --models cpp/models --preview --show-fps
+
+# 与 Python 逐帧对照：导出每个框与 17 个关键点
+./build/swim_analyse --input data/xxx.mp4 --models cpp/models --max-frames 200 --dump d.csv
 ```
 
-`--help` 看全部参数。
+`--help` 看全部参数（帮助里的默认值直接取自 `PipelineOptions{}`，不会与代码走偏）。
+算法阈值与 Python CLI 同名同义：`--conf` / `--kpt-thr` / `--containment` /
+`--track-iou` / `--track-max-lost` / `--stroke-type` / `--signal` / `--ppm`；
+`--queue-depth` 只影响流水线深度，不改结果。
+`--json` 的格式是 `{tid: {"strokes": n, "speed": v}}`，`speed` 是该 track **最后一次**
+速度采样，面向实时上报；Python 的 `result.json` 存整条速度序列，两者不可直接 diff。
 
 ## 可视化（`--preview` / `--out`）
 
@@ -123,19 +152,21 @@ pump，跨线程创建会不刷新甚至卡死。按 q/ESC 触发 `Pipeline::req
 
 ## 输入源
 
-`FrameSource` 三种实现共用 `next() -> GpuFrame` 接口，下游不感知差异：
+`FrameSource` 的两种实现共用 `next() -> GpuFrame` 接口，下游不感知差异：
 
 | 实现 | `backend()` | 用途 |
 | --- | --- | --- |
 | ffmpeg 管道 | `ffmpeg-pipe(prefetch)` | 默认。`ffprobe` 取元信息 + `ffmpeg … -f rawvideo -pix_fmt bgr24 -` 直读进锁页内存，实测 13.0 ms/帧 |
 | OpenCV | `opencv(prefetch)` | 回退与 `--decoder cpu`。文件与 rtsp/rtmp 共用（`VideoCapture`），16.9 ms/帧 |
-| `RawSource` | `raw` | 拼接程序把已在显存的画布 `push()` 进来，零解码、一次 D2D 拷贝 |
 
-前两者都带解码线程预取，解码与推理重叠。
+两者都带解码线程预取，解码与推理重叠。
+**外部直供显存帧**（拼接程序把已在显存的画布直接喂进来、零解码）不在这里实现 ——
+接口本身已足够，新增一个 `FrameSource` 子类实现 `next()` 即可，不必给基类开旁路入口。
 
-ffmpeg 管道的 13.0 ms/帧已经贴住 ffmpeg CLI 自身的地板：同一条命令落 `NUL`
-实测 12.9 ms/帧（纯解码不出像素 10.6 ms/帧），管道搬运只剩 0.1 ms 的余量。
-这条地板是靠自建 `CreatePipe`（128 MB 缓冲）拿到的 —— `_popen` 的匿名管道只有几 KB，
+ffmpeg 管道的 13.0 ms/帧已经贴住 ffmpeg CLI 自身的地板：同一条解码命令落 `NUL`
+实测 10.0–13.5 ms/帧（纯解码不出像素 7.0–10.6 ms/帧），管道搬运几乎没有余量。
+区间来自系统页缓存：同一文件冷热两次差 25%，所以这条地板要连着测量前提一起引用。
+地板是靠自建 `CreatePipe`（128 MB 缓冲）拿到的 —— `_popen` 的匿名管道只有几 KB，
 ffmpeg 每写满就得等读取方，实测退化到 16.7 ms/帧。
 
 **两条路径解出的像素值不同**，不只是快慢之别：vcpkg 的 `opencv4:x64-windows` 没编
@@ -145,13 +176,16 @@ ffmpeg 管道与 Python 的 `cv2.VideoCapture`（自带 ffmpeg）逐字节相同
 所以**要与 Python 逐值比对必须走默认路径**，`--decoder cpu` 只作兜底与排障。
 
 **NVDEC 用不上，不是"待补"**：CUVID 的 H.264 8bit 规格上限 4096×4096，画布宽 5002
-硬解开不了（HEVC 上限 8192，但源是 H.264）。`--decoder nvdec` 保留只为兼容旧命令行，
-行为等价 `auto`，并会打印被忽略的原因。live 场景要彻底绕开解码就用 `RawSource`。
+硬解开不了（HEVC 上限 8192，但源是 H.264）。所以 `DecoderPref` 只有 `Auto`/`Cpu`
+两个取值；`--decoder nvdec` 仅为兼容旧命令行而接受，会打印被忽略的原因并降级为 `auto`，
+其它非法取值直接报错退出。live 场景要彻底绕开解码，走上面说的自定义 `FrameSource` 子类。
 
 ## 渲染写出（`--out`）
 
 `Writer` 两级：先试 `cv::VideoWriter`（`avc1` → `mp4v`），都开不了则起 `ffmpeg` 子进程，
-用管道喂 rawvideo（`-c:v libx264 -preset veryfast -crf 23`）。
+用管道喂 rawvideo（`-c:v libx264 -preset veryfast -crf 23`）。子进程与管道走
+`Proc`（`include/swim/proc.h`）—— 解码（ffmpeg/ffprobe）与编码共用这一个类，
+Windows 上自建 `CreatePipe` 而非 `_popen`，理由见「输入源」的缓冲区一段。
 
 回退是 Windows 必需的：vcpkg 的 opencv4 没有 ffmpeg 特性，videoio 只剩 MSMF，
 而 MSMF 的 H.264 编码器在 1080p/4K 能开，**在 5002×2102 直接 `isOpened()==false`**。
@@ -219,10 +253,10 @@ pose 153.4 MB（比 H800 的 56/94 MB 大，TRT 按 GPU 选 kernel，属正常�
 34 ms 降到 1.7 ms，因为裁切的仿射采样与 SimCC 解码都进了 kernel。
 
 **瓶颈已经从 GPU 转到 CPU 解码**：纯分析模式下 `0_src_wait` 占 49%，而它的下限就是
-ffmpeg 自身的 12.9 ms/帧（见「输入源」），预取只能把它与 GPU 段重叠、消不掉。
+ffmpeg 自身的 10.0–13.5 ms/帧（见「输入源」），预取只能把它与 GPU 段重叠、消不掉。
 NVDEC 在这里帮不上：CUVID 的 H.264 8bit 上限 4096×4096，画布宽 5002 硬解开不了
-（HEVC 上限 8192，但源是 H.264）。要进一步提速只有两条路：live 场景走 `RawSource`
-让拼接程序直接给显存帧（零解码），或让 ffmpeg 输出 yuv420p 把搬运字节数减半
+（HEVC 上限 8192，但源是 H.264）。要进一步提速只有两条路：live 场景自定义一个
+`FrameSource` 子类让拼接程序直接给显存帧（零解码），或让 ffmpeg 输出 yuv420p 把搬运字节数减半
 （31.5 → 15.8 MB/帧）并在 kernel 里转 BGR —— 后者会丢掉与 Python 的逐字节一致性
 （swscale 用 BT.601 limited range，自行重建后平均差约 0.6/255），故未采用。
 

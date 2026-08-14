@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,10 +24,12 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "swim/frame_source.h"
 #include "swim/metrics.h"
 #include "swim/pipeline.h"
+#include "swim/proc.h"
 
 using namespace swim;
 
@@ -44,11 +47,17 @@ cv::Scalar id_color(int id) {           // 与 Python 版同思路：按 id 稳�
 
 struct Args {
   PipelineOptions opt;                  // 参数默认值只在 pipeline.h 定义一份
+                                        // （--help 也从这里现取，见 help_rows）
   std::string input, out, json, dump;
   bool        draw_kpts = true, show_fps = false, preview = false;
   float       preview_scale = 0.f;      // 0 = 自适应到 1600x900 以内
   DecoderPref decoder   = DecoderPref::Auto;
 };
+
+/// --queue-depth 的上限，只在 CLI 这一层拦：队列每格在渲染模式下对应一整帧
+/// 锁页内存（5002x2102 约 31.5 MB），16 格已经是 500 MB 量级，再大只会白占内存。
+/// 不放进 validate() 是因为库内部（非 CLI 调用方）可以自行决定更大的深度。
+constexpr int kMaxQueueDepth = 16;
 
 /// 带区间校验的数值解析：std::stoi/stof 对 "abc" 抛异常、对 "12abc" 静默截断，
 /// 两种都要在这里拦住，否则 --ppm 0 之类会一路走到"速度 = inf"。
@@ -63,6 +72,108 @@ double parse_num(const char* s, const std::string& key, double lo, double hi,
   return v;
 }
 
+// ── --help 表 ─────────────────────────────────────────────────────────────
+// 帮助文本里的默认值全部从 PipelineOptions{} / Args{} 的字段现取现格式化，
+// 于是「校验、行为、帮助」三处共用同一份默认值，改 pipeline.h 一处即三处同步
+// （早先 help 把 0.25/0.4/100 等硬编码了一遍，改默认值必漏其中之一）。
+
+/// printf 风格拼 std::string。帮助文本要就地插默认值，用一次性缓冲比拼 ostream 短。
+std::string sfmt(const char* fmt, ...) {
+  char buf[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  return buf;
+}
+
+/// 枚举默认值也只写一份：--signal / --decoder 的默认取自字段，名字在这里翻译。
+const char* signal_name(StrokeSignal s) {
+  return s == StrokeSignal::WristXHead ? "wrist_x_head" : "elbow_angle";
+}
+const char* decoder_name(DecoderPref d) {
+  return d == DecoderPref::Cpu ? "cpu" : "auto";
+}
+
+/// 一行帮助。arg 是参数占位，**保持 ASCII**：列宽按 strlen 算字节数，
+/// 占位里放中文会让这一列错位。desc 里的 '\n' 表示续行，由 print_help 缩进对齐。
+struct HelpRow {
+  const char* opt;
+  const char* arg;
+  std::string desc;
+};
+
+std::vector<HelpRow> help_rows() {
+  const PipelineOptions d{};        // 流水线参数默认值的唯一来源
+  const Args a{};                   // 非流水线参数（预览、绘制开关）的默认值
+  return {
+    {"--input", "FILE|URL", "输入视频文件或流地址（rtsp:// / rtmp:// 等），必填"},
+    {"--models", "DIR", sfmt("detect.onnx/pose.onnx 所在目录 (默认 %s)",
+                             d.models_dir.c_str())},
+    {"--out", "FILE", "写出标注视频 (H.264)"},
+    {"--json", "FILE", "写出每个 track 的划水次数与速度"},
+    {"--dump", "FILE", "逐帧写出每个框(帧号,id,xyxy,conf)+17 个关键点\n"
+                       "(kx,ky,ks)，用于与 Python 对照"},
+    {"--max-frames", "N", sfmt("只处理前 N 帧 (默认 %lld = 不限)",
+                               static_cast<long long>(d.max_frames))},
+    {"--detect-size", "N", sfmt("detect 输入方形边长, 须与 onnx 一致 (默认 %d)",
+                                d.detect_size)},
+    {"--max-persons", "N", sfmt("pose 最大人数，显存按此预留 (默认 %d, 上限 %d)",
+                                d.max_persons, kMaxPersons)},
+    {"--conf", "F", sfmt("检测置信度阈值 [0,1) (默认 %g)", d.conf_thr)},
+    {"--kpt-thr", "F", sfmt("关键点置信度阈值 [0,1) (默认 %g)", d.kpt_thr)},
+    {"--ppm", "F", sfmt("画布每米像素数 (默认 %g)", d.ppm)},
+    {"--containment", "F", sfmt("包含率去重阈值(交集/自身面积) (0,1] (默认 %g)",
+                                d.containment)},
+    {"--track-iou", "F", sfmt("跟踪匹配的 IoU 阈值 (0,1] (默认 %g)", d.track_iou)},
+    {"--track-max-lost", "N", sfmt("track 连续丢失多少帧后销毁 (默认 %d)",
+                                   d.track_max_lost)},
+    {"--queue-depth", "N", sfmt("推理->后处理队列深度 1..%d (默认 %d)。渲染时每格\n"
+                                "多占一整帧锁页内存，调大只在后处理抖动时有用",
+                                kMaxQueueDepth, d.queue_depth)},
+    {"--stroke-type", "S", sfmt("泳姿，决定左右是否分开计数 (默认 %s)\n可选: %s",
+                                d.stroke_type.c_str(), kStrokeTypes)},
+    {"--signal", "S", sfmt("划水信号 elbow_angle|wrist_x_head (默认 %s)",
+                           signal_name(d.signal))},
+    {"--decoder", "MODE", sfmt("auto|cpu (默认 %s=ffmpeg 管道，探测失败回退 OpenCV;\n"
+                               "cpu=强制 OpenCV; nvdec 已废弃，等价 auto)",
+                               decoder_name(a.decoder))},
+    {"--no-kpts", "", sfmt("不画骨架 (默认%s画)", a.draw_kpts ? "" : "不")},
+    {"--preview", "", "开实时窗口（画布会缩放后显示，按 q/ESC 退出）"},
+    {"--preview-scale", "F", "预览缩放比 0.05~1（默认自适应 1600x900 以内），\n"
+                             "给了它就等于同时开 --preview"},
+    {"--show-fps", "", "实时打印吞吐"},
+    {"--fp32", "", "engine 算子用 fp32 (默认 fp16)。注意 ONNX 若是\n"
+                   "fp16 权重导出的，这只放宽算子精度，不等于真 fp32"},
+    {"-h, --help", "", "打印本帮助并退出"},
+  };
+}
+
+/// 打印 --help。列宽取表内最长的「选项 + 占位」，说明的续行自动缩进到同一列，
+/// 于是加参数时不必手数空格。
+void print_help() {
+  const auto rows = help_rows();
+  size_t w = 0;
+  for (const auto& r : rows)
+    w = std::max(w, strlen(r.opt) + (*r.arg ? strlen(r.arg) + 1 : 0));
+
+  printf("用法: swim_analyse --input <视频|流> [选项]\n");
+  for (const auto& r : rows) {
+    std::string head = r.opt;
+    if (*r.arg) head += " " + std::string(r.arg);
+    bool first = true;
+    for (size_t p = 0; p <= r.desc.size();) {
+      const size_t nl = r.desc.find('\n', p);
+      const std::string seg = r.desc.substr(p, nl - p);   // npos 时取到末尾
+      if (first) printf("  %-*s  %s\n", int(w), head.c_str(), seg.c_str());
+      else       printf("  %-*s  %s\n", int(w), "", seg.c_str());
+      first = false;
+      if (nl == std::string::npos) break;
+      p = nl + 1;
+    }
+  }
+}
+
 bool parse(int argc, char** argv, Args& a) {
   auto need = [&](int& i) { SWIM_CHECK(i + 1 < argc, "参数缺少值"); return argv[++i]; };
   auto num  = [&](int& i, const std::string& k, double lo, double hi) {
@@ -70,6 +181,14 @@ bool parse(int argc, char** argv, Args& a) {
   };
   auto integer = [&](int& i, const std::string& k, long lo, long hi) {
     return static_cast<long>(parse_num(need(i), k, double(lo), double(hi), true));
+  };
+  // 区间 (0,1]：parse_num 的边界是闭的，0 要单独挡 —— 包含率/IoU 取 0 会让
+  // 去重与跟踪匹配退化成「任意两框都算同一目标」，validate() 也会拦，
+  // 但在这里报错才带得上参数名。
+  auto frac = [&](int& i, const std::string& k) {
+    const float v = num(i, k, 0.0, 1.0);
+    SWIM_CHECK(v > 0.f, k + " 须在 (0,1]");
+    return v;
   };
   auto& o = a.opt;
   for (int i = 1; i < argc; ++i) {
@@ -85,6 +204,12 @@ bool parse(int argc, char** argv, Args& a) {
     else if (k == "--conf")        o.conf_thr = num(i, k, 0.0, 0.999);
     else if (k == "--kpt-thr")     o.kpt_thr  = num(i, k, 0.0, 0.999);
     else if (k == "--ppm")         o.ppm      = num(i, k, 1e-3, 1e5);
+    else if (k == "--containment") o.containment = frac(i, k);
+    else if (k == "--track-iou")   o.track_iou   = frac(i, k);
+    else if (k == "--track-max-lost")
+      o.track_max_lost = int(integer(i, k, 1, 1 << 20));
+    else if (k == "--queue-depth")
+      o.queue_depth = int(integer(i, k, 1, kMaxQueueDepth));
     else if (k == "--stroke-type") o.stroke_type = need(i);
     else if (k == "--signal") {
       const std::string v = need(i);
@@ -102,34 +227,21 @@ bool parse(int argc, char** argv, Args& a) {
     }
     else if (k == "--fp32")        o.fp16 = false;
     else if (k == "--decoder") {
+      // 严格校验：拼错的值（如 cpuu）必须报错。早先的三元链把一切非
+      // nvdec/cpu 的输入都当 auto，于是 --decoder cpuu 会静默走 ffmpeg 路径，
+      // 用它做「强制 OpenCV」的像素对照会得出完全错误的结论。
       const std::string v = need(i);
-      a.decoder = v == "nvdec" ? DecoderPref::Nvdec
-                : v == "cpu"   ? DecoderPref::Cpu : DecoderPref::Auto;
+      if (v == "nvdec") {
+        printf("[Source] --decoder nvdec 已废弃：CUVID H.264 上限 4096 "
+               "装不下 5002 宽画布，按 auto 处理\n");
+        a.decoder = DecoderPref::Auto;
+      } else {
+        SWIM_CHECK(v == "auto" || v == "cpu",
+                   "--decoder 只能是 auto|cpu，收到 " + v);
+        a.decoder = v == "cpu" ? DecoderPref::Cpu : DecoderPref::Auto;
+      }
     } else if (k == "-h" || k == "--help") {
-      printf("用法: swim_analyse --input <视频|流> [选项]\n"
-             "  --models DIR       detect.onnx/pose.onnx 所在目录 (默认 cpp/models)\n"
-             "  --out FILE         写出标注视频 (H.264)\n"
-             "  --json FILE        写出每个 track 的划水次数与速度\n"
-             "  --dump FILE        逐帧写出每个框(帧号,id,xyxy,conf)+17 个关键点\n"
-             "                     (kx,ky,ks)，用于与 Python 对照\n"
-             "  --max-frames N     只处理前 N 帧\n"
-             "  --detect-size N    detect 输入方形边长, 须与 onnx 一致 (默认 640)\n"
-             "  --max-persons N    pose 最大人数，显存按此预留 (默认 %d, 上限 %d)\n"
-             "  --conf F           检测置信度阈值 (默认 0.25)\n"
-             "  --kpt-thr F        关键点置信度阈值 (默认 0.4)\n"
-             "  --ppm F            画布每米像素数 (默认 100)\n"
-             "  --stroke-type S    泳姿，决定左右是否分开计数 (默认 freestyle)\n"
-             "                     可选: %s\n"
-             "  --signal S         划水信号 elbow_angle|wrist_x_head (默认 elbow_angle)\n"
-             "  --decoder MODE     auto|cpu (默认 auto=ffmpeg 管道，探测失败回退 OpenCV;\n"
-             "                     cpu=强制 OpenCV; nvdec 已废弃，等价 auto)\n"
-             "  --no-kpts          不画骨架\n"
-             "  --preview          开实时窗口（画布会缩放后显示，按 q/ESC 退出）\n"
-             "  --preview-scale F  预览缩放比 0.05~1（默认自适应 1600x900 以内）\n"
-             "  --show-fps         实时打印吞吐\n"
-             "  --fp32             engine 算子用 fp32 (默认 fp16)。注意 ONNX 若是\n"
-             "                     fp16 权重导出的，这只放宽算子精度，不等于真 fp32\n",
-             kMaxPersons, kMaxPersons, kStrokeTypes);
+      print_help();
       return false;
     } else {
       throw std::runtime_error("未知参数 " + k);
@@ -165,57 +277,43 @@ class Writer {
              "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pix_fmt bgr24 "
              "-s %dx%d -r %.4f -i - -c:v libx264 -preset veryfast -crf 23 "
              "-pix_fmt yuv420p \"%s\"", w, h, fps, path.c_str());
-#ifdef _WIN32
-    pipe_ = _popen(cmd, "wb");            // 必须 "wb"：文本模式会把 0x0A 换成 CRLF
-#else
-    pipe_ = popen(cmd, "w");
-#endif
-    SWIM_CHECK(pipe_, "无法打开输出 " + path + "（OpenCV 与 ffmpeg 管道均失败）");
+    // 写侧不需要大缓冲：编码比我们写得快，攒下的字节数就是 ffmpeg 的一次读间隔
+    pipe_ = std::make_unique<Proc>(cmd, Proc::Mode::Write);
+    SWIM_CHECK(bool(*pipe_), "无法打开输出 " + path + "（OpenCV 与 ffmpeg 管道均失败）");
     bytes_ = size_t(w) * h * 3;
     printf("[Writer] %s codec=libx264 (ffmpeg 管道)\n", path.c_str());
   }
 
   /// 析构只收尸不报错：正常路径由 main 显式调 close() 检查退出码，
   /// 异常路径已经在抛别的东西了，析构里再抛会直接 terminate。
-  ~Writer() { reap(); }
+  /// 收尸本身由 ~Proc 完成（幂等）。
+  ~Writer() = default;
 
   void write(const cv::Mat& m) {
     if (!pipe_) { w_.write(m); return; }
     SWIM_CHECK(m.isContinuous(), "帧数据非连续，无法直接写管道");
     ++frames_;
-    if (fwrite(m.data, 1, bytes_, pipe_) == bytes_) return;
+    if (fwrite(m.data, 1, bytes_, pipe_->file()) == bytes_) return;
     // 短写只说明管道断了，真正的原因在 ffmpeg 的退出码里 —— 先收尸拿到它，
     // 否则只剩"写失败"这种没有指向性的报错，还会漏掉断在第几帧
     throw std::runtime_error("写 ffmpeg 管道失败：第 " + std::to_string(frames_) +
-                             " 帧短写，ffmpeg 退出码 " + std::to_string(reap()) +
+                             " 帧短写，ffmpeg 退出码 " +
+                             std::to_string(pipe_->close()) +
                              "（其 stderr 见上方；PATH 里有 ffmpeg 吗？）");
   }
 
   /// 显式关闭：管道要等 ffmpeg 落完 moov 才算写完，别拖到 main 结束后。
   /// 退出码非 0 必须报出来，否则视频缺 moov 而程序声称成功。
   void close() {
-    const int code = reap();
+    const int code = pipe_ ? pipe_->close() : 0;   // OpenCV 模式无子进程
     SWIM_CHECK(code == 0, "ffmpeg 编码进程退出码 " + std::to_string(code) +
                               "，视频可能不完整（已写 " +
                               std::to_string(frames_) + " 帧）");
   }
 
  private:
-  /// 关管道并等 ffmpeg 结束，返回其退出码；幂等，非管道模式返回 0。
-  int reap() {
-    if (!pipe_) return 0;
-    FILE* p = pipe_;
-    pipe_ = nullptr;
-#ifdef _WIN32
-    return _pclose(p);
-#else
-    const int st = pclose(p);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : st;
-#endif
-  }
-
   cv::VideoWriter w_;
-  FILE*   pipe_  = nullptr;
+  std::unique_ptr<Proc> pipe_;         // 空 = 走 OpenCV VideoWriter
   size_t  bytes_ = 0;
   int64_t frames_ = 0;
 };

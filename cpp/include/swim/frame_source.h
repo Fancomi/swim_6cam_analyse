@@ -1,14 +1,17 @@
-// 帧源抽象：离线视频 / live 流 / 外部显存直供，统一给出 GPU 上的画布帧。
+// 帧源抽象：离线视频 / live 流，统一给出 GPU 上的画布帧。
 //
 // 设计要点：
 //   - 内部持有 N 个 device 帧缓冲构成环形队列，next() 轮转复用，
 //     全程不做 cudaMalloc/Free，避免运行时抖动。
 //   - 解码在 CPU 侧完成后 H2D 上传，下游只见 GpuFrame，不感知后端差异。
 //     两条 CPU 路径共用预取骨架，差别只在「怎么拿到一帧 BGR24」：
-//     ffmpeg 管道（默认）实测 13.0 ms/帧，OpenCV(MSMF) 16.9 ms/帧。
-//   - NVDEC 对本画布物理不可用：CUVID 的 H.264 8-bit 上限是 4096，
-//     画布宽 5002 超限（HEVC 上限 8192 可以，但输入是 H.264），故无 NVDEC 实现。
-//   - RawSource 供拼接程序把已在显存的画布直接喂进来（零解码，一次 D2D 拷贝）。
+//     ffmpeg 管道（默认）实测 13.0 ms/帧，OpenCV(MSMF) 16.9 ms/帧。前者已贴住
+//     ffmpeg CLI 自身的地板（同命令落 NUL 实测 10~13.5 ms/帧，取决于文件是否在
+//     系统页缓存里），详见 proc.h 与 FfmpegSource 的注释。
+//   - NVDEC 对本画布物理不可用：CUVID 的 H.264 8-bit max_width/height 上限是
+//     4096，而画布宽 5002 超限（实测 ffmpeg 报 "Video width 5002 not within
+//     range from 48 to 4096"）。HEVC 上限 8192 可以，但输入是 H.264。
+//     所以没有 NVDEC 实现：这不是缺功能，是硬件限制。
 #pragma once
 
 #include <memory>
@@ -18,14 +21,17 @@
 
 namespace swim {
 
-/// 解码后端偏好。取值与 --decoder 的 auto|nvdec|cpu 一一对应：
-///   Auto  = ffmpeg 管道优先，探测失败自动回退 OpenCV；
-///   Cpu   = 强制 OpenCV VideoCapture。本机 videoio 只有 MSMF，它的 YUV→BGR
-///           换算与 swscale 不同（逐像素平均差约 4.5/255），因此该路径只作
-///           兜底与排障，**数值结果不能用于与 Python 端逐值比对**；
-///   Nvdec = 已确认不可行（见文件头 4096 上限），行为同 Auto，仅打印忽略原因。
-enum class DecoderPref { Auto, Nvdec, Cpu };
+/// 解码后端偏好。取值与 --decoder 的 auto|cpu 一一对应：
+///   Auto = ffmpeg 管道优先，探测失败自动回退 OpenCV；
+///   Cpu  = 强制 OpenCV VideoCapture。本机 videoio 只有 MSMF，它的 YUV→BGR
+///          换算与 swscale 不同（逐像素平均差约 4.5/255），因此该路径只作
+///          兜底与排障，**数值结果不能用于与 Python 端逐值比对**。
+/// 没有 Nvdec 取值：那条路已确认物理不可行（见文件头 4096 上限），留一个只会
+/// 被忽略的枚举值等于让每个 switch 都要处理一个死分支。
+enum class DecoderPref { Auto, Cpu };
 
+/// 帧源基类。外部直供显存帧的场景（例如拼接程序把已在显存的画布喂进来）请新增
+/// 一个 FrameSource 子类实现 next()，接口本身已足够，不必给基类加旁路入口。
 class FrameSource {
  public:
   virtual ~FrameSource() = default;
@@ -51,12 +57,6 @@ class FrameSource {
   static std::unique_ptr<FrameSource> open(const std::string& uri,
                                            DecoderPref pref = DecoderPref::Auto,
                                            int ring = 4, bool prefetch = true);
-
-  /// 外部直供：调用方自行把画布写进 device 指针后调用 push()。
-  static std::unique_ptr<FrameSource> raw(int w, int h, double fps, int ring = 3);
-  /// 仅 raw 源可用：拷入一帧（src 可为 host 或 device 指针）。
-  /// 上一帧未被 next() 取走时返回 false（该帧被丢弃，调用方可据此限速）。
-  virtual bool push(const void* src, bool src_on_device) { (void)src; (void)src_on_device; return false; }
 };
 
 }  // namespace swim

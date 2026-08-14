@@ -2,17 +2,18 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
 dist/
 .pytest_cache/
 # 虚拟环境
 .venv/
+# C++ 构建目录（cpp/build），以及 Python 的 build/
+build/
 # 数据与产物（体积大，不入库）
 data/
 output/
 *.mp4
 *.pkl
-# 模型权重：开发机训练产物，由 zip/外部交付，不入库
+# 模型权重：开发机训练产物，由外部交付，不入库（来源见 docs/权重来源与复现.md）
 weights/
 # 交接原版代码与对照脚本（仅本地验收用）
 .probe/

@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# 一键安装运行环境。默认在项目下创建 .venv，不污染系统 Python。
+# 一键安装 Python 参考链路的运行环境（Linux 与 Windows/Git Bash 通用）。
+# 默认在项目下创建 .venv，不污染系统 Python。
 #
 #   bash install.sh              # 安装 + 自检
 #   bash install.sh --skip-test  # 只安装
 #
-# 环境要求：Linux + NVIDIA GPU（CUDA 驱动 ≥ 12.1）+ Python 3.10。
+# 环境要求：NVIDIA GPU（驱动支持 CUDA 12.1）+ Python 3.10。
+# C++ 实时链路不需要本脚本（只需 CUDA/TensorRT/OpenCV），见 cpp/README.md；
+# 但导出 ONNX 用的是这里的 venv。
 #
 # 版本锁定的原因：mmcv 的 CUDA 算子只有预编译 wheel 可用（源码编译需数十分钟
 # 且易失败），而 OpenMMLab 官方只为特定 torch/CUDA 组合发布 wheel。
 # cu121/torch2.1.0 是同时提供 mmcv 2.1.0 wheel、且被 mmpose 1.3.1 与
 # mmdet 3.2.0 共同支持（两者都要求 mmcv<2.2.0）的组合，因此整条链锁在这里。
+# Python 必须 3.10：mmcv wheel 只发 cp310。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="${VENV:-$ROOT/.venv}"
 PY_VERSION=3.10
+export PYTHONUTF8=1          # Windows 默认 GBK，中文日志会乱码
 
 TORCH=2.1.0
 TORCHVISION=0.16.0
@@ -28,30 +33,40 @@ MMCV_INDEX="https://download.openmmlab.com/mmcv/dist/cu121/torch${TORCH}/index.h
 log() { printf '\033[1;32m[install]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[install] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# venv 里的解释器：Linux 在 bin/python，Windows 在 Scripts/python.exe
+venv_python() {
+  local p
+  for p in "$VENV/bin/python" "$VENV/Scripts/python.exe"; do
+    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 # ── 1. 前置检查 ──────────────────────────────────────────────────────────────
-# Windows/Git Bash 下 nvidia-smi 能通过，但 venv 路径、python3 存根、numpy 与
-# setuptools 的安装顺序都不一样，不是换个路径能覆盖的，故直接早退
-case "$(uname -s)" in
-  Linux) ;;
-  *) die "install.sh 仅支持 Linux；Windows 见 docs/迁移交接.md §4" ;;
-esac
 command -v nvidia-smi >/dev/null || die "未找到 nvidia-smi，本项目需要 NVIDIA GPU"
 log "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 
-# ── 2. 虚拟环境（优先 uv，缺失则回退 venv/virtualenv）───────────────────────
-if [[ ! -x "$VENV/bin/python" ]]; then
+# ── 2. 虚拟环境（优先 uv，缺失则回退 venv）──────────────────────────────────
+if ! venv_python >/dev/null; then
   log "创建虚拟环境 $VENV"
   if command -v uv >/dev/null; then
     uv venv "$VENV" --python "$PY_VERSION"
-  elif python3 -m venv "$VENV" 2>/dev/null; then
-    :
-  elif command -v virtualenv >/dev/null; then
-    virtualenv -p "python$PY_VERSION" "$VENV"
   else
-    die "无法创建虚拟环境，请先安装 uv 或 python${PY_VERSION}-venv"
+    # 逐个候选试 3.10：Windows 上 python3 常是 WindowsApps 的空壳（只会弹商店），
+    # 而 py launcher 能精确选版本；Linux 上通常是 python3.10
+    BASE=()
+    for c in "python$PY_VERSION" python3 python; do
+      command -v "$c" >/dev/null 2>&1 || continue
+      "$c" -c 'import sys;sys.exit(0 if sys.version_info[:2]==(3,10) else 1)' \
+        2>/dev/null && { BASE=("$c"); break; }
+    done
+    if [[ ${#BASE[@]} -eq 0 ]] && command -v py >/dev/null 2>&1 \
+       && py "-$PY_VERSION" -c '' 2>/dev/null; then BASE=(py "-$PY_VERSION"); fi
+    [[ ${#BASE[@]} -gt 0 ]] || die "未找到 Python $PY_VERSION，请先安装（或装 uv 由它下载）"
+    "${BASE[@]}" -m venv "$VENV" || die "创建虚拟环境失败：${BASE[*]} -m venv"
   fi
 fi
-PYTHON="$VENV/bin/python"
+PYTHON="$(venv_python)" || die "虚拟环境 $VENV 创建后仍找不到解释器"
 "$PYTHON" -c 'import sys; assert sys.version_info[:2]==(3,10), sys.version' \
   || die "虚拟环境 Python 版本必须是 3.10（mmcv wheel 只提供 cp310）"
 
@@ -72,7 +87,8 @@ log "安装 torch $TORCH (cu121)"
 #              uv 创建的 venv 默认不含 setuptools；pkg_resources 在
 #              setuptools 81 中被移除，故上限锁在 81 以下
 pip_install -q "torch==$TORCH" "torchvision==$TORCHVISION" "numpy==$NUMPY" \
-  "setuptools$SETUPTOOLS"
+  "setuptools$SETUPTOOLS" --index-url https://download.pytorch.org/whl/cu121 \
+  --extra-index-url https://pypi.org/simple
 "$PYTHON" - <<'EOF' || die "torch 无法使用 GPU，请检查驱动与 CUDA 版本"
 import sys, torch
 print(f"[install] torch {torch.__version__}  cuda {torch.version.cuda}  "
@@ -115,15 +131,21 @@ EOF
   log "单元测试"
   "$PYTHON" -m pytest "$ROOT/tests" -q
 
-  log "模型加载检查"
-  for f in weights/yolo_swim_detect.pt weights/rtmpose_m_swim.pth configs/pool_mesh.json; do
+  # 只强检默认 Plan C 需要的文件；Plan A/B 的权重缺失仅提示，不阻断
+  log "模型加载检查（Plan C）"
+  for f in weights/yolo_swim_detect.pt configs/rtmpose-m_canvas-192x256.py \
+           weights/plans/planC_rtmpose_m_canvas.pth; do
     [[ -f "$ROOT/$f" ]] || die "缺少文件 $f"
+  done
+  for f in weights/rtmpose_m_swim.pth configs/pool_mesh.json \
+           weights/plans/planB_yolo26x_pose_canvas.pt; do
+    [[ -f "$ROOT/$f" ]] || log "提示：缺少 $f（对应 Plan A/B 不可用，Plan C 不受影响）"
   done
   "$PYTHON" - <<EOF
 from mmpose.apis import init_model
 from ultralytics import YOLO
-m = init_model("$ROOT/configs/rtmpose-m_swim-256x192.py",
-               "$ROOT/weights/rtmpose_m_swim.pth", device="cuda:0")
+m = init_model("$ROOT/configs/rtmpose-m_canvas-192x256.py",
+               "$ROOT/weights/plans/planC_rtmpose_m_canvas.pth", device="cuda:0")
 print(f"[install] RTMPose 就绪：{m.dataset_meta['num_keypoints']} 个关键点")
 YOLO("$ROOT/weights/yolo_swim_detect.pt")
 print("[install] YOLO 就绪")

@@ -99,6 +99,13 @@ size_t volume(const nvinfer1::Dims& d, const std::string& who) {
   return v;
 }
 
+/// 一个绑定在当前形状下的字节数。dtype 要从 engine 现查（不是从 Binding 缓存），
+/// 分配与 set_batch 后的重算都走这里，两处口径必然一致。
+size_t binding_bytes(const nvinfer1::ICudaEngine& engine, const Binding& b) {
+  return volume(b.dims, b.name) *
+         elem_size(engine.getTensorDataType(b.name.c_str()));
+}
+
 /// 构建 engine 并写盘。分离成函数是为了让 builder 相关对象尽早释放
 /// （builder 会占约 2 GB CPU 内存）。
 void build_engine(const std::string& onnx, const std::string& out,
@@ -182,17 +189,19 @@ std::unique_ptr<TrtEngine> TrtEngine::load(
   e->dyn_input_ = dynamic_input;
   e->runtime_.reset(nvinfer1::createInferRuntime(g_logger));
   SWIM_CHECK(e->runtime_, "createInferRuntime 失败");
-  {
+  // 读盘 + 反序列化。写成 lambda 是因为要做两次（第二次是删档重建后重试），
+  // 而 blob 得在每次调用结束就释放（engine 有几百 MB，不该多留一份在内存里）。
+  auto deserialize = [&e, &path] {
     auto blob = read_file(path);
     e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
-  }
+  };
+  deserialize();
   if (!e->engine_) {
     // 身份戳一致却反序列化失败 = 文件损坏，删掉重建一次；再失败才抛
     printf("[TRT] %s 反序列化失败，删除并重建\n", path.c_str());
     std::remove(path.c_str());
     build_engine(onnx_path, path, dynamic_input, min_b, opt_b, max_b, fp16);
-    auto blob = read_file(path);
-    e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
+    deserialize();
     SWIM_CHECK(e->engine_, "engine 反序列化失败 " + path);
   }
   // kUSER_MANAGED：显存自管，避免运行时重分配
@@ -222,8 +231,7 @@ void TrtEngine::init_bindings(int max_batch) {
     // 按 max_batch 分配：动态维填 max_batch，后续 set_batch 只改逻辑尺寸
     b.dims = engine_->getTensorShape(b.name.c_str());
     if (b.dims.d[0] < 0) b.dims.d[0] = max_batch;
-    b.bytes = volume(b.dims, b.name) *
-              elem_size(engine_->getTensorDataType(b.name.c_str()));
+    b.bytes = binding_bytes(*engine_, b);
     SWIM_CHECK(cudaMalloc(&b.ptr, b.bytes) == cudaSuccess,
                "绑定 " + b.name + " 分配 " + std::to_string(b.bytes / (1 << 20)) +
                    " MB 显存失败（显存不足？可降 --max-persons）");
@@ -255,8 +263,7 @@ void TrtEngine::set_batch(int batch) {
   // 输入形状变化会传播到输出，同步各绑定的逻辑字节数（显存不动）
   for (auto& b : bindings_) {
     b.dims = ctx_->getTensorShape(b.name.c_str());
-    b.bytes = volume(b.dims, b.name) *
-              elem_size(engine_->getTensorDataType(b.name.c_str()));
+    b.bytes = binding_bytes(*engine_, b);
   }
   // 工作区只按 max_batch 分配一次。实测激活量随 batch 单调（max 是上界），但
   // 那是观察而非 API 契约 —— 加多 profile 或 weight streaming 后可能不成立，

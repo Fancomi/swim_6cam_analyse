@@ -149,6 +149,14 @@ class Pipeline {
   void post_loop(const Sink& sink);
   /// 单帧 GPU 链路，结果异步写入 blob，返回本帧人数。
   int  infer_frame(const GpuFrame& f, Slot<float>& blob);
+  /// 分配一个回读环：每格一块 elems 个元素的锁页 host 缓冲 + 一个完成事件。
+  /// 环深固定为 ring_depth()，两个环（关键点 blob、整帧图像）必须一致 ——
+  /// infer_loop 用同一个 cursor_ 索引它们。
+  template <typename T>
+  void alloc_ring(std::vector<Slot<T>>& ring, size_t elems);
+  /// 回读环深度：队列容量 + 消费者手上 1 + 生产者正在写 1。
+  /// 少一格会覆写在用的数据（曾表现为渲染画面撕裂）。
+  size_t ring_depth() const { return size_t(opt_.queue_depth) + 2; }
   /// 渲染路径的整帧回读环：run() 开始时一次性分配，运行期不再分配。
   void alloc_frame_ring(int w, int h);
 
@@ -172,7 +180,7 @@ class Pipeline {
   int*   h_count_   = nullptr;   // 唯一必须当帧同步的回读（决定 pose batch）
   size_t blob_n_    = 0;         // d_blob_/h_blob_ 的 float 个数
 
-  // 深度 = 队列容量 + 消费者手上 1 + 生产者正在写 1，少一格会覆写在用的数据
+  // 两个环深度相同（见 ring_depth()），由 alloc_ring 分配
   std::vector<Slot<float>>   blob_ring_;
   std::vector<Slot<uint8_t>> frame_ring_;
   size_t                     frame_bytes_ = 0;

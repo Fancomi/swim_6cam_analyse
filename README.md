@@ -2,30 +2,54 @@
 
 六路相机拼接全景视频的游泳动作分析：**逐人划水次数 + 瞬时速度 + 标注视频**。
 
-输入一段六机位拼接的泳池俯视全景视频（外加六路原始相机视频），输出每个泳者的
-划水次数、逐帧速度曲线，以及叠加了检测框 / ID / 划水数 / 速度 / 关键点骨架的视频。
+输入一段六机位拼接的泳池俯视全景视频（5002×2102），输出每个泳者的划水次数、
+逐帧速度曲线，以及叠加了检测框 / ID / 划水数 / 速度 / 关键点骨架的视频。
+
+仓库里有**两条独立实现**同一套算法：
+
+| | 用途 | 入口 | 速度 |
+| --- | --- | --- | --- |
+| **C++/CUDA** | 实时、上线、看效果 | 双击 `run_preview.bat` | 65–78 fps |
+| **Python** | 换模型、Plan A/B/C 对比、评测 | `bash run.sh C` | 约 13 倍实时 |
+
+C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边靠数值对照保持一致。
+**Agent / 新人先读 [`CLAUDE.md`](CLAUDE.md)** —— 它说明该走哪条线、只读哪些文件、
+以及改动时必须同步的几处契约。
 
 ## 快速开始
 
+**Windows（推荐，C++ 实时链路）** —— 双击即可，无需命令行：
+
+```
+build.bat          构建 + 从 weights/ 导出 ONNX（首次一次）
+run_preview.bat    实时预览窗口（也可把视频拖到它上面，或传 rtsp:// 流）
+run_analyse.bat    批处理出 json，加 --out o.mp4 出标注视频
+```
+
+首次运行 `run_preview.bat` 会构建 TensorRT engine（几分钟），之后秒开。
+环境要求与踩过的坑见 [`docs/windows.md`](docs/windows.md)。
+
+**Python 参考链路（Linux 或 Git Bash）**：
+
 ```bash
-bash install.sh                # 建 .venv、装依赖、跑自检和单元测试
+bash install.sh                # 建 .venv、装依赖、跑自检
 bash run.sh C                  # Plan C（推荐），默认数据
 bash run.sh C --max-frames 300 # 先跑 300 帧确认链路
 bash run.sh A                  # Plan A（交接原版，需六路原相机视频）
+bash test.sh                   # 秒级自检；--full 加 30 帧 GPU 冒烟
 ```
 
-Windows 上想直接看实时效果：**双击仓库根目录的 `run_preview.bat`**（也可把视频
-文件拖到它上面，或 `run_preview.bat rtsp://...` 接 live 流）。走的是 C++/CUDA
-链路，逐帧现场 detect + pose + 跟踪 + 划水/速度，边算边在窗口里画，按 q/ESC 结束。
-
-结果落在 `output/<视频名>_plan<X>/`：
+Python 结果落在 `output/<视频名>_plan<X>/`：
 
 | 文件 | 内容 |
 | --- | --- |
 | `<视频名>_plan<X>.mp4` | 标注视频（H.264） |
-| `result.json` | 每个 ID 的划水次数与速度采样点 |
+| `result.json` | 每个 ID 的划水次数与速度采样序列 `{tid: {strokes, speed_mps: [[t,v],…]}}` |
 | `signal_plots/id*.png` | 每人的划水信号图（原始 + 平滑 + 事件标记） |
 | `cache.pkl` | Stage1/2 中间结果，同 plan 重跑时自动复用 |
+
+C++ 的 `--json` 是另一种更薄的格式（`{tid: {strokes, speed}}`，speed 为最后一次采样值），
+面向实时上报；两者不可直接 diff。
 
 ## 三套关键点方案
 
@@ -44,11 +68,12 @@ Windows 上想直接看实时效果：**双击仓库根目录的 `run_preview.ba
 - **B** 一次前向出框+点，整图并行，耗时几乎与人数无关（17 人 35 ms、68 人 17 ms）；
   代价是一个骨干、一个尺度同时服务两个任务，检测与关键点精度均最低。
 - **C** 检测与关键点解耦，各自用专门模型；相比 A 省掉 4K 解码与 mesh，batch 不再切碎。
-  **推荐用这套。**
+  **推荐用这套**，也是 C++ 实时链路唯一实现的方案。
 
-> 评测口径：检测指标在人工标注 val（36 帧/639 框）上算，关键点用 PCK（误差按人体框高
-> 归一化）而非 COCO OKS —— 本数据目标 area 中位 17880，OKS 容差达 17–29 px 而人体框高
-> 仅 78 px，模型差异会被度量淹没。
+> 上表口径：`data/20260629`（19.3 人/帧）、H800、人工标注 val（36 帧/639 框）。
+> 关键点用 PCK（误差按人体框高归一化）而非 COCO OKS —— 本数据目标 area 中位 17880，
+> OKS 容差达 17–29 px 而人体框高仅 78 px，模型差异会被度量淹没。
+> **引用任何性能数字都要带上数据集 + 机器 + Plan**，两个数据集的人数密度差一倍以上。
 
 ## 工作原理（以 Plan A 为例）
 
@@ -92,30 +117,35 @@ Plan B/C 把 Stage1+2 换成画布单遍或画布两阶段，Stage3/4 不变。
 ## 目录结构
 
 ```
+CLAUDE.md                        导航：该走哪条线、同步契约、验证方法（先读这个）
+build.bat run_preview.bat run_analyse.bat   Windows C++ 入口（双击）
+scripts/env.bat                  三个 bat 共用的前置检查（TRT/exe/onnx/ffmpeg）
+install.sh run.sh test.sh        Python 入口（Linux / Git Bash）
 configs/
-  pool_mesh.json                 泳池 mesh 标定（六路相机的三角面片 + UV），仅 Plan A 用
+  pool_mesh.json                 泳池 mesh 标定（六路相机三角面片 + UV），仅 Plan A 用
   rtmpose-m_swim-256x192.py      Plan A 的原相机 RTMPose 推理配置
   rtmpose-m_canvas-192x256.py    Plan C 的画布 RTMPose 推理配置
-weights/
-  yolo_swim_detect.pt            泳者检测（微调），Plan A/C 共用
-  rtmpose_m_swim.pth             原相机 RTMPose-m（Plan A）
-  plans/planB_yolo26x_pose_canvas.pt   画布 yolo26-pose 一体（Plan B）
-  plans/planC_rtmpose_m_canvas.pth     画布 RTMPose-m（Plan C）
-src/swim_analyse/
+weights/                         成品权重，来源与复现见 docs/权重来源与复现.md
+src/swim_analyse/                Python 参考实现
   cli.py         统一入口：--plan A/B/C，Stage3/4 共用
   plans.py       三套方案的实现，统一接口 run() -> (all_boxes, raw_seq)
+  metrics.py     划水信号与计数、瞬时速度、信号图
   geometry.py    canvas <-> source 双向映射（网格索引加速），Plan A 用
   tracking.py    检测框去重 + IoU 贪心跟踪
   pose.py        RTMPose 封装、COCO17 定义、关键点插值
-  metrics.py     划水信号与计数、瞬时速度、信号图
   draw.py        骨架 / 标签绘制
   video.py       多路视频的帧级随机读取（带帧缓存），Plan A 用
+cpp/                             C++/CUDA 实时实现（Plan C），见 cpp/README.md
 tests/test_core.py               纯逻辑单元测试（无需 GPU 和数据）
-cpp/                             C++/CUDA 实时实现（Plan C，全程 GPU 驻留）
-                                 Windows 实测 65~78 fps 纯分析，见 cpp/README.md
+docs/
+  windows.md                     Windows 环境要求、脚本编码规则、踩过的坑
+  pipeline.html                  Plan A 的公式推导与逐段耗时拆解
+  权重来源与复现.md              权重来源与训练复现
 ```
 
-三套方案共享同一份数据约定，因此新增方案只需在 `plans.py` 里实现 `run()`：
+三套方案共享同一份数据约定，因此新增方案只需在 `plans.py` 里实现一个子类，
+覆盖 `_setup()`（加载模型）与 `_frame(fi, frame)`（处理一帧，结果写进
+`self.all_boxes` / `self.raw_seq`）两个钩子 —— 开视频、逐帧驱动、收尾都在基类：
 
 ```python
 all_boxes  {frame_idx: [(track_id, x1, y1, x2, y2, conf)]}    画布坐标
@@ -125,20 +155,25 @@ raw_seq    {track_id: [(frame_idx, kpts(17,2), scores(17,), cam_idx)]}
 
 ## 数据准备
 
-`data/20260629/` 下需要：
+默认数据集 `data/20260730/`（C++ 与 Python Plan B/C 共用，两条线的数字才可比）：
 
 ```
-merged_3000f.mp4      六路拼接后的全景视频（5002x2102）
+merged_3000f.mp4      六路拼接后的全景视频（5002x2102，3000 帧）
+```
+
+Plan A 额外需要六路原始相机视频，只有旧数据集 `data/20260629/` 有：
+
+```
+merged_3000f.mp4      画布
 cam1.mp4 ... cam6.mp4 六路原始相机视频（3840x2160）
 ```
 
-用其他数据时通过环境变量或参数指定：
+用其他数据时通过环境变量指定：
 
 ```bash
-DATA_DIR=/path/to/data CANVAS=/path/to/merged.mp4 bash run.sh C
+CANVAS=/path/to/merged.mp4 bash run.sh C          # Plan B/C 只要画布
+DATA_DIR=/path/to/20260629 bash run.sh A          # Plan A 还要同目录下的 cam*.mp4
 ```
-
-Plan B/C 只需 `CANVAS`（画布视频）；Plan A 还需 `DATA_DIR` 下的六路原相机视频。
 
 > **相机顺序（仅 Plan A）**：`--camera-videos` 必须按 `pool_mesh.json` 里 `meshes` 数组的
 > 顺序传入，即 `cam4 cam3 cam2 cam5 cam6 cam1`。mesh 的 `texture_basename` 依次是
@@ -147,13 +182,17 @@ Plan B/C 只需 `CANVAS`（画布视频）；Plan A 还需 `DATA_DIR` 下的六�
 ## 常用参数
 
 ```bash
-bash run.sh C --help                          # 全部参数
+bash run.sh --help                            # 全部参数
 bash run.sh C --signal wrist_x_head           # 换划水信号
 bash run.sh C --stroke-type breaststroke      # 换泳姿
-bash run.sh C --kpt-thr 0.5                   # 提高关键点置信度门槛
+bash run.sh C --kpt-thr 0.5                   # 提高单点置信度门槛（影响信号/插值/绘制）
+bash run.sh C --pose-score-thr 0.5            # 仅 Plan A：17 点均值低于此值才换相机补检
 bash run.sh C --codec mp4v                    # 换编码（默认 h264）
 DRAW_KEYPOINTS= bash run.sh C                 # 关掉骨架叠加（渲染更快）
 ```
+
+`--kpt-thr` 与 `--pose-score-thr` 是**两个不同的东西**，只是默认值都是 0.4：前者是单个
+关键点的可信门槛，后者是 Plan A 判断"这一次推理整体够不够好、要不要换相机再推一次"的门槛。
 
 调参时不必重跑 GPU：`output_dir/cache.pkl` 存在时会跳过 Stage1/2，直接从 Stage3 起算
 （缓存键是「影响 Stage1/2 的参数 + 输入视频与权重文件的大小/mtime」哈希，换 plan、
@@ -162,27 +201,29 @@ DRAW_KEYPOINTS= bash run.sh C                 # 关掉骨架叠加（渲染更�
 
 ## 环境说明
 
-版本被锁在 **Python 3.10 + torch 2.1.0(cu121) + mmcv 2.1.0 + mmpose 1.3.1**，
-原因是 mmcv 的 CUDA 算子只有预编译 wheel 可用，而 OpenMMLab 只为特定
-torch/CUDA 组合发布 wheel；`cu121/torch2.1.0` 是同时满足 mmpose 1.3.1 与
-mmdet 3.2.0（两者都要求 `mmcv<2.2.0`）的组合。内网环境下 `install.sh` 需要代理
-才能取到 mmcv wheel：
+Python 侧版本被锁在 **Python 3.10 + torch 2.1.0(cu121) + mmcv 2.1.0 + mmpose 1.3.1**，
+原因是 mmcv 的 CUDA 算子只有预编译 wheel 可用，而 OpenMMLab 只为特定 torch/CUDA
+组合发布 wheel；`cu121/torch2.1.0` 是同时满足 mmpose 1.3.1 与 mmdet 3.2.0
+（两者都要求 `mmcv<2.2.0`）的组合。内网环境下 `install.sh` 需要代理才能取到 mmcv wheel：
 
 ```bash
 export https_proxy=http://<proxy>:<port> http_proxy=http://<proxy>:<port>
 bash install.sh
 ```
 
+C++ 侧只需 CUDA 12.x + TensorRT 10.11 + OpenCV 4.x + ffmpeg CLI，不依赖上面这套 Python
+（只有导出 ONNX 用到）。Windows 细节见 [`docs/windows.md`](docs/windows.md)。
+
 ## 性能参考
 
-单张 H800，3000 帧 5002x2102 全景（约 100 秒视频，平均 19.3 人/帧，共 81 个 track）：
+### Python Plan A：H800，`data/20260629`，3000 帧（约 100 秒视频，19.3 人/帧，81 个 track）
 
 | 阶段 | 耗时 | 占比 | 主要成本 |
 | --- | --- | --- | --- |
 | Stage1 检测跟踪 | 146s | 11% | 3000 次画布整帧 YOLO |
 | Stage2 关键点 | 683s | 53% | 推理 58% / 4K 解码 24% / 几何 14% / 补检 4% |
 | Stage3 指标 | <1s | ~0% | 纯 CPU 信号处理 |
-| Stage4 渲染 | 463s | 36% | 逐帧 mp4v 编码（编码本身占 85%） |
+| Stage4 渲染 | 463s | 36% | 逐帧编码（编码本身占 85%） |
 
 合计约 21.5 分钟，即约 13 倍实时。两个值得知道的细分结论：
 
@@ -192,9 +233,13 @@ bash install.sh
 
 有 `cache.pkl` 时跳过 Stage1+2，可省掉全程的 64%。
 
-### C++ 实时实现
+### C++ Plan C：`data/20260730`，3000 帧（8.0 人/帧，63 个 track，划水合计 376 次）
 
-同一套 Plan C 用 C++/CUDA 重写后（全程 GPU 驻留，只回读关键点），
-RTX 4080 Laptop 上 3000 帧实测 **65~78 fps 纯分析 / 65~70 fps 实时预览窗口
-（`--preview`）/ 27~35 fps 渲染落盘**，瓶颈已从 GPU 推理转到 CPU 解码与编码。
-构建、参数与逐段耗时见 [`cpp/README.md`](cpp/README.md)。
+| 机器 | 纯分析 | 实时预览 `--preview` | 渲染落盘 `--out` |
+| --- | --- | --- | --- |
+| RTX 4080 Laptop | 12.8–15.5 ms/帧（**65–78 fps**） | 14.3–15.5 ms（65–70 fps） | 29.0–37.6 ms（27–35 fps） |
+| H800 | 12.4 ms/帧（**80 fps**） | — | 41.6 ms（24 fps） |
+
+全程 GPU 驻留，只回读关键点（约 9 KB/帧）。瓶颈已从 GPU 推理转到 CPU 解码与编码 ——
+GPU 段稳定在 6.2 ms（H800）/ 6.8–8 ms（4080 Laptop）。
+构建、参数、显存与逐段耗时见 [`cpp/README.md`](cpp/README.md)。

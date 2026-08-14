@@ -72,7 +72,7 @@ message(STATUS "TensorRT: ${TRT_INCLUDE}")
 
 add_executable(swim_analyse
   src/main.cpp src/pipeline.cpp src/trt_engine.cpp
-  src/frame_source.cpp src/metrics.cpp src/common.cpp src/kernels.cu)
+  src/frame_source.cpp src/proc.cpp src/metrics.cpp src/common.cpp src/kernels.cu)
 
 target_include_directories(swim_analyse PRIVATE include ${TRT_INCLUDE})
 target_link_libraries(swim_analyse PRIVATE

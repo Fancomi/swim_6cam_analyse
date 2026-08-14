@@ -160,12 +160,21 @@ mjx-container[display="true"]{overflow-x:auto;overflow-y:hidden;max-width:100%;p
 </head>
 <body>
 <div class="wrap">
-<h1>swim_6cam_analyse：六路相机游泳分析计算链路</h1>
+<h1>swim_6cam_analyse：Plan A 计算链路</h1>
 
 <p class="lede">
 六机位拍摄的泳池被拼成一张全景画布：<b>在画布上做检测与跟踪</b>（视野全、ID 连续），
 再用泳池的三角网格把每个人的框<b>映射回拍得最清楚的那路原始相机</b>去回归 17 个关键点，
 最后由关键点时序算出划水次数、由框中心轨迹算出速度，叠回画布输出标注视频。
+</p>
+
+<p class="note">
+<b>本页只讲 Plan A</b>（跨相机 mesh 方案，Python 参考实现）。Plan B/C 把 Stage1+2 换成
+画布单遍或画布两阶段，Stage3/4 完全相同；三套方案的指标对比见 <code>README.md</code>，
+C++ 实时链路（Plan C）见 <code>cpp/README.md</code>。
+<b>本页所有数字的口径是：Plan A · 数据集 <code>data/20260629</code> · 单张 H800</b>，
+该数据集平均 19.3 人/帧，与 C++ 链路用的 <code>data/20260730</code>（8.0 人/帧）人数密度差一倍以上，
+两者的耗时与统计量不可直接比较。
 </p>
 
 <div class="grid g4">
@@ -176,7 +185,7 @@ mjx-container[display="true"]{overflow-x:auto;overflow-y:hidden;max-width:100%;p
 </div>
 
 <p class="note">
-本页所有数字均来自这一次 3000 帧全量运行的实测日志与缓存统计。凡是推断而非实测的结论都标了
+本页所有数字均来自这一次 3000 帧全量运行（Plan A · <code>data/20260629</code> · H800）的实测日志与缓存统计。凡是推断而非实测的结论都标了
 <span class="mark m-inf">推断</span>，尚未验证的标 <span class="mark m-tbc">待确认</span>。
 </p>
 
