@@ -14,6 +14,10 @@ bash run.sh C --max-frames 300 # 先跑 300 帧确认链路
 bash run.sh A                  # Plan A（交接原版，需六路原相机视频）
 ```
 
+Windows 上想直接看实时效果：**双击仓库根目录的 `run_preview.bat`**（也可把视频
+文件拖到它上面，或 `run_preview.bat rtsp://...` 接 live 流）。走的是 C++/CUDA
+链路，逐帧现场 detect + pose + 跟踪 + 划水/速度，边算边在窗口里画，按 q/ESC 结束。
+
 结果落在 `output/<视频名>_plan<X>/`：
 
 | 文件 | 内容 |
@@ -191,6 +195,6 @@ bash install.sh
 ### C++ 实时实现
 
 同一套 Plan C 用 C++/CUDA 重写后（全程 GPU 驻留，只回读关键点），
-RTX 4080 Laptop 上 3000 帧实测 **65~78 fps 纯分析 / 65~67 fps 实时预览窗口
+RTX 4080 Laptop 上 3000 帧实测 **65~78 fps 纯分析 / 65~70 fps 实时预览窗口
 （`--preview`）/ 27~35 fps 渲染落盘**，瓶颈已从 GPU 推理转到 CPU 解码与编码。
 构建、参数与逐段耗时见 [`cpp/README.md`](cpp/README.md)。
