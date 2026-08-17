@@ -3,10 +3,11 @@ rem swim_analyse - build the C++/CUDA realtime pipeline on Windows (double-click
 rem ASCII only on purpose: cmd.exe parses .bat with the system ANSI codepage.
 rem Notes live in cpp/README.md, not here.
 rem
-rem Does three things, each skipped when already done:
+rem Does four things, each skipped when already done:
 rem   1) cmake configure  (Visual Studio 2022 + CUDA + TensorRT + vcpkg OpenCV)
 rem   2) cmake --build --config Release
 rem   3) export detect.onnx / pose.onnx from weights/  (needs .venv, install.sh)
+rem   4) bake cpp\models\stitch.lut from configs\pool_mesh.json (six-camera input)
 rem TensorRT engines are NOT built here - the first run builds and caches them
 rem (a few minutes), keyed by GPU arch + TRT version + flags.
 rem
@@ -57,18 +58,27 @@ echo [build] compile Release
 cmake --build cpp\build --config Release || goto :fail
 
 set "PY=.venv\Scripts\python.exe"
+if not exist "%PY%" (
+  echo [warn] %PY% missing - cannot export ONNX or bake the stitch LUT.
+  echo        Run scripts/install.sh, then:
+  echo          %PY% cpp\tools\export_onnx.py --out cpp\models
+  echo          %PY% cpp\tools\build_stitch_lut.py
+  goto :done
+)
+set PYTHONUTF8=1
+
 if exist cpp\models\detect.onnx if exist cpp\models\pose.onnx (
   echo [build] onnx already exported - delete cpp\models\*.onnx to redo
-  goto :done
-)
-if not exist "%PY%" (
-  echo [warn] %PY% missing - cannot export ONNX. Run scripts/install.sh, then:
-  echo        %PY% cpp\tools\export_onnx.py --out cpp\models
-  goto :done
+  goto :lut
 )
 echo [build] export onnx from weights
-set PYTHONUTF8=1
 "%PY%" cpp\tools\export_onnx.py --out cpp\models || goto :fail
+
+:lut
+rem Six-camera input (--cam-dir) needs this table; analysing an already-stitched
+rem canvas (--input) does not. Skipped when newer than the calibration.
+echo [build] bake stitch LUT from configs\pool_mesh.json
+"%PY%" cpp\tools\build_stitch_lut.py || goto :fail
 
 :done
 echo.

@@ -14,13 +14,15 @@ Windows 特有的环境要求、编码规则与已知坑；每条坑的修复都
 | CUDA Toolkit | 12.x | 与驱动匹配（实测 12.8）；**50 系卡需 ≥12.8**（Blackwell） |
 | TensorRT | **10.11.0.33** | 官方 Windows zip，解压即可。TRT 11 移除了 `BuilderFlag::kFP16`，本代码只针对 10.x |
 | OpenCV | 4.x | 实测 vcpkg `opencv4:x64-windows`（4.10）。`--preview` 需要 `highgui`。**它不含 ffmpeg 特性**，见第 3 节 |
+| FFmpeg libav*（可选） | 含 `h264_cuvid` | 只有六路现拼 `--cam-dir` 需要。vcpkg 装 `ffmpeg[core,avcodec,avformat,nvcodec]:x64-windows`（实测 7.1.2），`find_package(FFMPEG)` 自动找到。缺了只是这一路不编 |
 | CMake | ≥3.18 | |
-| ffmpeg CLI | 任意近期版本 | 在 `PATH` 里。**默认解码路径与 `--out` 编码都要它** |
+| ffmpeg CLI | 任意近期版本 | 在 `PATH` 里。**`--input` 的默认解码路径与 `--out` 编码都要它** |
 
 `scripts/build.bat` 里三个可覆盖的环境变量：`SWIM_TRT_ROOT`、`SWIM_VCPKG`、`SWIM_CUDA_ARCH`
 （RTX40=`89`，RTX50=`120`，RTX30=`86`；不要用 CMake 默认的 `86 89 90`，多架构编译慢很多）。
 运行期还要让 TRT 的 DLL 可见 —— `scripts/env.bat` 会把 `SWIM_TRT_LIB`（默认
 `<TRT_ROOT>\lib`）加进 `PATH`，三个 `.bat` 都 `call` 它。
+vcpkg 的 DLL（OpenCV / libav*）由 CMake 自动拷到 exe 旁，不必手动加 `PATH`。
 
 **库名差异**：Windows 的 TRT 导入库带版本后缀（`nvinfer_10.lib` / `nvonnxparser_10.lib`），
 Linux 是 `libnvinfer.so`。`cpp/CMakeLists.txt` 两套名字都找。
@@ -80,6 +82,21 @@ powershell.exe -NoProfile -Command "[System.Management.Automation.Language.Parse
    3.10 并在最后回退 `py -3.10`。
 7. **`export_onnx.py` 会在 `weights/` 下留一个中间 `yolo_swim_detect.onnx`** ——
    ultralytics 先写在 `.pt` 旁边再 `os.replace`，可手动删掉。
+8. **`av_hwdevice_ctx_create` 的顺序坑（六路现拼）** —— 传
+   `AV_CUDA_USE_PRIMARY_CONTEXT` 时它要设置 primary context 的 flags，若 CUDA runtime
+   API（`cudaSetDevice`/`cudaMalloc`）已经激活过它，就返回 `-129`
+   （`Primary context already active with incompatible flags`）。所以
+   `StitchFrameSource` 的构造顺序是「先建 hwdevice，再 `cudaMalloc` 查找表」，不能调换。
+   不传这个 flag 也能解码（FFmpeg 自建 context，靠 UVA 让裸指针可寻址），但那样
+   TensorRT 与 kernel 与解码器不在同一 context，跨 context 的裸指针访问不受保证。
+9. **h264_cuvid 的 `hw_frames_ctx` 可能为 NULL** —— 它自己管 surface 池，不走 FFmpeg 的
+   frames context。读 `ctx->hw_frames_ctx->data` 前必须判空，否则段错误
+   （调试时表现为「解出第一帧就崩」）。`sw_format` 要从 `frame->hw_frames_ctx` 拿。
+   另外 `surfaces` 选项已废弃，用 `AVCodecContext::extra_hw_frames` 加余量：
+   解码帧要一直扣到拼接读完才能 free，给不够会在 `avcodec_receive_frame` 处卡死。
+10. **奇数画布让 libx264 直接开不了** —— 拼接的 logical 画布是 5001×2101，`--out` 会在
+    第 3 帧短写、`moov atom not found`。所以烘表时就把画布补到偶数 5002×2102，
+    多出的一列一行没有 lane 覆盖、自然写黑，与上游 `encoded_width/height` 的约定一致。
 
 ## 4. Python 环境（参考实现用，Windows 实测顺序）
 
@@ -105,8 +122,14 @@ mmpose 1.3.1 / mmdet 3.2.0。自检 `bash scripts/test.sh`。
   `PYTHONUTF8=1`（`scripts/` 下的三个 `.sh` 都已导出）。
 - **显存量**：用运行前后 `nvidia-smi --query-gpu=memory.used` 的差值。
   `--query-compute-apps=used_memory` 在 Windows WDDM 下返回 `[N/A]`，别用它。
+  六路现拼还要看 `--query-gpu=utilization.decoder`：它是 NVDEC 的独立利用率，
+  跑满 100% 就说明瓶颈在解码器而不是 SM（`utilization.gpu` 那时只有 23%）。
 - **渲染产物校验**：`ffprobe` 看帧数/分辨率，再 `ffmpeg -i out.mp4 -f null -` 全量解码
   确认无坏帧（走 ffmpeg 管道时若中途断流，这里会暴露）。
 - **路径**：`.bat` 用 `\`；bash 脚本用 Git Bash 跑。注意 Git Bash 的 `/tmp` 对
-  Windows 版 Python 的 `open`/`subprocess` 不可见。
+  Windows 版 Python 的 `open`/`subprocess` 不可见。往 `PATH` 里加目录也要注意：
+  Git Bash 的 `PATH` 以 `:` 分隔，`"D:/x"` 会被拆成 `D` 和 `/x` 两项而**静默失效**
+  （症状是 exe 报找不到 DLL）。先 `cygpath -u` 转成 `/d/x` 再加，`scripts/test.sh` 已这么做。
+- **拼接对照**：`--dump-canvas f0.png` 把首帧画布原样落盘（未画标注），与离线参考逐像素
+  比。这比比对分析数字灵敏得多 —— 0.34 灰阶的画布差就能让 track 数从 63 变 88。
 - **对照与基线**：见 `CLAUDE.md` 的「怎么验证一处改动」与「数字的口径」。

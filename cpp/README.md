@@ -9,9 +9,12 @@
 
 ## 数据流
 
+输入有两条路，产出同一个 `GpuFrame`（BGR uint8，显存），下游完全不感知差异：
+
 ```
-FrameSource          解码 → GpuFrame（BGR uint8，显存）
-  ↓ 全程显存
+--input   已拼好的画布 mp4/流  ─ffmpeg 管道解码 + H2D─┐
+--cam-dir 六路 4K 原片         ─NVDEC + CUDA 拼接────┤（全程显存，零 H2D）
+                                                     ↓
 preprocess (CUDA)    BGR→RGB + 双线性 + letterbox → detect 输入 fp16
 detect     (TRT)     yolo26 end2end，输出 [1,300,6]，NMS 已内置
 filter+dedup (CUDA)  conf 筛选 + 坐标还原 + 包含率去重
@@ -29,14 +32,58 @@ CPU                  IoU 跟踪 → 划水计数 → 速度 → 回调
 之前 `cudaEventSynchronize`，所以「GPU 算第 n+1 帧」与「CPU 跟踪第 n 帧」并行。
 每帧唯一必须当帧等待的是框数（4 字节，pose 的 batch 取决于它）。
 
+## 上游拼接（`--cam-dir`，六路 4K → 画布，全程显存）
+
+把六路原相机片段直接喂进来，画布在 GPU 上现拼，**没有中间的画布 mp4**：
+
+```
+六路 4K H.264 ──NVDEC(h264_cuvid)──▶ AV_PIX_FMT_CUDA / NV12（显存，每路一线程）
+                                        │  唯一 D2H 是几百字节的 lane 描述
+                     stitch (CUDA) ─────┤  逐画布像素 gather：查表取源坐标 + 权重
+                                        ▼  NV12 双线性 → bt601 → 加权累加 → BGR
+                                     GpuFrame（画布 5002×2102）
+```
+
+省掉了「先拼成 mp4、再解码画布」的一次 H.264 编码与一次 5002 宽画布解码 ——
+后者本身就要 13 ms/帧、占原链路 49% 的耗时。
+
+**NVDEC 在这里可用、解画布时不可用**：CUVID 的 H.264 上限 4096×4096，成品画布宽
+5002 超限，而单路 4K 只有 3840 宽正好装得下（实测六路并发解码 25.8 ms/帧，
+NVDEC 利用率 100%，即已跑满解码器）。
+
+**几何不在 C++ 里算**。`cpp/tools/build_stitch_lut.py` 把 `configs/pool_mesh.json`
+烘成逐像素查找表 `cpp/models/stitch.lut`（每覆盖像素一条：源坐标 f32×2 + 权重 u16，
+109 MB，1.041 条/像素），kernel 只做 gather。理由：「哪个画布像素属于哪个三角形」的
+判定语义来自 OpenCV 的 `fillConvexPoly` + `getAffineTransform`，在 CUDA 里重写是整条
+链路唯一容易**静默**出错的地方（差一个边界像素、仿射差半像素，表现为接缝错位而不
+报错）。烘表脚本直接调那两个函数，于是 C++ 侧零光栅化代码。改了标定就重跑它
+（`scripts\build.bat` 已包含这一步）。
+
+kernel 的三处口径是逐值拟合出来的，改动前先看清代价：
+
+| 口径 | 取值 | 依据 |
+| --- | --- | --- |
+| YUV→BGR 矩阵 | **bt601 limited → full** | `cv2.VideoCapture` 与 `ffmpeg -vf scale=in_color_matrix=bt601:in_range=tv` **逐字节相同**；按文件标签的 bt709 会整体偏 mean 3.6 灰阶 |
+| 定点取整 | `floor(x - 0.5)` | 拟合 swscale 的 16 位定点查表（4K 整帧 mean\|d\| 0.36，floor 0.62，round 1.12） |
+| 插值顺序 | 4 个 tap 各自转 BGR 后再双线性 | 反过来（先插 chroma 再转色）在 chroma 边缘偏差翻倍（独占像素 mean\|d\| 1.69 vs 1.08） |
+
+权重烘表时已全局归一化到和为 1（实测偏差 ±1.5e-5 = u16 的 1 个 LSB），所以 kernel
+不必再除 alpha —— 那次除法只用来兜量化残差与边界像素。累加顺序固定为 lane 顺序、
+无原子操作，因此逐位可复现。
+
+对齐结果：CUDA 画布 vs 离线 CPU 参考（同一份标定，用上游 `compose.py` 的语义独立
+算出）**mean|d| 0.34 灰阶、最大 3、66.8% 逐字节相同、100% 在 2 灰阶内、PSNR 52.7 dB**。
+残差是无偏舍入噪声（bias +0.13），不是几何错位。
+
 ## 依赖
 
 | 组件 | 版本 | 说明 |
 | --- | --- | --- |
 | CUDA | 12.x | Linux 机 12.9，Windows 机 12.8 |
 | **TensorRT** | **10.11.0.33** | cuda-12.0~12.9 变体。TRT 11 移除了 `BuilderFlag::kFP16`（强类型恒开），本代码只针对 10.x。Windows 导入库名带后缀：`nvinfer_10.lib` |
-| OpenCV | 4.x | 解码、渲染与 `--preview` 窗口（需 `highgui`）。apt / vcpkg 版都未编 `cudacodec`；不过本画布（5002 宽）超出 CUVID H.264 的 4096 上限，硬解本就不可用，见「输入源」 |
-| ffmpeg CLI | 任意近期版本 | **默认解码路径就要它**（`ffmpeg` + `ffprobe`），`--out` 的编码也要（Windows 必然走这条，见「渲染写出」）。找不到则回退 OpenCV |
+| OpenCV | 4.x | 解码、渲染与 `--preview` 窗口（需 `highgui`）。apt / vcpkg 版都未编 `cudacodec` |
+| ffmpeg CLI | 任意近期版本 | `--input` 的默认解码路径要它（`ffmpeg` + `ffprobe`），`--out` 的编码也要（Windows 必然走这条，见「渲染写出」）。找不到则回退 OpenCV |
+| FFmpeg libav*（可选） | 含 `h264_cuvid` | 只有 `--cam-dir` 需要：`avcodec`/`avformat`/`avutil`。vcpkg 装 `ffmpeg[core,avcodec,avformat,nvcodec]:x64-windows`（实测 7.1.2）。找不到就跳过这一路，其余功能不变 |
 | cmake | ≥3.18 | |
 
 ## 构建
@@ -64,16 +111,18 @@ OpenCV 由 vcpkg 提供（`vcpkg install opencv4:x64-windows`）时传它的 too
 `find_package(OpenCV)` 会自动解析；用官方预编译包则改传 `-DOpenCV_DIR=C:/opencv/build`。
 多配置生成器（VS）**必须加 `--config Release`**，否则拿到的是慢一个量级的 Debug 二进制。
 
-## 准备模型
+## 准备模型与拼接表
 
 ```bash
 # 从 .pt/.pth 导出 fp16 ONNX（detect 必须用训练时的 imgsz=640）
 python cpp/tools/export_onnx.py --out cpp/models
+# 烘拼接查找表（只有 --cam-dir 需要；改了 configs/pool_mesh.json 要重跑）
+python cpp/tools/build_stitch_lut.py
 ```
 
-Windows 上 `scripts\build.bat` 已包含这一步（用 `.venv\Scripts\python.exe`，
+Windows 上 `scripts\build.bat` 已包含这两步（用 `.venv\Scripts\python.exe`，
 需先跑 `scripts/install.sh`）。
-`.onnx` 与 `.engine` 都不入库；权重来源见 [`../docs/权重来源与复现.md`](../docs/权重来源与复现.md)。
+`.onnx` / `.engine` / `.lut` 都不入库；权重来源见 [`../docs/权重来源与复现.md`](../docs/权重来源与复现.md)。
 
 engine 由程序首次运行时自动构建并缓存。文件名带**身份戳**：
 `pose.engine` → `pose.sm89-trt101100-b40-fp16-<onnx mtime>-<size>.engine`。
@@ -90,16 +139,20 @@ kernel 按该参数写、engine 按 ONNX 分配，不校验就是越界写。det
 
 ## 运行
 
-Windows 双击即可，不必记命令：**`scripts\preview.bat`**（实时窗口，可拖视频进去或传
-rtsp URL）、**`scripts\analyse.bat`**（批处理出 json，加 `--out o.mp4` 出标注视频）。
-两者共用 `scripts\env.bat` 做前置检查（TensorRT / exe / onnx / ffmpeg）。
-Linux 或要自定义参数时直接调二进制：
+Windows 双击即可，不必记命令：**`scripts\preview.bat`**（实时窗口）、
+**`scripts\analyse.bat`**（批处理出 json，加 `--out o.mp4` 出标注视频）。
+两者都能**拖文件也能拖目录**进去 —— 拖视频 = 分析已拼画布，拖六路片段目录 =
+GPU 上现拼；也接 rtsp URL。共用 `scripts\env.bat` 做前置检查（TensorRT / exe /
+onnx / ffmpeg）。Linux 或要自定义参数时直接调二进制：
 
 ```bash
 export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目录加进 PATH
 
 # 离线视频，纯分析（最快，只回读关键点）
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models --json out.json
+
+# 六路 4K 原片，GPU 上现拼再分析（没有中间画布 mp4）
+./build/swim_analyse --cam-dir /path/to/20260730-4k-raw --models cpp/models --json out.json
 
 # 实时预览窗口（不落盘，按 q/ESC 提前结束）
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models --preview --show-fps
@@ -113,7 +166,16 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目
 
 # 与 Python 逐帧对照：导出每个框与 17 个关键点
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models --max-frames 200 --dump d.csv
+
+# 拼接对照：把首帧画布原样落 PNG（未画标注），与离线拼接逐像素比
+./build/swim_analyse --cam-dir /path/to/clips --models cpp/models \
+    --max-frames 1 --dump-canvas f0.png
 ```
+
+`--input` 与 `--cam-dir` **必须且只能给一个**（前者是已拼画布，后者是六路原片）。
+`--cam-dir` 按 `stitch.lut` 里的相机 id 在目录下找 `*_<相机>.mp4`，一个相机匹配到
+0 个或 2 个以上都直接报错 —— 静默挑一个等于把错误的相机贴到网格上，症状是接缝
+错位而不是报错。`--stitch-lut` 可换表（默认 `<models>/stitch.lut`）。
 
 `--help` 看全部参数（帮助里的默认值直接取自 `PipelineOptions{}`，不会与代码走偏）。
 算法阈值与 Python CLI 同名同义：`--conf` / `--kpt-thr` / `--containment` /
@@ -153,16 +215,17 @@ pump，跨线程创建会不刷新甚至卡死。按 q/ESC 触发 `Pipeline::req
 
 ## 输入源
 
-`FrameSource` 的两种实现共用 `next() -> GpuFrame` 接口，下游不感知差异：
+`FrameSource` 的三种实现共用 `next() -> GpuFrame` 接口，下游不感知差异：
 
 | 实现 | `backend()` | 用途 |
 | --- | --- | --- |
-| ffmpeg 管道 | `ffmpeg-pipe(prefetch)` | 默认。`ffprobe` 取元信息 + `ffmpeg … -f rawvideo -pix_fmt bgr24 -` 直读进锁页内存，实测 13.0 ms/帧 |
+| ffmpeg 管道 | `ffmpeg-pipe(prefetch)` | `--input` 默认。`ffprobe` 取元信息 + `ffmpeg … -f rawvideo -pix_fmt bgr24 -` 直读进锁页内存，实测 13.0 ms/帧 |
 | OpenCV | `opencv(prefetch)` | 回退与 `--decoder cpu`。文件与 rtsp/rtmp 共用（`VideoCapture`），16.9 ms/帧 |
+| 六路 NVDEC + 拼接 | `nvdec-stitch` | `--cam-dir`。六路 4K 硬解进显存 + CUDA 拼接，实测 20.3 ms/帧（NVDEC 已跑满），见「上游拼接」 |
 
-两者都带解码线程预取，解码与推理重叠。
-**外部直供显存帧**（拼接程序把已在显存的画布直接喂进来、零解码）不在这里实现 ——
-接口本身已足够，新增一个 `FrameSource` 子类实现 `next()` 即可，不必给基类开旁路入口。
+前两者带解码线程预取；第三种是每路一个解码线程 + 画布环。
+**外部直供显存帧**（拼接程序把已在显存的画布喂进来、零解码）照第三种的样子再加一个
+子类即可 —— 接 zcam 流走的就是这条路，把 `NvdecLane` 换成流接收即可，拼接与下游不动。
 
 ffmpeg 管道的 13.0 ms/帧已经贴住 ffmpeg CLI 自身的地板：同一条解码命令落 `NUL`
 实测 10.0–13.5 ms/帧（纯解码不出像素 7.0–10.6 ms/帧），管道搬运几乎没有余量。
@@ -176,10 +239,11 @@ ffmpeg 特性，videoio 只剩 MSMF，它的 YUV→BGR 换算与 swscale 不一�
 ffmpeg 管道与 Python 的 `cv2.VideoCapture`（自带 ffmpeg）逐字节相同，
 所以**要与 Python 逐值比对必须走默认路径**，`--decoder cpu` 只作兜底与排障。
 
-**NVDEC 用不上，不是"待补"**：CUVID 的 H.264 8bit 规格上限 4096×4096，画布宽 5002
-硬解开不了（HEVC 上限 8192，但源是 H.264）。所以 `DecoderPref` 只有 `Auto`/`Cpu`
-两个取值；`--decoder nvdec` 仅为兼容旧命令行而接受，会打印被忽略的原因并降级为 `auto`，
-其它非法取值直接报错退出。live 场景要彻底绕开解码，走上面说的自定义 `FrameSource` 子类。
+**解画布时 NVDEC 用不上，不是"待补"**：CUVID 的 H.264 8bit 规格上限 4096×4096，
+画布宽 5002 硬解开不了（HEVC 上限 8192，但源是 H.264）。所以 `DecoderPref` 只有
+`Auto`/`Cpu` 两个取值；`--decoder nvdec` 仅为兼容旧命令行而接受，会打印被忽略的原因
+并降级为 `auto`，其它非法取值直接报错退出。
+`--cam-dir` 那条路能用 NVDEC，正是因为它解的是单路 3840 宽而不是成品画布。
 
 ## 渲染写出（`--out`）
 
@@ -214,6 +278,19 @@ host 侧另有锁页缓冲：解码环 4×31.5 MB、关键点回读环 5×9 KB�
 
 超过 40 人的框会被丢弃以保持显存恒定（实测该数据每帧最多 13 人）。
 
+`--cam-dir` 那条路多占约 1.8 GB（整进程 2.8 GB，对比画布路的 1.0 GB）：
+
+| 项 | 大小 |
+| --- | --- |
+| 拼接查找表（一次 `cudaMalloc`，只读） | 109 MB |
+| 六路 NVDEC surface 池（4K NV12 ×12 MB × 每路约 14 张） | 约 1.0 GB |
+| 画布环 4×31.5 MB（拼接输出，替代解码环） | 126 MB |
+| 六路解出但尚未消费的帧（预取 3 + 环里扣 4） | 计入上面的 surface 池 |
+
+surface 数由 `kExtraHwFrames`（`stitch_source.cpp`）控制。它必须 ≥「预取深度 + 画布
+环深」：解码帧要一直扣到拼接 kernel 读完才能 `av_frame_free`（free 就把 surface 还给
+解码器，提前还等于边解码边覆写正在被读的显存），给不够会在 `receive_frame` 处卡死。
+
 ## 性能
 
 3000 帧 5002×2102 画布，约 8 人/帧，`--max-persons 40`。
@@ -240,26 +317,52 @@ host 侧另有锁页缓冲：解码环 4×31.5 MB、关键点回读环 5×9 KB�
 | `8_frame_d2h` | — | 0.02 ms |
 | **端到端** | **12.8–15.5 ms（65–78 fps）** | **29.0–37.6 ms（27–35 fps）** |
 
+### 六路 4K 现拼（`--cam-dir`，RTX 4080 Laptop，3000 帧）
+
+| 阶段 | 每帧 |
+| --- | --- |
+| `0_src_wait`（六路 NVDEC + CUDA 拼接） | 20.3 ms（77.6%） |
+| `1_pre+detect` | 4.54 ms |
+| `2_crop+pose+decode` | 1.34 ms |
+| `7_track_metrics` | 0.53 ms |
+| **端到端** | **26.2 ms（38.2 fps）** |
+
+比读已拼画布慢一倍（13.3 vs 26.2 ms/帧），瓶颈仍在解码侧但性质不同：
+**NVDEC 利用率已经 100%**，六路 4K 并发的裸解码就要 25.8 ms/帧（单独测 ffmpeg
+h264_cuvid 六路并发 900 帧 23.2 s），拼接 kernel 只占其中约 1 ms。所以这条路的上限
+就是本卡的 NVDEC 吞吐，比它更快只能减路数、降分辨率、或换多解码器的卡。
+GPU 段（`1_`+`2_`）反而比画布路更快（5.9 vs 7.5 ms），因为不再和 CPU 解码抢内存带宽。
+
+接实际 zcam 流时这一项会消失：那时帧本来就在显存里，不必解码。
+
 给区间而非单值：这是笔记本，同一条命令连跑三次差 10% 属常态（散热与后台进程），
 渲染模式波动更大因为它多起一个 libx264 进程抢 CPU。GPU 段（`1_`+`2_`）稳定在 6.8–8 ms。
 
-一致性：24107 人次、63 track、376 次划水；**纯分析与渲染两种模式的 JSON 与 `--dump` CSV
-逐字节相同**，同一路径重复跑也逐字节可复现。
+一致性（`--input` 画布路）：24107 人次、63 track、376 次划水；**纯分析与渲染两种模式的
+JSON 与 `--dump` CSV 逐字节相同**，同一路径重复跑也逐字节可复现。
 `--decoder cpu` 是另一组数（24245 人次、63 track），差异来自 MSMF 的
 像素换算，不是随机性，见「输入源」。
 显存（Windows 实测）：整进程约 1.0 GB，含 CUDA context；engine 工作区 detect 56.2 MB /
 pose 153.4 MB（比 H800 的 56/94 MB 大，TRT 按 GPU 选 kernel，属正常差异）。
 
+`--cam-dir` 是**另一组合法数字**（3000 帧 25141 人次、88 track、387 次划水），不是回归：
+它的画布与 `merged_3000f.mp4` 差 0.34 灰阶（见「上游拼接」），而 track 数对亚灰阶差异
+敏感 —— 88 vs 63 主要是短 track 变多（划水为 0 的 track 60 vs 34），有划水的 track
+28 vs 29、划水合计 387 vs 376（+2.9%）。逐帧比对 600 帧：框数相同的帧 62.3%，
+配对框中心距离中位 1.57 px、91% 在 5 px 内。**两条路的数字不可直接 diff**，
+各自对自己的基线。
+
 与 Python 版 Plan C 的 55 ms（detect+pose）相比，GPU 段快 **8.8×**（H800）；pose 部分从
 34 ms 降到 1.7 ms，因为裁切的仿射采样与 SimCC 解码都进了 kernel。
 
-**瓶颈已经从 GPU 转到 CPU 解码**：纯分析模式下 `0_src_wait` 占 49%，而它的下限就是
-ffmpeg 自身的 10.0–13.5 ms/帧（见「输入源」），预取只能把它与 GPU 段重叠、消不掉。
-NVDEC 在这里帮不上：CUVID 的 H.264 8bit 上限 4096×4096，画布宽 5002 硬解开不了
-（HEVC 上限 8192，但源是 H.264）。要进一步提速只有两条路：live 场景自定义一个
-`FrameSource` 子类让拼接程序直接给显存帧（零解码），或让 ffmpeg 输出 yuv420p 把搬运字节数减半
-（31.5 → 15.8 MB/帧）并在 kernel 里转 BGR —— 后者会丢掉与 Python 的逐字节一致性
-（swscale 用 BT.601 limited range，自行重建后平均差约 0.6/255），故未采用。
+**`--input` 那条路的瓶颈在 CPU 解码**：纯分析模式下 `0_src_wait` 占 49%，而它的下限
+就是 ffmpeg 自身的 10.0–13.5 ms/帧（见「输入源」），预取只能把它与 GPU 段重叠、消不掉。
+NVDEC 对成品画布帮不上（4096 上限），但**上游那条 `--cam-dir` 就是这个问题的正解**：
+它绕开画布编解码，直接从六路原片拼，代价是受本卡 NVDEC 吞吐限制（38 fps）。
+接 zcam 流后两处解码都没有了。
+另一个曾考虑的选项 —— 让 ffmpeg 输出 yuv420p 把搬运字节数减半（31.5 → 15.8 MB/帧）
+并在 kernel 里转 BGR —— 会丢掉与 Python 的逐字节一致性（swscale 用 BT.601 limited
+range，自行重建后平均差约 0.6/255），故未采用。
 
 渲染模式下 `0_src_wait` 涨到 18.6–25.2 ms 不是解码变慢，而是 libx264 编码进程与解码
 进程抢 CPU；`8_frame_d2h` 只有 0.02 ms，说明整帧回读已被 `cudaEvent` 完全重叠掉。

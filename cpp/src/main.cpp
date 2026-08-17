@@ -30,6 +30,9 @@
 #include "swim/metrics.h"
 #include "swim/pipeline.h"
 #include "swim/proc.h"
+#ifdef SWIM_HAS_STITCH
+#include "swim/stitch.h"
+#endif
 
 using namespace swim;
 
@@ -49,6 +52,8 @@ struct Args {
   PipelineOptions opt;                  // 参数默认值只在 pipeline.h 定义一份
                                         // （--help 也从这里现取，见 help_rows）
   std::string input, out, json, dump;
+  std::string cam_dir, lut;             // 六路拼接输入：片段目录 + 查找表
+  std::string dump_canvas;              // 首帧画布原样落 PNG（拼接对照用）
   bool        draw_kpts = true, show_fps = false, preview = false;
   float       preview_scale = 0.f;      // 0 = 自适应到 1600x900 以内
   DecoderPref decoder   = DecoderPref::Auto;
@@ -107,13 +112,19 @@ std::vector<HelpRow> help_rows() {
   const PipelineOptions d{};        // 流水线参数默认值的唯一来源
   const Args a{};                   // 非流水线参数（预览、绘制开关）的默认值
   return {
-    {"--input", "FILE|URL", "输入视频文件或流地址（rtsp:// / rtmp:// 等），必填"},
+    {"--input", "FILE|URL", "已拼好的画布视频或流地址（rtsp:// 等）"},
+    {"--cam-dir", "DIR", "六路原相机片段目录，GPU 上实时拼接后直接分析\n"
+                         "（与 --input 二选一；片段名须以 _<相机>.mp4 结尾）"},
+    {"--stitch-lut", "FILE", sfmt("拼接查找表 (默认 <models>/stitch.lut，\n"
+                                  "由 cpp/tools/build_stitch_lut.py 生成)")},
     {"--models", "DIR", sfmt("detect.onnx/pose.onnx 所在目录 (默认 %s)",
                              d.models_dir.c_str())},
     {"--out", "FILE", "写出标注视频 (H.264)"},
     {"--json", "FILE", "写出每个 track 的划水次数与速度"},
     {"--dump", "FILE", "逐帧写出每个框(帧号,id,xyxy,conf)+17 个关键点\n"
                        "(kx,ky,ks)，用于与 Python 对照"},
+    {"--dump-canvas", "FILE", "把首帧画布原样存成 PNG（未画标注），\n"
+                              "用于与离线拼接逐像素对照"},
     {"--max-frames", "N", sfmt("只处理前 N 帧 (默认 %lld = 不限)",
                                static_cast<long long>(d.max_frames))},
     {"--detect-size", "N", sfmt("detect 输入方形边长, 须与 onnx 一致 (默认 %d)",
@@ -157,7 +168,7 @@ void print_help() {
   for (const auto& r : rows)
     w = std::max(w, strlen(r.opt) + (*r.arg ? strlen(r.arg) + 1 : 0));
 
-  printf("用法: swim_analyse --input <视频|流> [选项]\n");
+  printf("用法: swim_analyse (--input <画布视频|流> | --cam-dir <六路片段目录>) [选项]\n");
   for (const auto& r : rows) {
     std::string head = r.opt;
     if (*r.arg) head += " " + std::string(r.arg);
@@ -194,10 +205,13 @@ bool parse(int argc, char** argv, Args& a) {
   for (int i = 1; i < argc; ++i) {
     const std::string k = argv[i];
     if      (k == "--input")       a.input = need(i);
+    else if (k == "--cam-dir")     a.cam_dir = need(i);
+    else if (k == "--stitch-lut")  a.lut = need(i);
     else if (k == "--models")      o.models_dir = o.engine_dir = need(i);
     else if (k == "--out")         a.out = need(i);
     else if (k == "--json")        a.json = need(i);
     else if (k == "--dump")        a.dump = need(i);
+    else if (k == "--dump-canvas") a.dump_canvas = need(i);
     else if (k == "--max-frames")  o.max_frames  = integer(i, k, 0, 1 << 30);
     else if (k == "--detect-size") o.detect_size = int(integer(i, k, 64, 4096));
     else if (k == "--max-persons") o.max_persons = int(integer(i, k, 1, kMaxPersons));
@@ -247,11 +261,26 @@ bool parse(int argc, char** argv, Args& a) {
       throw std::runtime_error("未知参数 " + k);
     }
   }
-  SWIM_CHECK(!a.input.empty(), "必须指定 --input");
-  // 只有要图像（落盘或预览）才付整帧 D2H；纯分析模式保持只回读关键点
-  o.need_image = !a.out.empty() || a.preview;
+  SWIM_CHECK(a.input.empty() != a.cam_dir.empty(),
+             "--input（已拼画布）与 --cam-dir（六路实时拼接）必须且只能给一个");
+  if (a.lut.empty()) a.lut = o.models_dir + "/stitch.lut";
+  // 只有要图像（落盘、预览或导出画布）才付整帧 D2H；纯分析模式只回读关键点
+  o.need_image = !a.out.empty() || a.preview || !a.dump_canvas.empty();
   o.validate();
   return true;
+}
+
+/// 按参数选帧源：给了 --cam-dir 走六路 NVDEC 拼接，否则读已拼好的画布。
+/// 两条路都产出同一个 GpuFrame（BGR uint8 显存），下游完全不感知差异。
+std::unique_ptr<FrameSource> make_source(const Args& a) {
+  if (a.cam_dir.empty()) return FrameSource::open(a.input, a.decoder);
+#ifdef SWIM_HAS_STITCH
+  return StitchSource::open(a.cam_dir, a.lut);
+#else
+  throw std::runtime_error(
+      "本二进制未编入拼接源（configure 时没找到 FFmpeg libav*），"
+      "--cam-dir 不可用；请装 ffmpeg 开发包后重新构建，或改用 --input");
+#endif
 }
 
 /// H.264 写出器：先试 OpenCV(avc1→mp4v)，都开不了则退到外部 ffmpeg 管道。
@@ -405,7 +434,7 @@ int main(int argc, char** argv) try {
   Args a;
   if (!parse(argc, argv, a)) return 0;
 
-  auto src = FrameSource::open(a.input, a.decoder);
+  auto src = make_source(a);
   printf("[Input] %dx%d %.2f fps 总帧 %lld 后端 %s\n", src->width(), src->height(),
          src->fps(), static_cast<long long>(src->total()), src->backend());
 
@@ -452,7 +481,12 @@ int main(int argc, char** argv) try {
 
     if (fr.bgr) {
       cv::Mat img(fr.h, fr.w, CV_8UC3, const_cast<uint8_t*>(fr.bgr));
-      // 预览必须先做：它要的是未画过的原图（缩小后再画，字才不糊），
+      // 首帧原样落盘必须最先做：下面的 draw 是在整帧上原地画的
+      if (!a.dump_canvas.empty() && fr.index == 0) {
+        SWIM_CHECK(cv::imwrite(a.dump_canvas, img), "无法写入 " + a.dump_canvas);
+        printf("[Output] 首帧画布 %s (%dx%d)\n", a.dump_canvas.c_str(), fr.w, fr.h);
+      }
+      // 预览次之：它要的是未画过的原图（缩小后再画，字才不糊），
       // 而 writer 的 draw 是在整帧上原地画的。
       if (a.preview && !quit) {
         if (!preview) preview = std::make_unique<Preview>(fr.w, fr.h, a.preview_scale);

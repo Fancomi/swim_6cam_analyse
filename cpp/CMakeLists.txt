@@ -78,6 +78,26 @@ target_include_directories(swim_analyse PRIVATE include ${TRT_INCLUDE})
 target_link_libraries(swim_analyse PRIVATE
   ${TRT_LIBS} CUDA::cudart ${OpenCV_LIBS})
 
+# ── 上游拼接源（可选）：六路 4K NVDEC + CUDA 拼接 ─────────────────────────
+# 需要 FFmpeg 的 libav*（含 h264_cuvid）。找不到就不编这一路，其余功能不受影响
+# —— 分析画布 mp4 的主链路只用 ffmpeg CLI，不链接 libav*。
+# vcpkg 的 opencv4 不带 ffmpeg 特性，所以这里必须单独找 ffmpeg 包
+# （`vcpkg install ffmpeg[core,avcodec,avformat,nvcodec]:x64-windows`）。
+option(SWIM_ENABLE_STITCH "编入六路 NVDEC 拼接源（需要 FFmpeg libav*）" ON)
+if(SWIM_ENABLE_STITCH)
+  find_package(FFMPEG QUIET)
+  if(FFMPEG_FOUND OR FFMPEG_LIBRARIES)
+    target_sources(swim_analyse PRIVATE src/stitch.cu src/stitch_source.cpp)
+    target_include_directories(swim_analyse PRIVATE ${FFMPEG_INCLUDE_DIRS})
+    target_link_directories(swim_analyse PRIVATE ${FFMPEG_LIBRARY_DIRS})
+    target_link_libraries(swim_analyse PRIVATE ${FFMPEG_LIBRARIES})
+    target_compile_definitions(swim_analyse PRIVATE SWIM_HAS_STITCH=1)
+    message(STATUS "拼接源: 启用（FFmpeg libav* 已找到）")
+  else()
+    message(STATUS "拼接源: 跳过（未找到 FFmpeg libav*，--input-6cam 不可用）")
+  endif()
+endif()
+
 if(UNIX)
   target_link_libraries(swim_analyse PRIVATE dl pthread)
 endif()

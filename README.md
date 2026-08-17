@@ -2,17 +2,19 @@
 
 六路相机拼接全景视频的游泳动作分析：**逐人划水次数 + 瞬时速度 + 标注视频**。
 
-输入一段六机位拼接的泳池俯视全景视频（5002×2102），输出每个泳者的划水次数、
-逐帧速度曲线，以及叠加了检测框 / ID / 划水数 / 速度 / 关键点骨架的视频。
+输入六机位的泳池俯视画面，输出每个泳者的划水次数、逐帧速度曲线，以及叠加了检测框 /
+ID / 划水数 / 速度 / 关键点骨架的视频。输入可以是**已拼好的全景视频**（5002×2102），
+也可以是**六路 4K 原片** —— 后者的画布在 GPU 上现拼，不落中间文件。
 
 仓库里有**两条独立实现**同一套算法：
 
 | | 用途 | 入口 | 速度 |
 | --- | --- | --- | --- |
-| **C++/CUDA** | 实时、上线、看效果 | 双击 `scripts/preview.bat` | 65–78 fps |
+| **C++/CUDA** | 实时、上线、看效果 | 双击 `scripts/preview.bat` | 画布 65–78 fps / 六路现拼 38 fps |
 | **Python** | 换模型、Plan A/B/C 对比、评测 | `bash scripts/run.sh C` | 约 13 倍实时 |
 
-C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边靠数值对照保持一致。
+C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边靠数值对照保持一致；
+上游的六路拼接只有 C++ 有。
 **Agent / 新人先读 [`CLAUDE.md`](CLAUDE.md)** —— 它说明该走哪条线、只读哪些文件、
 以及改动时必须同步的几处契约。
 
@@ -21,8 +23,8 @@ C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边
 **Windows（推荐，C++ 实时链路）** —— 双击 `scripts\` 里的三个 `.bat` 即可，无需命令行：
 
 ```
-scripts\build.bat      构建 + 从 weights/ 导出 ONNX（首次一次）
-scripts\preview.bat    实时预览窗口（也可把视频拖到它上面，或传 rtsp:// 流）
+scripts\build.bat      构建 + 导出 ONNX + 烘拼接查找表（首次一次）
+scripts\preview.bat    实时预览窗口（拖视频进去 = 分析画布，拖六路片段目录 = GPU 现拼）
 scripts\analyse.bat    批处理出 json，加 --out o.mp4 出标注视频
 ```
 
@@ -137,9 +139,10 @@ src/swim_analyse/                Python 参考实现
   draw.py        骨架 / 标签绘制
   video.py       多路视频的帧级随机读取（带帧缓存），Plan A 用
 cpp/                             C++/CUDA 实时实现（Plan C），见 cpp/README.md
-  src/ include/swim/             实现与头文件
+  src/ include/swim/             实现与头文件（含六路 NVDEC 拼接 stitch.cu）
   tools/export_onnx.py           weights/ -> ONNX（scripts/build.bat 会调）
-  models/                        ONNX 与 TRT engine（除 pose_meta.json 外不入库）
+  tools/build_stitch_lut.py      pool_mesh.json -> 逐像素拼接查找表（同上）
+  models/                        ONNX / TRT engine / stitch.lut（除 pose_meta.json 外不入库）
 tests/test_core.py               纯逻辑单元测试（无需 GPU 和数据）
 docs/
   windows.md                     Windows 环境要求、脚本编码规则、踩过的坑
@@ -165,6 +168,14 @@ raw_seq    {track_id: [(frame_idx, kpts(17,2), scores(17,), cam_idx)]}
 merged_3000f.mp4      六路拼接后的全景视频（5002x2102，3000 帧）
 ```
 
+**六路原片（仅 C++ `--cam-dir`）**：一个目录，每台相机一个 `*_<相机>.mp4`（3840×2160
+H.264），相机名取自 `cpp/models/stitch.lut`。实测目录
+`D:\WindowsProject\workspace\SWIM\20260730-4k-raw`，与上面的画布是同一场录制：
+
+```
+20260730_170731_cam1.mp4 ... _cam6.mp4    六路 4K 原片（各约 2.4 GB）
+```
+
 Plan A 额外需要六路原始相机视频，只有旧数据集 `data/20260629/` 有：
 
 ```
@@ -182,6 +193,8 @@ DATA_DIR=/path/to/20260629 bash scripts/run.sh A   # Plan A 还要同目录下�
 > **相机顺序（仅 Plan A）**：`--camera-videos` 必须按 `pool_mesh.json` 里 `meshes` 数组的
 > 顺序传入，即 `cam4 cam3 cam2 cam5 cam6 cam1`。mesh 的 `texture_basename` 依次是
 > `camera_3/2/1/4/5/6`，与文件名并非同序 —— 这个对应关系在标定时确定，不要改动。
+> **`20260730-4k-raw` 那批文件的对应是另一组** `cam3 cam2 cam1 cam4 cam5 cam6`
+> （实测认出来的，写在 `cpp/tools/build_stitch_lut.py` 的 `POOL_CAMERA_IDS`）。
 
 ## 常用参数
 
@@ -216,7 +229,9 @@ bash scripts/install.sh
 ```
 
 C++ 侧只需 CUDA 12.x + TensorRT 10.11 + OpenCV 4.x + ffmpeg CLI，不依赖上面这套 Python
-（只有导出 ONNX 用到）。Windows 细节见 [`docs/windows.md`](docs/windows.md)。
+（只有导出 ONNX 与烘拼接表用到）。六路现拼（`--cam-dir`）还要 FFmpeg 的 libav* 开发库
+（含 `h264_cuvid`），缺了只是这一路不编，其余功能不变。Windows 细节见
+[`docs/windows.md`](docs/windows.md)。
 
 ## 性能参考
 
@@ -246,4 +261,12 @@ C++ 侧只需 CUDA 12.x + TensorRT 10.11 + OpenCV 4.x + ffmpeg CLI，不依赖�
 
 全程 GPU 驻留，只回读关键点（约 9 KB/帧）。瓶颈已从 GPU 推理转到 CPU 解码与编码 ——
 GPU 段稳定在 6.2 ms（H800）/ 6.8–8 ms（4080 Laptop）。
-构建、参数、显存与逐段耗时见 [`cpp/README.md`](cpp/README.md)。
+
+### C++ 六路现拼：`20260730-4k-raw` 六路 4K，3000 帧，RTX 4080 Laptop
+
+26.2 ms/帧（**38.2 fps**），88 个 track、划水合计 387 次。慢一倍是因为
+**NVDEC 已跑满 100%**：六路 4K 并发的裸解码就要 25.8 ms/帧，拼接 kernel 只占约 1 ms。
+画布与离线 CPU 参考差 mean|d| 0.34 灰阶（最大 3，100% 在 2 灰阶内）。
+接实际 zcam 流后解码这一项会消失。
+
+拼接的语义与口径、显存拆解、逐段耗时见 [`cpp/README.md`](cpp/README.md)。

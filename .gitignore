@@ -27,3 +27,5 @@ yolo/
 # C++ 构建产物与模型中间物
 cpp/models/*.onnx
 cpp/models/*.engine
+# 拼接查找表：由 configs/pool_mesh.json 现场烘（cpp/tools/build_stitch_lut.py），109 MB
+cpp/models/*.lut

@@ -5,12 +5,14 @@ rem Notes live in cpp/README.md, not here.
 rem
 rem   double-click              -> analyse the default canvas, write json only
 rem   drag a video onto me      -> analyse that file
+rem   drag a FOLDER onto me     -> six raw camera clips, stitched on the GPU
 rem   analyse.bat f --out o.mp4     -> also write an annotated video
 rem   analyse.bat --max-frames 300  -> default input, flags passed through
 rem
 rem Live preview instead of batch: preview.bat
 rem Build / export ONNX first:     build.bat
 rem Override the TensorRT lib dir: set SWIM_TRT_LIB=<dir>
+rem Six-camera mode needs cpp\models\stitch.lut - build.bat bakes it.
 
 setlocal
 rem This script lives in scripts\ but all paths below are repo-root relative,
@@ -43,6 +45,11 @@ goto :collect
 if not defined INPUT set "INPUT=data\20260730\merged_3000f.mp4"
 if not defined NAME  set "NAME=merged_3000f"
 
+rem A directory means "six raw camera clips": stitch them on the GPU instead of
+rem reading an already-stitched canvas. One flag switch, same pipeline downstream.
+set "MODE=--input"
+if exist "%INPUT%\" set "MODE=--cam-dir"
+
 rem Substring test via pure batch expansion: calling find/where here would pick
 rem up the Unix tools when launched from a Git Bash shell.
 if not "%INPUT%"=="%INPUT://=%" (
@@ -54,18 +61,22 @@ if not exist "%INPUT%" (
   echo [error] input not found: %INPUT%
   goto :end
 )
+if "%MODE%"=="--cam-dir" if not exist "cpp\models\stitch.lut" (
+  echo [error] cpp\models\stitch.lut missing - run scripts\build.bat to bake it.
+  goto :end
+)
 
 if not exist output mkdir output
 set "JSON=output\%NAME%_cpp.json"
 
 echo.
-echo   input : %INPUT%
+if "%MODE%"=="--cam-dir" (echo   six-cam : %INPUT%  ^(NVDEC + GPU stitch^)) else (echo   input : %INPUT%)
 echo   json  : %JSON%
 echo   detect + pose + tracking on every frame; no results are cached
 echo   add --out o.mp4 for an annotated video (needs ffmpeg on PATH)
 echo.
 
-"%EXE%" --input "%INPUT%" --models cpp\models --json "%JSON%" --show-fps%ARGS%
+"%EXE%" %MODE% "%INPUT%" --models cpp\models --json "%JSON%" --show-fps%ARGS%
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" (echo [error] swim_analyse exited with code %RC%) else (echo [ok] wrote %JSON%)
