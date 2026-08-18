@@ -113,8 +113,9 @@ std::vector<HelpRow> help_rows() {
   const Args a{};                   // 非流水线参数（预览、绘制开关）的默认值
   return {
     {"--input", "FILE|URL", "已拼好的画布视频或流地址（rtsp:// 等）"},
-    {"--cam-dir", "DIR", "六路原相机片段目录，GPU 上实时拼接后直接分析\n"
-                         "（与 --input 二选一；片段名须以 _<相机>.mp4 结尾）"},
+    {"--cam-dir", "DIR|LIST", "六路输入，GPU 上实时拼接后直接分析（与 --input 二选一）\n"
+                              "目录 = 离线片段（名字以 _<相机>.mp4 结尾）\n"
+                              "文件 = 相机清单，每行 <相机>=<地址>，地址可为 rtsp://"},
     {"--stitch-lut", "FILE", sfmt("拼接查找表 (默认 <models>/stitch.lut，\n"
                                   "由 cpp/tools/build_stitch_lut.py 生成)")},
     {"--models", "DIR", sfmt("detect.onnx/pose.onnx 所在目录 (默认 %s)",
@@ -262,8 +263,7 @@ bool parse(int argc, char** argv, Args& a) {
     }
   }
   SWIM_CHECK(a.input.empty() != a.cam_dir.empty(),
-             "--input（已拼画布）与 --cam-dir（六路实时拼接）必须且只能给一个");
-  if (a.lut.empty()) a.lut = o.models_dir + "/stitch.lut";
+             "--input（已拼画布）与 --cam-dir（六路实时拼接）必须且只能给一个");  if (a.lut.empty()) a.lut = o.models_dir + "/stitch.lut";
   // 只有要图像（落盘、预览或导出画布）才付整帧 D2H；纯分析模式只回读关键点
   o.need_image = !a.out.empty() || a.preview || !a.dump_canvas.empty();
   o.validate();

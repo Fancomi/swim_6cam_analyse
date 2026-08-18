@@ -29,3 +29,5 @@ cpp/models/*.onnx
 cpp/models/*.engine
 # 拼接查找表：由 configs/pool_mesh.json 现场烘（cpp/tools/build_stitch_lut.py），109 MB
 cpp/models/*.lut
+# 现场相机清单：由 scripts/cams.sh 按机器生成，含具体 IP
+configs/cameras.txt

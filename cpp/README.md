@@ -147,7 +147,8 @@ Windows 双击即可，不必记命令。**脚本选「结果去哪」，第一�
 | `6cam` | 实时看六路现拼 | 批处理六路现拼 → json |
 | 视频文件（可拖） | 实时看那段视频 | 批处理那段视频 |
 | 目录（可拖） | 实时看那批六路片段 | 批处理那批六路片段 |
-| `rtsp://…` | 实时看直播流 | 报错（流没有结尾） |
+| 相机清单文件 | 实时看六路 ZCam 现拼 | 批处理（流没有结尾，需配 `--max-frames`） |
+| `rtsp://…` | 实时看单路直播画布 | 报错（流没有结尾） |
 
 两者跑的是同一套算法、同一份 exe，其余参数原样透传
 （`scripts\analyse.bat 6cam --out o.mp4 --max-frames 300`）。命令行解析、源解析与
@@ -164,6 +165,9 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目
 
 # 六路 4K 原片，GPU 上现拼再分析（没有中间画布 mp4）
 ./build/swim_analyse --cam-dir /path/to/20260730-4k-raw --models cpp/models --json out.json
+
+# 六路现场 ZCam：相机清单，每行 <相机>=rtsp://…（bash scripts/cams.sh list 生成）
+./build/swim_analyse --cam-dir configs/cameras.txt --models cpp/models --preview --show-fps
 
 # 实时预览窗口（不落盘，按 q/ESC 提前结束）
 ./build/swim_analyse --input data/xxx.mp4 --models cpp/models --preview --show-fps
@@ -183,10 +187,14 @@ export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目
     --max-frames 1 --dump-canvas f0.png
 ```
 
-`--input` 与 `--cam-dir` **必须且只能给一个**（前者是已拼画布，后者是六路原片）。
-`--cam-dir` 按 `stitch.lut` 里的相机 id 在目录下找 `*_<相机>.mp4`，一个相机匹配到
+`--input` 与 `--cam-dir` **必须且只能给一个**（前者是已拼画布，后者是六路输入）。
+`--cam-dir` 给**目录**时按 `stitch.lut` 里的相机 id 找 `*_<相机>.mp4`，一个相机匹配到
 0 个或 2 个以上都直接报错 —— 静默挑一个等于把错误的相机贴到网格上，症状是接缝
-错位而不是报错。`--stitch-lut` 可换表（默认 `<models>/stitch.lut`）。
+错位而不是报错。给**文件**时按相机清单读（每行 `<相机>=<地址>`，`#` 起注释），
+地址可以是路径也可以是 `rtsp://`，缺哪台相机会明确报出来。
+用 `相机=地址` 而不是按行序对应，是因为现场相机的 IP 尾数与 mesh 顺序不同
+（`20260730` 那批实测是 `cam3 cam2 cam1 cam4 cam5 cam6`），按行序写迟早错位。
+`--stitch-lut` 可换表（默认 `<models>/stitch.lut`）。
 
 `--help` 看全部参数（帮助里的默认值直接取自 `PipelineOptions{}`，不会与代码走偏）。
 算法阈值与 Python CLI 同名同义：`--conf` / `--kpt-thr` / `--containment` /
@@ -232,11 +240,20 @@ pump，跨线程创建会不刷新甚至卡死。按 q/ESC 触发 `Pipeline::req
 | --- | --- | --- |
 | ffmpeg 管道 | `ffmpeg-pipe(prefetch)` | `--input` 默认。`ffprobe` 取元信息 + `ffmpeg … -f rawvideo -pix_fmt bgr24 -` 直读进锁页内存，实测 13.0 ms/帧 |
 | OpenCV | `opencv(prefetch)` | 回退与 `--decoder cpu`。文件与 rtsp/rtmp 共用（`VideoCapture`），16.9 ms/帧 |
-| 六路 NVDEC + 拼接 | `nvdec-stitch` | `--cam-dir`。六路 4K 硬解进显存 + CUDA 拼接，实测 20.3 ms/帧（NVDEC 已跑满），见「上游拼接」 |
+| 六路 NVDEC + 拼接 | `nvdec-stitch` | `--cam-dir`。六路 4K 硬解进显存 + CUDA 拼接。离线片段 20.3 ms/帧（NVDEC 已跑满）；现场 RTSP 实测 30.3 fps，见「上游拼接」 |
 
 前两者带解码线程预取；第三种是每路一个解码线程 + 画布环。
-**外部直供显存帧**（拼接程序把已在显存的画布喂进来、零解码）照第三种的样子再加一个
-子类即可 —— 接 zcam 流走的就是这条路，把 `NvdecLane` 换成流接收即可，拼接与下游不动。
+**接现场 ZCam 相机**就走第三种：`--cam-dir` 接受一个相机清单文件（每行
+`<相机>=rtsp://…`），`libavformat` 对文件与流是同一套 API，`NvdecLane` 内部不区分。
+相机侧的配置口径与实测约束见 [`../docs/cameras.md`](../docs/cameras.md)。
+
+直播流与离线片段的处理有三处**刻意不同**（都由实测逼出来，改动前先读那份文档）：
+
+| | 离线片段 | 直播流 |
+| --- | --- | --- |
+| 队列满时 | 背压等待（丢帧会与基线对不上） | **丢最旧的一帧**（相机不等人，停读 socket 会让它超时） |
+| 读失败 | 即 EOF | 连续 20 次才判定断流（单次通常只是 socket 超时） |
+| 解码速度 | 不限速（批处理越快越好） | 由相机定速；**混合来源时离线路按帧率限速**，否则会饿死直播路 |
 
 ffmpeg 管道的 13.0 ms/帧已经贴住 ffmpeg CLI 自身的地板：同一条解码命令落 `NUL`
 实测 10.0–13.5 ms/帧（纯解码不出像素 7.0–10.6 ms/帧），管道搬运几乎没有余量。

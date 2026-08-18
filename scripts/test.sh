@@ -27,7 +27,7 @@ PYTHON="$ROOT/.venv/bin/python"
 [[ -x "$PYTHON" ]] || PYTHON="$ROOT/.venv/Scripts/python.exe"
 
 # ── 1. 入口脚本语法 ─────────────────────────────────────────────────────────
-for f in scripts/run.sh scripts/install.sh scripts/test.sh; do
+for f in scripts/run.sh scripts/install.sh scripts/test.sh scripts/cams.sh; do
   run "语法 $(basename "$f")" bash -n "$f"
 done
 

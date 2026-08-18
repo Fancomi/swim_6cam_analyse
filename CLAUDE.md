@@ -11,6 +11,7 @@
 | 改划水计数 / 速度算法 | **两条都要改**（见『同步契约』） | `src/swim_analyse/metrics.py` + `cpp/src/metrics.cpp` |
 | 双击运行、装环境、CI | 入口脚本 | 本页『入口脚本』一节 |
 | 权重从哪来、怎么复现训练 | — | `docs/权重来源与复现.md` |
+| 接现场 ZCam 相机（配 4K30、拉流、踩过的坑） | — | `docs/cameras.md` |
 | Windows 环境坑（编码、TRT、ffmpeg） | — | `docs/windows.md` |
 
 两条线的关系：C++ 只实现 **Plan C**（画布 detect + 画布 RTMPose），是 Python Plan C 的
@@ -34,6 +35,7 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `scripts/preview.bat` | **开窗口实时看**（按 q/ESC 停） | Windows |
 | `scripts/analyse.bat` | **写文件**（json，加 `--out` 出标注 mp4），跑完退出 | Windows |
 | `scripts/install.sh` | 建 `.venv` 装 Python 依赖 + 自检 | Linux / Git Bash |
+| `scripts/cams.sh` | 六路 ZCam：探测 / 配 4K30 / 生成清单 / 直接起预览 | Git Bash |
 | `scripts/run.sh` | Python 参考链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
 | `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
 
@@ -45,10 +47,13 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `6cam` | 六路 4K 原片，GPU 上现拼 | `--cam-dir` |
 | 视频文件路径（可拖拽） | 那段全景视频 | `--input` |
 | 目录路径（可拖拽） | 那个目录里的六路片段 | `--cam-dir` |
-| `rtsp://…` | 直播流（只有 preview 能用，流没有结尾） | `--input` |
+| **相机清单文件** | 每行 `<相机>=<地址>`，地址可为 `rtsp://` | `--cam-dir` |
+| `rtsp://…` | 单路直播画布流（只有 preview 能用） | `--input` |
 
 所以「带拼接的实时 pose」= `scripts\preview.bat 6cam`，「带拼接的批处理」=
 `scripts\analyse.bat 6cam`。默认源可用 `SWIM_CANVAS` / `SWIM_CAM_DIR` 覆盖。
+**接现场相机**走 `bash scripts/cams.sh`（它生成 `configs/cameras.txt` 再喂给
+`--cam-dir`），细节见 `docs/cameras.md`。
 
 `scripts/env.bat` 是两个 `.bat` 共用的**命令行解析 + 源解析 + 前置检查**（定位
 TensorRT、检查 exe/onnx/lut/ffmpeg），设好 `MODE`/`INPUT`/`ARGS`/`NAME`/`LABEL`/`EXE`
@@ -185,6 +190,7 @@ cpp/build/Release/swim_analyse.exe --cam-dir <六路片段目录> --models cpp/m
 | `cpp/README.md` | C++ 链路的一切：数据流、依赖、构建、显存、性能、与 Python 的对齐 |
 | `docs/pipeline.html` | Plan A 的公式推导与逐段耗时拆解 |
 | `docs/权重来源与复现.md` | 权重来源、训练复现 |
+| `docs/cameras.md` | ZCam 相机侧的一切：两路流分工、movfmt、拉流约束、现场坑 |
 | `docs/windows.md` | Windows 环境要求与踩过的坑（含脚本编码规则） |
 | 本页 | 导航、同步契约、验证方法、数字口径 |
 

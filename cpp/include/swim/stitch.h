@@ -1,11 +1,14 @@
-// 上游拼接源：六路 4K H.264 -> NVDEC 解到显存 -> CUDA 拼成画布 -> GpuFrame。
+// 上游拼接源：六路 4K H.264/HEVC -> NVDEC 解到显存 -> CUDA 拼成画布 -> GpuFrame。
 //
 // 全程不回 CPU：解码直出 AV_PIX_FMT_CUDA(NV12) 的 CUdeviceptr，拼接 kernel 直接
 // 读它，产物就是推理链路要的画布。相比「离线拼好 mp4 再解码」省掉一次 H.264
 // 编码 + 一次 5002 宽画布解码（后者本身就要 13 ms/帧，是原链路 49% 的耗时）。
 //
+// 输入既可以是六个离线片段，也可以是六路直播流（rtsp:// 等）—— libavformat 对
+// 两者是同一套 API，差别只在打开选项，见 stitch_source.cpp 的 open_options。
+//
 // 为什么 NVDEC 在这里可用、解画布时不可用：CUVID 的 H.264 上限 4096x4096，
-// 成品画布宽 5002 超限，而单路 4K 只有 3840 宽，正好装得下。
+// 成品画布宽 5002 超限，而单路 4K 只有 3840 宽，正好装得下（HEVC 上限 8192）。
 //
 // 几何不在 C++ 里算：cpp/tools/build_stitch_lut.py 把标定烘成逐像素查找表
 // （源坐标 + 权重），kernel 只做 gather。「哪个像素属于哪个三角形」的判定语义
@@ -83,9 +86,11 @@ void launch_stitch(const StitchLane* lanes, int n_lanes, uint8_t* canvas,
 /// 六路视频拼接帧源。uri 语法见 open()。
 class StitchSource {
  public:
-  /// dir 下按 lut 的相机 id 找片段（`*_<camera>.mp4`），lut_path 缺省取
-  /// models_dir/stitch.lut。ring 为画布环深度，须 >= 3。
-  static std::unique_ptr<FrameSource> open(const std::string& dir,
+  /// spec 有两种：
+  ///   目录 —— 在其中按 lut 的相机 id 找离线片段（`*_<相机>.mp4`）
+  ///   文件 —— 相机清单，每行 `<相机>=<地址>`，地址可以是 rtsp:// 等直播流
+  /// lut_path 缺省取 models_dir/stitch.lut。ring 为画布环深度，须 >= 3。
+  static std::unique_ptr<FrameSource> open(const std::string& spec,
                                            const std::string& lut_path,
                                            int ring = 4);
 };
