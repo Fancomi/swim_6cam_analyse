@@ -25,18 +25,36 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 
 ## 入口脚本（全在 `scripts/`；改之前先看 `docs/windows.md` 的编码规则）
 
-| 入口 | 干什么 | 平台 |
+**两个维度，别混**：`.bat` 选的是「结果去哪」，参数选的是「输入从哪来」。
+同一份算法（逐帧 detect + pose + 跟踪 + 划水/速度，无缓存），四种组合都能跑。
+
+| 入口 | 结果去哪 | 平台 |
 | --- | --- | --- |
-| `scripts/build.bat` | 构建 C++ + 导出 ONNX（双击） | Windows |
-| `scripts/preview.bat` | C++ 实时预览窗口（双击 / 拖视频 / 传 rtsp URL） | Windows |
-| `scripts/analyse.bat` | C++ 批处理出 json，加 `--out` 出标注视频（双击） | Windows |
+| `scripts/build.bat` | 构建 C++ + 导出 ONNX + 烘拼接表（首次一次） | Windows |
+| `scripts/preview.bat` | **开窗口实时看**（按 q/ESC 停） | Windows |
+| `scripts/analyse.bat` | **写文件**（json，加 `--out` 出标注 mp4），跑完退出 | Windows |
 | `scripts/install.sh` | 建 `.venv` 装 Python 依赖 + 自检 | Linux / Git Bash |
-| `scripts/run.sh` | Python 链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
+| `scripts/run.sh` | Python 参考链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
 | `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
 
-`scripts/env.bat` 是三个 `.bat` 共用的前置检查（定位 TensorRT、检查 exe/onnx/ffmpeg），
-不单独运行。**所有脚本都自己 `cd` 到仓库根**（`.bat` 用 `%~dp0..`，`.sh` 用
-`BASH_SOURCE/..`），所以从任何目录双击或调用都一样，脚本内部的相对路径一律以根为基准。
+两个 `.bat` 的第一个参数选输入源，语法完全一致（`env.bat` 统一解析）：
+
+| 第一个参数 | 输入 | 传给二进制 |
+| --- | --- | --- |
+| 省略 / `canvas` | 已拼好的全景视频（默认数据集） | `--input` |
+| `6cam` | 六路 4K 原片，GPU 上现拼 | `--cam-dir` |
+| 视频文件路径（可拖拽） | 那段全景视频 | `--input` |
+| 目录路径（可拖拽） | 那个目录里的六路片段 | `--cam-dir` |
+| `rtsp://…` | 直播流（只有 preview 能用，流没有结尾） | `--input` |
+
+所以「带拼接的实时 pose」= `scripts\preview.bat 6cam`，「带拼接的批处理」=
+`scripts\analyse.bat 6cam`。默认源可用 `SWIM_CANVAS` / `SWIM_CAM_DIR` 覆盖。
+
+`scripts/env.bat` 是两个 `.bat` 共用的**命令行解析 + 源解析 + 前置检查**（定位
+TensorRT、检查 exe/onnx/lut/ffmpeg），设好 `MODE`/`INPUT`/`ARGS`/`NAME`/`LABEL`/`EXE`
+回给调用方，不单独运行。两个 launcher 因此各只剩十几行，差异只有「窗口 vs 文件」。
+**所有脚本都自己 `cd` 到仓库根**（`.bat` 用 `%~dp0..`，`.sh` 用 `BASH_SOURCE/..`），
+所以从任何目录双击或调用都一样，脚本内部的相对路径一律以根为基准。
 C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/README.md` 有命令）。
 
 ## 目录职责（放新文件前先对一眼）
@@ -99,8 +117,9 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
    `LutHeader`/`LutLane`。改一侧必须改另一侧 —— C++ 侧有 `static_assert(72/48)`
    会在编译期挡住尺寸不一致，但**字段顺序变了编译器发现不了**，表现为画布错乱。
    改了 `configs/pool_mesh.json` 或 `--ppm` 也要重跑该脚本（`scripts/build.bat` 会调）。
-6. **默认数据集**：`scripts/run.sh` 与三个 `.bat` 默认都指向 `data/20260730/merged_3000f.mp4`，
-   这样两条线的数字可直接比。**Plan A 例外**，它需要六路原相机视频，只有 `data/20260629/` 有
+6. **默认数据集**：`scripts/run.sh` 与两个 `.bat`（省略参数时）默认都指向
+   `data/20260730/merged_3000f.mp4`，这样两条线的数字可直接比。六路现拼的默认目录是
+   `env.bat` 的 `SWIM_CAM_DIR`。**Plan A 例外**，它需要六路原相机视频，只有 `data/20260629/` 有
    （该目录未随包分发，本机没有 → Plan A 本机跑不了）。
 
 ## 怎么验证一处改动

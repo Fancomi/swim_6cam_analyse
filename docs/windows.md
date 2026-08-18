@@ -21,7 +21,7 @@ Windows 特有的环境要求、编码规则与已知坑；每条坑的修复都
 `scripts/build.bat` 里三个可覆盖的环境变量：`SWIM_TRT_ROOT`、`SWIM_VCPKG`、`SWIM_CUDA_ARCH`
 （RTX40=`89`，RTX50=`120`，RTX30=`86`；不要用 CMake 默认的 `86 89 90`，多架构编译慢很多）。
 运行期还要让 TRT 的 DLL 可见 —— `scripts/env.bat` 会把 `SWIM_TRT_LIB`（默认
-`<TRT_ROOT>\lib`）加进 `PATH`，三个 `.bat` 都 `call` 它。
+`<TRT_ROOT>\lib`）加进 `PATH`，`preview.bat` 与 `analyse.bat` 都 `call` 它。
 vcpkg 的 DLL（OpenCV / libav*）由 CMake 自动拷到 exe 旁，不必手动加 `PATH`。
 
 **库名差异**：Windows 的 TRT 导入库带版本后缀（`nvinfer_10.lib` / `nvonnxparser_10.lib`），

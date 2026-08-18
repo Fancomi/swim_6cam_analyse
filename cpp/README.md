@@ -139,11 +139,22 @@ kernel 按该参数写、engine 按 ONNX 分配，不校验就是越界写。det
 
 ## 运行
 
-Windows 双击即可，不必记命令：**`scripts\preview.bat`**（实时窗口）、
-**`scripts\analyse.bat`**（批处理出 json，加 `--out o.mp4` 出标注视频）。
-两者都能**拖文件也能拖目录**进去 —— 拖视频 = 分析已拼画布，拖六路片段目录 =
-GPU 上现拼；也接 rtsp URL。共用 `scripts\env.bat` 做前置检查（TensorRT / exe /
-onnx / ffmpeg）。Linux 或要自定义参数时直接调二进制：
+Windows 双击即可，不必记命令。**脚本选「结果去哪」，第一个参数选「输入从哪来」**：
+
+| | `scripts\preview.bat`（开窗口） | `scripts\analyse.bat`（写文件） |
+| --- | --- | --- |
+| 省略 / `canvas` | 实时看已拼画布 | 批处理已拼画布 → json |
+| `6cam` | 实时看六路现拼 | 批处理六路现拼 → json |
+| 视频文件（可拖） | 实时看那段视频 | 批处理那段视频 |
+| 目录（可拖） | 实时看那批六路片段 | 批处理那批六路片段 |
+| `rtsp://…` | 实时看直播流 | 报错（流没有结尾） |
+
+两者跑的是同一套算法、同一份 exe，其余参数原样透传
+（`scripts\analyse.bat 6cam --out o.mp4 --max-frames 300`）。命令行解析、源解析与
+前置检查都在 `scripts\env.bat` 里做一次，两个 launcher 各只剩十几行。
+默认源用 `SWIM_CANVAS` / `SWIM_CAM_DIR` 覆盖。
+
+Linux 或要自定义参数时直接调二进制：
 
 ```bash
 export LD_LIBRARY_PATH=/opt/trt/TensorRT-10.11.0.33/lib   # Windows 是把该目录加进 PATH

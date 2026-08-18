@@ -20,15 +20,25 @@ C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边
 
 ## 快速开始
 
-**Windows（推荐，C++ 实时链路）** —— 双击 `scripts\` 里的三个 `.bat` 即可，无需命令行：
+**Windows（推荐，C++ 实时链路）** —— 双击 `scripts\` 里的 `.bat` 即可，无需命令行。
+**脚本选「结果去哪」，参数选「输入从哪来」**，两个维度独立：
 
 ```
-scripts\build.bat      构建 + 导出 ONNX + 烘拼接查找表（首次一次）
-scripts\preview.bat    实时预览窗口（拖视频进去 = 分析画布，拖六路片段目录 = GPU 现拼）
-scripts\analyse.bat    批处理出 json，加 --out o.mp4 出标注视频
+scripts\build.bat            构建 + 导出 ONNX + 烘拼接查找表（首次一次）
+
+scripts\preview.bat          开窗口实时看 —— 已拼全景视频（默认）
+scripts\preview.bat 6cam     开窗口实时看 —— 六路 4K 原片，GPU 上现拼
+scripts\analyse.bat          跑完写 json  —— 已拼全景视频（默认）
+scripts\analyse.bat 6cam     跑完写 json  —— 六路 4K 原片，GPU 上现拼
 ```
 
-首次运行 `scripts\preview.bat` 会构建 TensorRT engine（几分钟），之后秒开。
+两个 `.bat` 跑的是**同一套算法**（逐帧 detect + pose + 跟踪 + 划水/速度，无缓存），
+区别只有结果去哪：`preview` 显示，`analyse` 落盘。第一个参数还可以是**视频文件**
+（= 指定一段全景视频）、**目录**（= 指定六路片段目录）、`rtsp://…`（直播流，只有
+preview 能用），都支持直接拖到 `.bat` 上。其余参数原样透传，例如
+`scripts\analyse.bat 6cam --out o.mp4 --max-frames 300`。
+
+首次运行会构建 TensorRT engine（几分钟），之后秒开。
 环境要求与踩过的坑见 [`docs/windows.md`](docs/windows.md)。
 
 **Python 参考链路（Linux 或 Git Bash）**：
@@ -121,11 +131,13 @@ Plan B/C 把 Stage1+2 换成画布单遍或画布两阶段，Stage3/4 不变。
 ```
 CLAUDE.md                        导航：该走哪条线、同步契约、验证方法（先读这个）
 scripts/                         全部用户入口，脚本自己 cd 到仓库根，从哪调都一样
-  build.bat preview.bat analyse.bat   Windows C++ 入口（双击）
-  env.bat                        三个 bat 共用的前置检查（TRT/exe/onnx/ffmpeg），不单独跑
+  build.bat                      构建 + 导出 ONNX + 烘拼接表（双击）
+  preview.bat                    开窗口实时看（双击；第一个参数选输入源）
+  analyse.bat                    跑完写 json / mp4（双击；同一套参数）
+  env.bat                        两个 bat 共用：解析命令行 + 定位输入源 + 前置检查，不单独跑
   install.sh run.sh test.sh      Python 入口（Linux / Git Bash）
 configs/
-  pool_mesh.json                 泳池 mesh 标定（六路相机三角面片 + UV），仅 Plan A 用
+  pool_mesh.json                 泳池 mesh 标定（六路相机三角面片 + UV），Plan A 与 GPU 拼接共用
   rtmpose-m_swim-256x192.py      Plan A 的原相机 RTMPose 推理配置
   rtmpose-m_canvas-192x256.py    Plan C 的画布 RTMPose 推理配置
 weights/                         成品权重，来源与复现见 docs/权重来源与复现.md

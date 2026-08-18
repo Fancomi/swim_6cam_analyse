@@ -1,67 +1,42 @@
 @echo off
-rem swim_analyse - realtime preview with the C++ pipeline (double-click to run).
-rem ASCII only on purpose: cmd.exe parses .bat with the system ANSI codepage.
-rem Notes live in cpp/README.md, not here.
-rem
-rem   double-click              -> preview the default canvas video
-rem   drag a video onto me      -> preview that file
-rem   drag a FOLDER onto me     -> six raw camera clips, stitched on the GPU
-rem   preview.bat URL           -> rtsp:// / rtmp:// / http:// live stream
-rem   preview.bat --preview-scale 0.5       -> flags are passed through
-rem
-rem Every frame runs detect + pose + tracking live; nothing is replayed.
-rem Press q or ESC on the window to stop.
-rem
-rem Write json / mp4 instead of a window: analyse.bat
-rem Build / export ONNX first:            build.bat
-rem Override the TensorRT lib dir:        set SWIM_TRT_LIB=<dir>
-rem Six-camera mode needs cpp\models\stitch.lut - build.bat bakes it.
+goto :run
 
+rem ==========================================================================
+rem  LIVE PREVIEW - opens a window and runs detect + pose + tracking on every
+rem  frame as it arrives. Nothing is cached or replayed: what the window shows
+rem  is what was just computed for that frame.
+rem
+rem  Double-click to run (reads the already-stitched panorama by default), or
+rem  name a source:
+rem      scripts\preview.bat              stitched panorama video (default)
+rem      scripts\preview.bat 6cam         six raw 4K clips, stitched on the GPU
+rem      scripts\preview.bat <video>      a specific panorama video (or drag it here)
+rem      scripts\preview.bat <folder>     a six-camera clip folder (or drag it here)
+rem      scripts\preview.bat rtsp://...   live stream
+rem  Anything else is passed straight through, e.g.
+rem      scripts\preview.bat 6cam --preview-scale 0.5
+rem
+rem  Want json / mp4 instead of a window?  ->  scripts\analyse.bat
+rem  Never built it?                       ->  scripts\build.bat
+rem
+rem  UTF-8 without BOM + CRLF + ASCII only: cmd.exe parses .bat with the system
+rem  ANSI codepage, so non-ASCII text here breaks on non-936 machines.
+rem  Chinese notes live in cpp\README.md; encoding rules in docs\windows.md.
+rem ==========================================================================
+
+:run
 setlocal
 rem This script lives in scripts\ but all paths below are repo-root relative,
 rem so cd to the parent of %~dp0. Double-click still works from anywhere.
 cd /d "%~dp0.."
-call "%~dp0env.bat" || goto :end
 
-rem Arg 1 is the input only when it does not start with "-"; everything else is
-rem passed through. Collected with a shift loop (not %1..%9) so quoting survives
-rem and there is no 9-argument cap. No parentheses around the set/test pair:
-rem cmd expands a whole block before running it, so a variable set inside a block
-rem cannot be read in the same block.
-set "INPUT="
-set "ARGS="
-set "A=%~1"
-if defined A if not "%A:~0,1%"=="-" goto :take_input
-goto :collect
-:take_input
-set "INPUT=%~1"
-shift
-:collect
-if "%~1"=="" goto :parsed
-set "ARGS=%ARGS% %1"
-shift
-goto :collect
-:parsed
-
-if not defined INPUT set "INPUT=data\20260730\merged_3000f.mp4"
-rem A directory means "six raw camera clips": stitch them on the GPU instead of
-rem reading an already-stitched canvas. One flag switch, same pipeline downstream.
-set "MODE=--input"
-if exist "%INPUT%\" set "MODE=--cam-dir"
-rem Substring test via pure batch expansion: calling find/where here would pick
-rem up the Unix tools when launched from a Git Bash shell.
-if not "%INPUT%"=="%INPUT://=%" set "IS_URL=1"
-if not defined IS_URL if not exist "%INPUT%" (
-  echo [error] input not found: %INPUT%
-  goto :end
-)
-if "%MODE%"=="--cam-dir" if not exist "cpp\models\stitch.lut" (
-  echo [error] cpp\models\stitch.lut missing - run scripts\build.bat to bake it.
-  goto :end
-)
+rem env.bat parses the command line, resolves the source (canvas / 6cam / file /
+rem dir / URL) and checks the toolchain, setting MODE / INPUT / ARGS / LABEL /
+rem EXE. This launcher only decides where results go: a window.
+call "%~dp0env.bat" %* || goto :end
 
 echo.
-if "%MODE%"=="--cam-dir" (echo   six-cam : %INPUT%  ^(NVDEC + GPU stitch^)) else (echo   input : %INPUT%)
+echo   %LABEL%
 echo   every frame runs detect + pose + tracking live; nothing is replayed
 echo   first run builds TensorRT engines - that takes a few minutes
 echo   press q or ESC on the preview window to stop
