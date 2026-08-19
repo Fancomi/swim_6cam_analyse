@@ -198,6 +198,23 @@ class PrefetchSource : public FrameSource {
   std::exception_ptr      err_;
 };
 
+/// uri 是网络流吗（决定要不要给 ffmpeg/ffprobe 下 rtsp/超时那组选项）。
+bool is_stream(const std::string& uri) {
+  for (const char* p : {"rtsp://", "rtsps://", "rtmp://", "http://", "https://",
+                        "udp://", "srt://"})
+    if (uri.rfind(p, 0) == 0) return true;
+  return false;
+}
+
+/// 网络流要额外给 ffmpeg/ffprobe 的选项（放在 -i 之前才生效）。
+///   rtsp_transport tcp   默认的 UDP 在 4K 码率下丢包会花屏（满屏
+///                        "error while decoding MB"），实测必须换 TCP
+///   timeout              socket IO 超时（微秒），连不上时不要无限期卡住
+/// 离线文件不需要任何选项，多给也无害但没必要。
+std::string stream_opts(const std::string& uri) {
+  return is_stream(uri) ? "-rtsp_transport tcp -timeout 5000000 " : "";
+}
+
 /// ffprobe 探到的流信息。ok=false 表示不可用（ffprobe 缺失/字段缺失/尺寸非法），
 /// 调用方据此回退 OpenCV。
 struct Probe {
@@ -214,7 +231,7 @@ struct Probe {
 /// 二进制读不影响解析 —— 下面本来就在剥行尾的 \r。
 Probe probe(const std::string& uri) {
   const std::string cmd =
-      "ffprobe -v error -select_streams v:0 -show_entries "
+      "ffprobe -v error " + stream_opts(uri) + "-select_streams v:0 -show_entries "
       "stream=width,height,r_frame_rate,nb_frames "
       "-of default=noprint_wrappers=1:nokey=1 -i \"" + uri + "\"";
   Proc p(cmd, Proc::Mode::Read);
@@ -263,8 +280,10 @@ class FfmpegSource final : public PrefetchSource {
       : PrefetchSource("ffmpeg-pipe"),
         // -noautorotate：保证输出帧尺寸恒等于 ffprobe 报的 stream 宽高。带旋转元数据
         // 时自动旋转会输出 h×w（字节数相同！），按 w×h 解读就是整帧错切且无从察觉。
-        pipe_("ffmpeg -hide_banner -loglevel error -nostdin -noautorotate -i \"" +
-                  uri + "\" -map 0:v:0 -f rawvideo -pix_fmt bgr24 pipe:1",
+        // stream_opts 里的 rtsp_transport=tcp 对直播流是必需的，见那里的注释。
+        pipe_("ffmpeg -hide_banner -loglevel error -nostdin -noautorotate " +
+                  stream_opts(uri) + "-i \"" + uri +
+                  "\" -map 0:v:0 -an -f rawvideo -pix_fmt bgr24 pipe:1",
               Proc::Mode::Read, 128u << 20) {   // 128 MB 缓冲，理由见 proc.h
     SWIM_CHECK(bool(pipe_), "无法启动 ffmpeg 解码管道（PATH 里有 ffmpeg 吗？）");
     start(pr.w, pr.h, pr.fps, pr.total, ring, prefetch);

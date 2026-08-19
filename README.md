@@ -41,6 +41,12 @@ preview 能用），都支持直接拖到 `.bat` 上。其余参数原样透传�
 首次运行会构建 TensorRT engine（几分钟），之后秒开。
 环境要求与踩过的坑见 [`docs/windows.md`](docs/windows.md)。
 
+**交付到现场机器**：`bash scripts/dist.sh`（加 `--zip`）出一个约 740 MB 的自包含
+目录 `dist/swim_analyse/`，里面是预构建 engine + 两个双击入口 `run_1cam.bat`
+（单相机联调）/ `run_6cam.bat`（六路上线，改 `cameras.txt` 里的 IP 即可）。
+engine 与打包机的 GPU 架构、TensorRT 版本绑定，换代必须在目标机重新打包，
+细节见 [`CLAUDE.md`](CLAUDE.md) 的『交付包』。
+
 **Python 参考链路（Linux 或 Git Bash）**：
 
 ```bash
@@ -136,6 +142,8 @@ scripts/                         全部用户入口，脚本自己 cd 到仓库�
   analyse.bat                    跑完写 json / mp4（双击；同一套参数）
   env.bat                        两个 bat 共用：解析命令行 + 定位输入源 + 前置检查，不单独跑
   install.sh run.sh test.sh      Python 入口（Linux / Git Bash）
+  cams.sh                        六路 ZCam：探测 / 配 4K30 / 生成清单 / 起预览
+  dist.sh                        打交付包到 dist/swim_analyse/（预构建 engine + 双击入口）
 configs/
   pool_mesh.json                 泳池 mesh 标定（六路相机三角面片 + UV），Plan A 与 GPU 拼接共用
   rtmpose-m_swim-256x192.py      Plan A 的原相机 RTMPose 推理配置

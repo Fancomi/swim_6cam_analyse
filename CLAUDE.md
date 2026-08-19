@@ -38,6 +38,7 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `scripts/cams.sh` | 六路 ZCam：探测 / 配 4K30 / 生成清单 / 直接起预览 | Git Bash |
 | `scripts/run.sh` | Python 参考链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
 | `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
+| `scripts/dist.sh` | **打交付包**到 `dist/swim_analyse/`（`--zip` 再压缩） | Git Bash |
 
 两个 `.bat` 的第一个参数选输入源，语法完全一致（`env.bat` 统一解析）：
 
@@ -54,6 +55,21 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 `scripts\analyse.bat 6cam`。默认源可用 `SWIM_CANVAS` / `SWIM_CAM_DIR` 覆盖。
 **接现场相机**走 `bash scripts/cams.sh`（它生成 `configs/cameras.txt` 再喂给
 `--cam-dir`），细节见 `docs/cameras.md`。
+
+### 交付包（`bash scripts/dist.sh`）
+
+给「另一台同型号 GPU 机器」的自包含目录：exe + 运行期 DLL + **预构建 engine**
+（裸名 `models/detect.engine`、`models/pose.engine`，不带 ONNX）+ `stitch.lut` +
+`cameras.txt` 模板 + `README.txt`（UTF-8 带 BOM）+ 两个入口：
+`run_1cam.bat`（单相机联调，走 `--input`，**需要 PATH 里有 ffmpeg/ffprobe**，
+缺了会回退 OpenCV/MSMF：实测 5.7 fps vs 77.7，且帧率报成 30.00（真值 59.94），
+所以入口里加了 `where ffprobe` 预警）、`run_6cam.bat`（六路上线，走 `--cam-dir`，
+NVDEC 进程内解码，不需要 ffmpeg）。约 740 MB。
+
+包里刻意不带 ONNX（140 MB）与 `nvinfer_builder_resource`（1.8 GB）：交付机不重建
+engine。**engine 与打包机的 GPU 架构 + TRT 版本绑定**，换代必须在目标机重跑
+`scripts/build.bat` 再打包 —— `trt_engine.cpp` 在无 ONNX 时会给出这句提示。
+engine 与 lut 逐字节 md5 校验后再入包（静默坏拷贝会伪装成「架构不匹配」，实测踩过）。
 
 `scripts/env.bat` 是两个 `.bat` 共用的**命令行解析 + 源解析 + 前置检查**（定位
 TensorRT、检查 exe/onnx/lut/ffmpeg），设好 `MODE`/`INPUT`/`ARGS`/`NAME`/`LABEL`/`EXE`
@@ -75,6 +91,7 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 | `tests/` | pytest，纯逻辑、无需 GPU 与数据 |
 | `docs/` | 环境与推导类文档；性能数字归属见下面『文档归属』 |
 | `data/` `output/` `weights/` | 输入、产物、权重，均不入库 |
+| `dist/` | `scripts/dist.sh` 出的交付包，不入库；不要手工往里放东西（下次打包会整目录重建） |
 
 ## Python 侧速查
 

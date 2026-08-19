@@ -370,6 +370,9 @@ LaneUris uris_from_dir(const std::string& dir, const StitchLut& lut) {
 /// 用显式的 `相机=地址` 而不是「按行序对应」：现场六台相机的 IP 尾数与 mesh 顺序
 /// 不同（20260730 那批实测是 cam3 cam2 cam1 cam4 cam5 cam6），按行序写迟早错位，
 /// 而错位的症状是接缝错乱、不报错。
+///
+/// **允许只给一部分相机**：没列出的那路留空，画布上它的区域是黑的。分批上线
+/// （先装两台）与单相机联调都要靠这个，否则本地只有一台相机时根本跑不起来。
 LaneUris uris_from_list(const std::string& path, const StitchLut& lut) {
   std::ifstream f(path);
   SWIM_CHECK(f.good(), "无法打开相机清单 " + path);
@@ -379,6 +382,14 @@ LaneUris uris_from_list(const std::string& path, const StitchLut& lut) {
   while (std::getline(f, line)) {
     ++lineno;
     if (!line.empty() && line.back() == '\r') line.pop_back();   // 允许 CRLF
+    // 剥 UTF-8 BOM：这个文件是给人在记事本里改的，交付包的模板就带 BOM
+    // （见 docs/windows.md 的编码约定）。不剥掉，第一行的相机名会带三个不可见
+    // 字节而匹配不上，报错还指向「格式不对」。
+    if (lineno == 1 && line.size() >= 3 &&
+        static_cast<unsigned char>(line[0]) == 0xEF &&
+        static_cast<unsigned char>(line[1]) == 0xBB &&
+        static_cast<unsigned char>(line[2]) == 0xBF)
+      line.erase(0, 3);
     const size_t begin = line.find_first_not_of(" \t");
     if (begin == std::string::npos || line[begin] == '#') continue;
     const size_t eq = line.find('=', begin);
@@ -390,19 +401,23 @@ LaneUris uris_from_list(const std::string& path, const StitchLut& lut) {
     const size_t vb = val.find_first_not_of(" \t");
     val = vb == std::string::npos ? "" : val.substr(vb);
     while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.pop_back();
-    SWIM_CHECK(!val.empty(), path + ":" + std::to_string(lineno) + " 地址为空");
     SWIM_CHECK(map.emplace(key, val).second,
                path + " 里 " + key + " 出现了两次");
   }
   LaneUris out;
+  int active = 0;
   for (int i = 0; i < lut.lanes(); ++i) {
     auto it = map.find(lut.camera(i));
-    SWIM_CHECK(it != map.end(),
-               path + " 缺少相机 " + lut.camera(i) + " 的地址（表里有 " +
-                   std::to_string(map.size()) + " 条，需要 " +
-                   std::to_string(lut.lanes()) + " 条）");
-    out.push_back(it->second);
+    out.push_back(it == map.end() ? std::string() : it->second);
+    if (!out.back().empty()) ++active;
   }
+  SWIM_CHECK(active > 0,
+             path + " 里没有一台相机与 LUT 对得上（LUT 需要: " + [&] {
+               std::string s;
+               for (int i = 0; i < lut.lanes(); ++i)
+                 s += (i ? " " : "") + lut.camera(i);
+               return s;
+             }() + "）");
   return out;
 }
 
@@ -439,18 +454,28 @@ class StitchFrameSource final : public FrameSource {
     const int n = lut_->lanes();
     const LaneUris uris = spec_is_list ? uris_from_list(spec, *lut_)
                                        : uris_from_dir(spec, *lut_);
+    // lanes_ 与 LUT 的 lane 一一对应，缺的那路存 nullptr（画布上是黑的）。
+    // 保持下标对齐而不是压紧数组，是因为 lane i 的查找表就是 lut 的第 i 条。
     for (int i = 0; i < n; ++i) {
+      const std::string& uri = uris[size_t(i)];
+      if (uri.empty()) {
+        printf("[Stitch] lane %d = %-6s <- (未配置，该区域留黑)\n", i,
+               lut_->camera(i).c_str());
+        lanes_.push_back(nullptr);
+        continue;
+      }
       printf("[Stitch] lane %d = %-6s <- %s\n", i, lut_->camera(i).c_str(),
-             uris[size_t(i)].c_str());
-      lanes_.push_back(std::make_unique<NvdecLane>(uris[size_t(i)]));
+             uri.c_str());
+      lanes_.push_back(std::make_unique<NvdecLane>(uri));
     }
     av_buffer_unref(&seed);
 
-    // 六路必须同分辨率：拼接表按单一源尺寸烘的，混着不同尺寸会越界采样。
+    // 各路必须同分辨率：拼接表按单一源尺寸烘的，混着不同尺寸会越界采样。
     // 帧率取各路最大值（用于划水/速度的时间轴）；直播流的 total 是 -1，
     // 用 min 会让整体退化成 -1 —— 那正是想要的（流没有总帧数）。
     bool live = false;
     for (int i = 0; i < n; ++i) {
+      if (!lanes_[i]) continue;
       SWIM_CHECK(lanes_[i]->width() == lut_->src_w() &&
                      lanes_[i]->height() == lut_->src_h(),
                  lanes_[i]->path() + " 是 " + std::to_string(lanes_[i]->width()) +
@@ -485,21 +510,23 @@ class StitchFrameSource final : public FrameSource {
     // 混合来源时给离线路限速，理由见 NvdecLane::loop()。全离线时不限速
     // （那是批处理，越快越好）；全直播时也不需要（各路本来就由相机定速）。
     bool any_file = false;
-    for (auto& lane : lanes_) any_file = any_file || !lane->live();
+    for (auto& lane : lanes_) any_file = any_file || (lane && !lane->live());
     const bool pace = live && any_file;
     if (pace) printf("[Stitch] 混合来源：离线路按帧率限速，避免饿死直播路\n");
-    for (auto& lane : lanes_) lane->start(pace);
+    for (auto& lane : lanes_)
+      if (lane) lane->start(pace);
   }
 
   ~StitchFrameSource() override {
     // 直播流丢了多少帧是运维要看的数：持续增长说明这台机器追不上相机帧率
     int64_t drops = 0;
     for (auto& lane : lanes_)
-      if (lane->live()) drops += lane->dropped();
+      if (lane && lane->live()) drops += lane->dropped();
     if (drops > 0)
       printf("[Stitch] 直播流累计丢弃 %lld 帧（追不上相机帧率时的正常行为）\n",
              static_cast<long long>(drops));
-    for (auto& lane : lanes_) lane->stop();      // 先停线程，再回收显存
+    for (auto& lane : lanes_)
+      if (lane) lane->stop();                    // 先停线程，再回收显存
     if (stream_) cudaStreamSynchronize(stream_);
     for (auto& s : slots_) {
       for (auto*& f : s.frames)
@@ -523,13 +550,23 @@ class StitchFrameSource final : public FrameSource {
       if (f) av_frame_free(&f);
 
     for (int i = 0; i < n; ++i) {
+      StitchLane lane = lut_->lanes_view()[size_t(i)];
+      if (!lanes_[size_t(i)]) {
+        // 未配置的相机：权重给 0，kernel 里这一路对累加无贡献（画布留黑）。
+        // 指针置空是刻意的 —— 权重为 0 时 kernel 不会取样，留着野指针更危险。
+        lane.weight = nullptr;
+        lane.luma = lane.chroma = nullptr;
+        lane.bw = lane.bh = 0;
+        s.host_lanes[i] = lane;
+        continue;
+      }
       AVFrame* f = lanes_[size_t(i)]->pop();
-      if (!f) {                                  // 任一路结束即整体结束
-        for (int j = 0; j < i; ++j) av_frame_free(&s.frames[size_t(j)]);
+      if (!f) {                                  // 任一在用的路结束即整体结束
+        for (int j = 0; j < i; ++j)
+          if (s.frames[size_t(j)]) av_frame_free(&s.frames[size_t(j)]);
         return false;
       }
       s.frames[size_t(i)] = f;
-      StitchLane lane = lut_->lanes_view()[size_t(i)];
       lane.luma = f->data[0];
       lane.chroma = f->data[1];
       lane.luma_pitch = f->linesize[0];

@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+# Python 打包产物，以及 scripts/dist.sh 出的交付包 dist/swim_analyse/
 dist/
 .pytest_cache/
 # 虚拟环境
