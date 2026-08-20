@@ -31,6 +31,23 @@ for f in scripts/run.sh scripts/install.sh scripts/test.sh scripts/cams.sh scrip
   run "语法 $(basename "$f")" bash -n "$f"
 done
 
+# .bat 只能是「无 BOM + CRLF + 纯 ASCII」：cmd.exe 把 BOM 当第一条命令的一部分
+# （`@echo off` 变乱码），中文又按系统 ANSI 代码页解，换台机器就是乱码。
+# 破坏这三条不会在本机报错，只在交付机上现身，所以在这里挡住。
+# dist.sh 生成的 .bat（run_*.bat / update.bat）同规则，见其中的 crlf()。
+# 行尾用「CR 数 == LF 数」判定：msys 的 grep 会先剥掉行尾 CR，`grep -v $'\r$'`
+# 因此对 CRLF 文件也全命中，测不出东西。
+bat_bad=""
+for f in scripts/*.bat; do
+  b="$(basename "$f")"
+  head -c 3 "$f" | od -An -tx1 | grep -q 'ef bb bf' && bat_bad+=" $b:BOM"
+  LC_ALL=C grep -q $'[\x80-\xff]' "$f" && bat_bad+=" $b:非ASCII"
+  [[ "$(tr -dc '\r' < "$f" | wc -c)" == "$(tr -dc '\n' < "$f" | wc -c)" ]] ||
+    bat_bad+=" $b:非CRLF"
+done
+[[ -z "$bat_bad" ]] && ok "bat 编码（无 BOM + CRLF + 纯 ASCII）" \
+                    || bad "bat 编码违规:$bat_bad"
+
 # ── 2. 单元测试（纯逻辑，无需 GPU 与数据）───────────────────────────────────
 if [[ -x "$PYTHON" ]]; then
   run "单元测试 pytest tests" "$PYTHON" -m pytest tests -q

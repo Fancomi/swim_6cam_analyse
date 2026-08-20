@@ -16,11 +16,13 @@ rem   set SWIM_TRT_ROOT=<TensorRT-10.11 root>
 rem   set SWIM_VCPKG=<vcpkg root>
 rem   set SWIM_CUDA_ARCH=89        RTX40=89  RTX50=120  RTX30=86
 rem   set SWIM_FRESH=1             delete cpp\build and reconfigure
+rem   set SWIM_NO_PAUSE=1          do not wait for a keypress (used by dist.bat)
 
 setlocal
 rem This script lives in scripts\ but every path below is repo-root relative,
 rem so cd to the parent of %~dp0. Double-click still works from anywhere.
 cd /d "%~dp0.."
+set "RC=0"
 
 if not defined SWIM_TRT_ROOT set "SWIM_TRT_ROOT=D:\WindowsProject\workspace\TRT\TensorRT-10.11.0.33"
 if not defined SWIM_VCPKG    set "SWIM_VCPKG=D:\BaiduNetdiskDownload\vcpkg-2025.12.12"
@@ -29,16 +31,19 @@ if not defined SWIM_CUDA_ARCH set "SWIM_CUDA_ARCH=89"
 if not exist "%SWIM_TRT_ROOT%\include\NvInfer.h" (
   echo [error] TensorRT not found: "%SWIM_TRT_ROOT%\include\NvInfer.h"
   echo         set SWIM_TRT_ROOT to the TensorRT 10.11 root and retry.
+  set "RC=1"
   goto :end
 )
 set "TOOLCHAIN=%SWIM_VCPKG%\scripts\buildsystems\vcpkg.cmake"
 if not exist "%TOOLCHAIN%" (
   echo [error] vcpkg toolchain not found: "%TOOLCHAIN%"
   echo         set SWIM_VCPKG, or edit this file to pass -DOpenCV_DIR instead.
+  set "RC=1"
   goto :end
 )
 "%SystemRoot%\System32\where.exe" cmake >nul 2>nul || (
   echo [error] cmake not on PATH - install CMake ^>=3.18 or use a VS Developer Prompt
+  set "RC=1"
   goto :end
 )
 
@@ -90,9 +95,14 @@ goto :end
 :fail
 echo.
 echo [error] build failed with code %ERRORLEVEL% - see the log above.
+set "RC=1"
 
 :end
 echo.
+rem "if cond a & b" would run b unconditionally (cmd splits on & before the if),
+rem hence the goto. endlocal wipes RC, so expand it on the same line.
+if defined SWIM_NO_PAUSE goto :quit
 echo Press any key to close...
 pause >nul
-endlocal
+:quit
+endlocal & exit /b %RC%

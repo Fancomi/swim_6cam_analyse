@@ -38,7 +38,8 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `scripts/cams.sh` | 六路 ZCam：探测 / 配 4K30 / 生成清单 / 直接起预览 | Git Bash |
 | `scripts/run.sh` | Python 参考链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
 | `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
-| `scripts/dist.sh` | **打交付包**到 `dist/swim_analyse/`（`--zip` 再压缩） | Git Bash |
+| `scripts/dist.bat` | **打交付包**（双击：先构建再打包，`inc` 出增量、`zip` 顺手压缩） | Windows |
+| `scripts/dist.sh` | 同上的实现（`dist.bat` 调它；也可单独跑，见下） | Git Bash |
 
 两个 `.bat` 的第一个参数选输入源，语法完全一致（`env.bat` 统一解析）：
 
@@ -56,20 +57,39 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 **接现场相机**走 `bash scripts/cams.sh`（它生成 `configs/cameras.txt` 再喂给
 `--cam-dir`），细节见 `docs/cameras.md`。
 
-### 交付包（`bash scripts/dist.sh`）
+### 交付包（双击 `scripts/dist.bat`）
 
-给「另一台同型号 GPU 机器」的自包含目录：exe + 运行期 DLL + **预构建 engine**
-（裸名 `models/detect.engine`、`models/pose.engine`，不带 ONNX）+ `stitch.lut` +
-`cameras.txt` 模板 + `README.txt`（UTF-8 带 BOM）+ 两个入口：
-`run_1cam.bat`（单相机联调，走 `--input`，**需要 PATH 里有 ffmpeg/ffprobe**，
-缺了会回退 OpenCV/MSMF：实测 5.7 fps vs 77.7，且帧率报成 30.00（真值 59.94），
-所以入口里加了 `where ffprobe` 预警）、`run_6cam.bat`（六路上线，走 `--cam-dir`，
-NVDEC 进程内解码，不需要 ffmpeg）。约 740 MB。
+**两级，对应「第一次拷过去」与「之后每次更新」**。两级都先跑 `build.bat`（已构建则空转），
+所以「双击、等、拷目录」就是全部流程：
 
-包里刻意不带 ONNX（140 MB）与 `nvinfer_builder_resource`（1.8 GB）：交付机不重建
-engine。**engine 与打包机的 GPU 架构 + TRT 版本绑定**，换代必须在目标机重跑
-`scripts/build.bat` 再打包 —— `trt_engine.cpp` 在无 ONNX 时会给出这句提示。
-engine 与 lut 逐字节 md5 校验后再入包（静默坏拷贝会伪装成「架构不匹配」，实测踩过）。
+| 命令 | 产物 | 大小 |
+| --- | --- | --- |
+| `dist.bat` / `bash scripts/dist.sh` | 全能包 `dist/swim_analyse/` | 约 3.0 GB / 42 文件 |
+| `dist.bat inc` / `dist.sh --inc` | 增量包 `dist/swim_analyse_update/` + `update.bat` | 通常 0.4 MB |
+| 追加 `zip` / `--zip` | 同名 `.zip`（无 `zip` 命令时退到 Windows 自带 `tar.exe -a`） | — |
+
+**全能包 = 目标机零安装**，只要 NVIDIA 驱动 ≥ 550：exe + 运行期 DLL + `cudart64_12.dll` +
+四个 VC 运行库 + `ffmpeg`/`ffprobe`（462 MB）+ 预烘 engine + **ONNX 与
+`nvinfer_builder_resource`（合 1.8 GB）** + `stitch.lut` + `cameras.txt` 模板 +
+`README.txt`（UTF-8 带 BOM）+ 两个入口 `run_1cam.bat`（单相机联调，`--input`）/
+`run_6cam.bat`（六路上线，`--cam-dir`，改 `cameras.txt` 的 IP 即可）。
+入口自己 `set "PATH=%~dp0;%PATH%"`，所以自带的 ffmpeg 一定被用上（回退 OpenCV/MSMF
+是 5.7 fps vs 77.7，且帧率报成 30.00 而真值 59.94）。
+**带 ONNX 是刻意的**：engine 与「GPU 架构 + TRT 版本」烘死，带着它换代机器能自己现烘
+（几分钟，之后秒开）。要省这 1.8 GB 就 `SWIM_DIST_LEAN=1`，代价是换架构即失效。
+
+**增量包 = 相对最近一次全能包的累积差异**，按 `dist/<名>.manifest`（只在全能包时写）
+判断，所以必须先打过全能包；累积而非逐次差分，中间漏几个增量包也只需应用最新的。
+`update.bat` **只覆盖不删除**，且跳过 `cameras.txt`（现场 IP 在里面）。
+
+一份清单（`<md5> <包内路径> <源路径>`）同时喂两级，两者对「包里该有什么」不会分叉；
+顺手拿到的 md5 又当拷贝校验 —— 一次静默坏拷贝在目标机上表现为「反序列化失败」，
+与「换了显卡架构」症状一模一样（实测踩过）。生成的文本文件（入口 / README /
+`cameras.txt`）也走同一条路，改了入口脚本增量包会自动带上。
+
+engine 在包里统一改成**裸名**（`models/detect.engine`）：目标机的身份戳必然与本机不同
+（ONNX 的 mtime 变了），裸名才是它能认的那条路。`trt_engine.cpp` 按
+**身份戳名 → 裸名 → 现烘** 三级找 engine，裸名那份不可用时有 ONNX 就现烘、没有就报错。
 
 `scripts/env.bat` 是两个 `.bat` 共用的**命令行解析 + 源解析 + 前置检查**（定位
 TensorRT、检查 exe/onnx/lut/ffmpeg），设好 `MODE`/`INPUT`/`ARGS`/`NAME`/`LABEL`/`EXE`
@@ -91,7 +111,7 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 | `tests/` | pytest，纯逻辑、无需 GPU 与数据 |
 | `docs/` | 环境与推导类文档；性能数字归属见下面『文档归属』 |
 | `data/` `output/` `weights/` | 输入、产物、权重，均不入库 |
-| `dist/` | `scripts/dist.sh` 出的交付包，不入库；不要手工往里放东西（下次打包会整目录重建） |
+| `dist/` | `scripts/dist.sh` 出的交付包与 `*.manifest`（增量的基准），不入库；不要手工往里放东西（下次打包会整目录重建） |
 
 ## Python 侧速查
 

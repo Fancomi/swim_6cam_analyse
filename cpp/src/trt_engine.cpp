@@ -178,56 +178,64 @@ void build_engine(const std::string& onnx, const std::string& out,
 std::unique_ptr<TrtEngine> TrtEngine::load(
     const std::string& onnx_path, const std::string& engine_path,
     const std::string& dynamic_input, int min_b, int opt_b, int max_b, bool fp16) {
-  // 两种来源。开发机：有 ONNX，engine 按身份戳命名并按需构建。
-  // 交付包（dist）：只带一个现成的 engine，没有 ONNX 也没有 TRT 的构建资源
-  // （nvinfer_builder_resource 有 1.8 GB，不值得随包分发）。
+  // engine 有三个可能来源，优先级从高到低：
+  //   身份戳名  开发机自己烘过的，与「本机 + 本 ONNX + 本参数」严格对应，直接可用
+  //   裸名      交付包自带的预烘 engine。名字不含身份戳，无从判断是否属于本机，
+  //             只能试着反序列化；不匹配时有 ONNX 就现烘（全能包），没有就报错（精简包）
+  //   现烘      要有 ONNX
   const bool have_onnx = stamp_of(onnx_path).exists();
-  const std::string path =
+  const std::string tagged =
       have_onnx ? tagged_path(engine_path, engine_tag(onnx_path, max_b, fp16))
                 : engine_path;
-  if (have_onnx) {
-    if (!stamp_of(path).exists())
-      build_engine(onnx_path, path, dynamic_input, min_b, opt_b, max_b, fp16);
-  } else {
-    SWIM_CHECK(stamp_of(path).exists(),
-               "既找不到 ONNX " + onnx_path + " 也找不到预构建 engine " + path +
-                   "（开发机请跑 cpp/tools/export_onnx.py；交付包应自带 engine）");
-    printf("[TRT] 用预构建 engine %s（无 ONNX，本机不重建）\n", path.c_str());
+  std::string path = tagged;
+  if (!stamp_of(tagged).exists()) {
+    if (stamp_of(engine_path).exists()) {
+      path = engine_path;
+      printf("[TRT] 用交付包自带的 engine %s%s\n", path.c_str(),
+             have_onnx ? "（不匹配则用 ONNX 现烘）" : "（无 ONNX，本机不重建）");
+    } else {
+      SWIM_CHECK(have_onnx,
+                 "既找不到 ONNX " + onnx_path + " 也找不到预构建 engine " +
+                     engine_path + "（开发机请跑 cpp/tools/export_onnx.py；"
+                     "交付包应自带 engine）");
+      build_engine(onnx_path, tagged, dynamic_input, min_b, opt_b, max_b, fp16);
+    }
   }
 
   auto e = std::unique_ptr<TrtEngine>(new TrtEngine());
   e->dyn_input_ = dynamic_input;
   e->runtime_.reset(nvinfer1::createInferRuntime(g_logger));
   SWIM_CHECK(e->runtime_, "createInferRuntime 失败");
-  // 读盘 + 反序列化。写成 lambda 是因为要做两次（第二次是删档重建后重试），
-  // 而 blob 得在每次调用结束就释放（engine 有几百 MB，不该多留一份在内存里）。
-  auto deserialize = [&e, &path] {
-    auto blob = read_file(path);
+  // 读盘 + 反序列化 + 体检。返回空串表示可用，否则是「为什么不可用」的短语。
+  // 写成 lambda 是因为要做两次（第二次是现烘后重试），而 blob 得在每次调用结束就
+  // 释放（engine 有几百 MB，不该多留一份在内存里）。
+  auto try_load = [&e, &dynamic_input, max_b](const std::string& p) -> std::string {
+    auto blob = read_file(p);
     e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
+    if (!e->engine_) return "反序列化失败（GPU 架构或 TensorRT 版本不符，也可能文件损坏）";
+    // 预构建 engine 的 batch 上限由打包时决定，可能小于本次 --max-persons。
+    // 不查的话会在 init_bindings 的 setInputShape 处以晦涩的失败现身。
+    if (!dynamic_input.empty()) {
+      const auto mx = e->engine_->getProfileShape(
+          dynamic_input.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+      if (!(mx.nbDims > 0 && mx.d[0] >= max_b))
+        return "batch 上限 " + std::to_string(mx.d[0]) + " 小于 --max-persons " +
+               std::to_string(max_b);
+    }
+    return {};
   };
-  deserialize();
-  if (!e->engine_) {
-    // 有 ONNX：身份戳一致却反序列化失败 = 文件损坏，删掉重建一次，再失败才抛。
-    // 没 ONNX：engine 与本机不匹配（换了 GPU 架构或 TRT 版本），无从重建。
+  std::string why = try_load(path);
+  if (!why.empty()) {
     SWIM_CHECK(have_onnx,
-               "engine 反序列化失败 " + path +
-                   "：它与本机的 GPU 架构或 TensorRT 版本不匹配。"
-                   "交付包的 engine 与构建它的机器绑定，请在本机重新构建"
-                   "（scripts/build.bat）后再打包");
-    printf("[TRT] %s 反序列化失败，删除并重建\n", path.c_str());
-    std::remove(path.c_str());
-    build_engine(onnx_path, path, dynamic_input, min_b, opt_b, max_b, fp16);
-    deserialize();
-    SWIM_CHECK(e->engine_, "engine 反序列化失败 " + path);
-  }
-  // 预构建 engine 的 batch 上限由打包时决定，可能小于本次 --max-persons。
-  // 不查的话会在 init_bindings 的 setInputShape 处以晦涩的失败现身。
-  if (!have_onnx && !dynamic_input.empty()) {
-    const auto mx = e->engine_->getProfileShape(
-        dynamic_input.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
-    SWIM_CHECK(mx.nbDims > 0 && mx.d[0] >= max_b,
-               "预构建 engine 的 batch 上限是 " + std::to_string(mx.d[0]) +
-                   "，小于 --max-persons " + std::to_string(max_b));
+               "预构建 engine " + path + " 不可用：" + why +
+                   "。交付包的 engine 与打包机的 GPU 架构 + TensorRT 版本绑定，"
+                   "请在本机重新构建（scripts/build.bat）后再打包");
+    printf("[TRT] %s 不可用（%s），改用 ONNX 现烘\n", path.c_str(), why.c_str());
+    // 自己烘的坏了才删；交付包自带的裸名 engine 留着（换回原机器还能用）
+    if (path == tagged) std::remove(path.c_str());
+    build_engine(onnx_path, tagged, dynamic_input, min_b, opt_b, max_b, fp16);
+    why = try_load(tagged);
+    SWIM_CHECK(why.empty(), "新烘的 engine 仍不可用 " + tagged + "：" + why);
   }
   // kUSER_MANAGED：显存自管，避免运行时重分配
   e->ctx_.reset(e->engine_->createExecutionContext(
