@@ -246,12 +246,16 @@ set "PATH=%~dp0;%PATH%"
 
 rem Arg 1 is the source only when it is not a flag; the rest passes through.
 rem Shift loop rather than %1..%9 so quoting survives and there is no 9-arg cap.
+rem Two separate ifs, NOT `if defined A if not "%A:~0,1%"=="-"`: cmd expands the
+rem whole line before running any of it, so ":~0,1" is applied even when A is
+rem empty, expands to the bare text ~0,1 and eats the quotes - the line ends up
+rem unbalanced and cmd aborts with "The syntax of the command is incorrect."
+rem That is the no-argument path, i.e. exactly what a double-click does.
 set "SRC="
 set "ARGS="
 set "A=%~1"
-if defined A if not "%A:~0,1%"=="-" goto :take_src
-goto :collect
-:take_src
+if not defined A goto :collect
+if "%A:~0,1%"=="-" goto :collect
 set "SRC=%~1"
 shift
 :collect

@@ -55,9 +55,14 @@ rem cannot be read in the same block.
 set "ARG="
 set "ARGS="
 set "A=%~1"
-if defined A if not "%A:~0,1%"=="-" goto :take_src
-goto :collect
-:take_src
+rem Two separate ifs, NOT `if defined A if not "%A:~0,1%"=="-"`: cmd expands the
+rem whole line before running any of it, so the substring operator is evaluated
+rem even when A is empty - and ":~0,1" on an undefined name expands to the bare
+rem text ~0,1 while eating the quotes, leaving the line unbalanced. Symptom:
+rem "The syntax of the command is incorrect." on the NO-ARGUMENT path only, i.e.
+rem exactly the double-click path that never gets tested from a shell.
+if not defined A goto :collect
+if "%A:~0,1%"=="-" goto :collect
 set "ARG=%~1"
 shift
 :collect
