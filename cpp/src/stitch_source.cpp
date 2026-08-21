@@ -166,8 +166,11 @@ class NvdecLane {
   NvdecLane(const NvdecLane&) = delete;
   NvdecLane& operator=(const NvdecLane&) = delete;
 
-  void start(bool pace) {
+  /// pace=true 时离线路按 fps 限速（理由见 loop()）。fps 用画布帧率而不是本路
+  /// 自报值：--fps 覆盖后两者可能不同，限速要跟着实际时间轴走。
+  void start(bool pace, double fps) {
     pace_ = pace && !live_;
+    pace_fps_ = fps > 0 ? fps : fps_;
     worker_ = std::thread([this] { loop(); });
   }
 
@@ -261,7 +264,7 @@ class NvdecLane {
     // read 返回 ETIMEDOUT(-138)。已用最小复现确认：只读不解不受影响，
     // 一旦同进程有 5 路满速 cuvid 解码，直播路 5 s 就超时一次。
     const auto period = std::chrono::duration<double, std::milli>(
-        pace_ && fps_ > 0 ? 1000.0 / fps_ : 0.0);
+        pace_ && pace_fps_ > 0 ? 1000.0 / pace_fps_ : 0.0);
     auto next_at = std::chrono::steady_clock::now();
     for (;;) {
       if (pace_) {
@@ -326,6 +329,7 @@ class NvdecLane {
   bool    flushed_ = false;
   bool    live_ = false;                    // 直播流：满队列丢旧帧而不是背压
   bool    pace_ = false;                    // 离线路按帧率限速（混合来源时）
+  double  pace_fps_ = 0;                    // 限速用的帧率（画布帧率，可被 --fps 覆盖）
   int     read_fails_ = 0;                  // 连续读失败次数（live 下容忍抖动）
 
   std::thread             worker_;
@@ -436,7 +440,7 @@ LaneUris uris_from_list(const std::string& path, const StitchLut& lut) {
 class StitchFrameSource final : public FrameSource {
  public:
   StitchFrameSource(const std::string& spec, bool spec_is_list,
-                    const std::string& lut_path, int ring)
+                    const std::string& lut_path, double fps, int ring)
       : ring_n_(ring) {
     SWIM_CHECK(ring_n_ >= 3, "拼接画布环深须 >= 3");
     // 顺序要紧：av_hwdevice_ctx_create(AV_CUDA_USE_PRIMARY_CONTEXT) 要设置
@@ -489,6 +493,13 @@ class StitchFrameSource final : public FrameSource {
     }
     if (live) total_ = -1;
     if (fps_ <= 0) fps_ = 30.0;
+    // --fps 覆盖：相机侧改成 4KP29.97 后流里仍可能报 59.94（实测 ZCam 的
+    // avg_frame_rate 跟不上 movfmt 切换），时间轴按错的帧率走会让速度整体翻倍。
+    // 只改时间轴与离线路限速，不影响解码。
+    if (fps > 0) {
+      printf("[Stitch] --fps %.3f 覆盖源自报的 %.3f（时间轴与限速按前者）\n", fps, fps_);
+      fps_ = fps;
+    }
 
     bytes_ = size_t(lut_->canvas_w()) * lut_->canvas_h() * 3;
     SWIM_CUDA(cudaStreamCreate(&stream_));
@@ -514,7 +525,7 @@ class StitchFrameSource final : public FrameSource {
     const bool pace = live && any_file;
     if (pace) printf("[Stitch] 混合来源：离线路按帧率限速，避免饿死直播路\n");
     for (auto& lane : lanes_)
-      if (lane) lane->start(pace);
+      if (lane) lane->start(pace, fps_);
   }
 
   ~StitchFrameSource() override {
@@ -620,11 +631,11 @@ class StitchFrameSource final : public FrameSource {
 
 std::unique_ptr<FrameSource> StitchSource::open(const std::string& spec,
                                                 const std::string& lut_path,
-                                                int ring) {
+                                                double fps, int ring) {
   // 目录 = 一批离线片段，文件 = 相机清单（每行 `相机=地址`，地址可为 rtsp://）。
   // 两者都只是「怎么给六个地址」，NvdecLane 内部不区分。
   const bool is_list = !std::filesystem::is_directory(spec);
-  return std::make_unique<StitchFrameSource>(spec, is_list, lut_path, ring);
+  return std::make_unique<StitchFrameSource>(spec, is_list, lut_path, fps, ring);
 }
 
 }  // namespace swim

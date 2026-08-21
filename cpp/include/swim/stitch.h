@@ -90,9 +90,11 @@ class StitchSource {
   ///   目录 —— 在其中按 lut 的相机 id 找离线片段（`*_<相机>.mp4`）
   ///   文件 —— 相机清单，每行 `<相机>=<地址>`，地址可以是 rtsp:// 等直播流
   /// lut_path 缺省取 models_dir/stitch.lut。ring 为画布环深度，须 >= 3。
+  /// fps > 0 时覆盖各路自报帧率的最大值，同时用于离线路限速（见 stitch_source
+  /// 的 pace）；相机已配成 30fps 而流里报 59.94 时靠它把时间轴摆正。
   static std::unique_ptr<FrameSource> open(const std::string& spec,
                                            const std::string& lut_path,
-                                           int ring = 4);
+                                           double fps = 0, int ring = 4);
 };
 
 }  // namespace swim

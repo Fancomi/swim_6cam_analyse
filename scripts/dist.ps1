@@ -305,6 +305,9 @@ rem   run_1cam.bat rtsp://1.2.3.4/live_stream    override it
 rem   run_1cam.bat <file.mp4>      any video file works too
 rem   run_1cam.bat --max-frames 300              flags pass through
 rem
+rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
+rem q/ESC = quit.
+rem
 rem Every frame runs detect + pose + tracking; nothing is replayed.
 rem Decoding goes through the bundled ffmpeg (about 78 fps here).
 rem
@@ -320,7 +323,11 @@ rem
 rem   double-click                 read cameras.txt, live preview window
 rem   run_6cam.bat --json out.json      also write per-swimmer results
 rem   run_6cam.bat --out out.mp4        also write an annotated video
+rem   run_6cam.bat --fps 30        force the time axis to 30fps
 rem   run_6cam.bat <list.txt>      use a different camera list
+rem
+rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
+rem q/ESC = quit. Toggles also apply to what --out writes.
 rem
 rem Edit cameras.txt to match the venue's IPs. Camera names on the left must
 rem stay as they are - they are tied to the pool calibration in stitch.lut.
@@ -371,6 +378,10 @@ movfmt 决定主流的分辨率与帧率，**它在录制中是只读的** —�
   curl "http://<ip>/ctrl/stream_setting?index=stream0&venc=h264"
   curl "http://<ip>/ctrl/get?k=movfmt"          回读校验，必须看到 4KP29.97
 
+回读只说明相机认了；流里自报的帧率**可能仍是 59.94**（实测该字段跟不上 movfmt
+切换）。时间轴按错帧率走会让速度整体翻倍，这时加 --fps 30 把它摆正 ——
+它只改时间轴，不改解码。
+
 RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前 send_stream
 选中的那一路（默认 Stream0，即 4K 主流）。同一台相机最多约 4 个并发会话。
 
@@ -380,7 +391,18 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   run_6cam.bat --out out.mp4        标注视频（编码会吃掉一半帧率）
   run_6cam.bat --max-frames 300     只跑前 300 帧
   run_6cam.bat --preview-scale 0.4  预览窗口缩放比
+  run_6cam.bat --fps 30             按 30fps 算时间轴（流报错帧率时用）
   swim_analyse.exe --help           全部参数
+
+预览窗口的热键（焦点要在窗口上）
+--------------------------------
+  1     人体关键点（骨架）开关
+  2     分析框与 ID/划水/速度 标签开关
+  3     米制标尺网格开关（每 1 m 一条，5 m 加粗标米数）
+  q/ESC 退出
+
+窗口里看到的就是 --out 写进 mp4 的：热键切换会同时作用于落盘。
+想一开始就是某个状态，用 --no-kpts / --no-boxes / --grid。
 
 怎么更新
 --------

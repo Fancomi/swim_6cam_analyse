@@ -54,9 +54,12 @@ class FrameSource {
   /// prefetch=true 时内部起一个解码线程预取，使解码与推理真正重叠 ——
   /// 5002x2102 的 CPU 解码 13~17 ms/帧，不重叠会直接吃掉一半吞吐。
   /// ring 为环深度，须 >= 2（预取需要至少一格给消费者、一格给生产者）。
+  /// fps > 0 时覆盖容器/流自报的帧率（时间轴由它定）：直播流常报错帧率，
+  /// 实测 ZCam 的 rtsp 在 MSMF 下报 30.00 而真值 59.94，划水与速度会整体偏。
   static std::unique_ptr<FrameSource> open(const std::string& uri,
                                            DecoderPref pref = DecoderPref::Auto,
-                                           int ring = 4, bool prefetch = true);
+                                           double fps = 0, int ring = 4,
+                                           bool prefetch = true);
 };
 
 }  // namespace swim

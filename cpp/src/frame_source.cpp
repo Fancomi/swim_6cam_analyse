@@ -322,13 +322,13 @@ class FfmpegSource final : public PrefetchSource {
 /// 所以：与 Python 对照数值时必须走 Auto，本路径只用于兜底/排障。
 class CpuSource final : public PrefetchSource {
  public:
-  CpuSource(const std::string& uri, int ring, bool prefetch)
+  CpuSource(const std::string& uri, double fps, int ring, bool prefetch)
       : PrefetchSource("opencv") {
     SWIM_CHECK(cap_.open(uri), "无法打开输入 " + uri);
     const double n = cap_.get(cv::CAP_PROP_FRAME_COUNT);
     start(int(cap_.get(cv::CAP_PROP_FRAME_WIDTH)),
           int(cap_.get(cv::CAP_PROP_FRAME_HEIGHT)),
-          cap_.get(cv::CAP_PROP_FPS),
+          fps > 0 ? fps : cap_.get(cv::CAP_PROP_FPS),
           n > 0 ? int64_t(n) : -1,          // 流媒体读不到帧数
           ring, prefetch);
   }
@@ -352,16 +352,22 @@ class CpuSource final : public PrefetchSource {
 }  // namespace
 
 std::unique_ptr<FrameSource> FrameSource::open(const std::string& uri,
-                                              DecoderPref pref, int ring,
-                                              bool prefetch) {
-  const Probe pr = pref == DecoderPref::Cpu ? Probe{} : probe(uri);
+                                              DecoderPref pref, double fps,
+                                              int ring, bool prefetch) {
+  Probe pr = pref == DecoderPref::Cpu ? Probe{} : probe(uri);
+  // --fps 覆盖：探测到的帧率只用于时间轴（划水/速度），改它不影响解码。
+  // 放在这里而不是各子类里，两条 CPU 路径就都被覆盖到。
+  if (fps > 0 && pr.ok) {
+    printf("[Source] --fps %.3f 覆盖源自报的 %.3f（只改时间轴，不改解码）\n", fps, pr.fps);
+    pr.fps = fps;
+  }
 
   // 首选 ffmpeg 管道（约 13 ms/帧，已贴住 ffmpeg CLI 自身地板，且与 Python 的
   // cv2 逐字节一致）；探测不到才回退 OpenCV/MSMF（16.9 ms/帧，像素值有差异）。
   if (pr.ok) return std::make_unique<FfmpegSource>(uri, pr, ring, prefetch);
   if (pref != DecoderPref::Cpu)
     printf("[Source] ffprobe 探测失败，回退 OpenCV 解码（更慢，且像素值与 ffmpeg 不同）\n");
-  return std::make_unique<CpuSource>(uri, ring, prefetch);
+  return std::make_unique<CpuSource>(uri, fps, ring, prefetch);
 }
 
 }  // namespace swim

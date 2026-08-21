@@ -4,8 +4,8 @@
 #   bash scripts/cams.sh probe            # 只探测：谁在线、当前分辨率/帧率/编码
 #   bash scripts/cams.sh setup            # 下发 4K30 配置（会先停录制，movfmt 才可写）
 #   bash scripts/cams.sh list             # 生成 configs/cameras.txt（喂给 --cam-dir）
-#   bash scripts/cams.sh verify           # 逐台真实拉流，确认分辨率/帧率与期望一致
-#   bash scripts/cams.sh run [参数...]    # list + 直接起实时预览
+#   bash scripts/cams.sh verify           # 逐台真实拉流，确认分辨率/编码/帧率与期望一致
+#   bash scripts/cams.sh run [参数...]    # list + 直接起实时预览（自动带 --fps，见 CAM_FPS）
 #
 # 相机地址由「IP 基址 + 尾数」算出，尾数与相机名的对应写在 CAM_MAP 里 ——
 # 这个对应关系由标定决定（见 configs/pool_mesh.json 的 meshes 顺序），不是按
@@ -25,6 +25,7 @@
 #   CAM_STREAM=0|1         拉哪一路（0=stream0 主流 4K，1=stream1 子流）
 #   CAM_LIST=<路径>        清单输出位置（默认 configs/cameras.txt）
 #   CAM_FMT=4KP29.97       主模式（决定 stream0 的分辨率与帧率）
+#   CAM_FPS=<帧率>|0       run 时下给 --fps 的时间轴帧率（默认取自 CAM_FMT，0=不覆盖）
 #   CAM_KEEP_REC=1         setup 时不停录制（那样 movfmt 会改不动，仅用于只调码率）
 set -uo pipefail
 
@@ -39,6 +40,11 @@ CAM_MAP="${CAM_MAP:-cam1=199 cam2=199 cam3=199 cam4=199 cam5=199 cam6=199}"
 CAM_STREAM="${CAM_STREAM:-0}"
 CAM_LIST="${CAM_LIST:-$ROOT/configs/cameras.txt}"
 CAM_FMT="${CAM_FMT:-4KP29.97}"
+# 期望帧率从 CAM_FMT 里剥出来（"4KP29.97" -> 29.97），既用于 verify 的回读判定，
+# 也是 run 默认下给 --fps 的值。原因：相机改成 4KP29.97 后 rtsp 里仍可能报 59.94
+# （实测 avg_frame_rate 跟不上 movfmt 切换），时间轴按错帧率走会让速度整体翻倍。
+# CAM_FPS=0 显式关掉覆盖（回到「由流自报的帧率决定」）。
+CAM_FPS="${CAM_FPS-$(sed -n 's/.*[Pp]\([0-9.]*\)$/\1/p' <<<"$CAM_FMT")}"
 # stream1（子流）的目标参数。只有 CAM_STREAM=1 时下发。
 SUB_W="${SUB_W:-1920}"; SUB_H="${SUB_H:-1080}"; SUB_FPS="${SUB_FPS:-30}"
 
@@ -123,7 +129,7 @@ setup_one() {
   else bad "$name movfmt 仍是 $got（想要 $CAM_FMT）—— 录制停了吗？该值在录制中只读"; fi
 }
 
-# 真实拉一次流，确认 LUT 期望的分辨率与我们配的帧率都对得上。
+# 真实拉一次流，确认 LUT 期望的分辨率、编码与我们配的帧率都对得上。
 # 串行做：同一台相机最多约 4 个并发 RTSP 会话，六路并行 verify 会互相挤掉。
 verify_one() {
   local name="$1" url; url="$(cam_url "$name")"
@@ -132,9 +138,21 @@ verify_one() {
           -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate \
           -of csv=p=0 "$url" 2>&1 | tail -1)"
   if [[ "$line" != *","*","* ]]; then bad "$name 拉不到流: $line"; return 1; fi
-  # LUT 是按 3840x2160 烘的；分辨率不符会在 C++ 侧启动时报错，这里先拦一次
-  if [[ "$line" == *",3840,2160,"* ]]; then ok "$name $line"
-  else warn "$name $line（LUT 按 3840x2160 烘制，尺寸不符会被拒）"; fi
+  IFS=, read -r codec w h rate <<<"$line"
+  # r_frame_rate 是 num/den（30000/1001）；换成小数才好跟 CAM_FPS 比
+  local fps; fps="$(awk -F/ '{printf "%.2f", $2 ? $1/$2 : $1}' <<<"$rate")"
+  local msg="$name ${codec} ${w}x${h} ${fps}fps"
+  # LUT 是按 3840x2160 烘的；分辨率不符会在 C++ 侧启动时报错，这里先拦一次。
+  # 编码必须是 8bit h264/hevc：10bit 出的是 P010，拼接 kernel 只认 NV12。
+  [[ "$w,$h" == "3840,2160" ]] || { warn "$msg（LUT 按 3840x2160 烘制，尺寸不符会被拒）"; return; }
+  [[ "$codec" == h264 || "$codec" == hevc ]] || { warn "$msg（拼接 kernel 只认 8bit NV12）"; return; }
+  # 帧率只告警不拦：--fps 就是为这种「流自报值与相机设置不一致」准备的兜底。
+  if [[ -n "$CAM_FPS" && "$CAM_FPS" != 0 ]] &&
+     ! awk -v a="$fps" -v b="$CAM_FPS" 'BEGIN{exit !(a-b<0.5 && b-a<0.5)}'; then
+    warn "$msg（相机配的是 $CAM_FMT，run 会用 --fps $CAM_FPS 把时间轴摆正）"
+  else
+    ok "$msg"
+  fi
 }
 
 write_list() {
@@ -167,8 +185,12 @@ case "${1:-probe}" in
   list) write_list ;;
   run)
     write_list
+    # 默认把 --fps 钉在 CAM_FMT 的帧率上（理由见 CAM_FPS 的注释）；用户在
+    # "${@:2}" 里自己传了 --fps 则以他为准，不重复下发。
+    fps_arg=()
+    [[ -n "$CAM_FPS" && "$CAM_FPS" != 0 && "$*" != *--fps* ]] && fps_arg=(--fps "$CAM_FPS")
     exec "$ROOT/cpp/build/Release/swim_analyse.exe" --cam-dir "$CAM_LIST" \
-         --models cpp/models --preview --show-fps "${@:2}"
+         --models cpp/models --preview --show-fps "${fps_arg[@]}" "${@:2}"
     ;;
   *)
     echo "用法: bash scripts/cams.sh [probe|setup|verify|list|run]" >&2

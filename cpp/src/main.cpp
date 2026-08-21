@@ -48,14 +48,26 @@ cv::Scalar id_color(int id) {           // 与 Python 版同思路：按 id 稳�
   return cv::Scalar((h >> 16) & 255, (h >> 8) & 255, h & 255);
 }
 
+/// 叠加层的三个开关。预览窗口里按 1/2/3 实时切换，`--out` 落盘用当前状态
+/// （落盘没有键盘，所以静态开关 --no-kpts / --grid 也要保留）。
+/// 一个结构体而不是三个 bool 参数：draw()、Preview::show() 与 main 的 sink
+/// 共用同一份状态，加第四个开关时不必再改一遍签名。
+struct Overlay {
+  bool kpts  = true;                    // 1: 人体关键点骨架
+  bool boxes = true;                    // 2: 检测框 + ID/划水/速度 标签
+  bool grid  = false;                   // 3: 米制标尺网格（按 --ppm）
+};
+
 struct Args {
   PipelineOptions opt;                  // 参数默认值只在 pipeline.h 定义一份
                                         // （--help 也从这里现取，见 help_rows）
   std::string input, out, json, dump;
   std::string cam_dir, lut;             // 六路拼接输入：片段目录 + 查找表
   std::string dump_canvas;              // 首帧画布原样落 PNG（拼接对照用）
-  bool        draw_kpts = true, show_fps = false, preview = false;
+  Overlay     ov;                       // 叠加层初始状态
+  bool        show_fps = false, preview = false;
   float       preview_scale = 0.f;      // 0 = 自适应到 1600x900 以内
+  float       fps = 0.f;                // 0 = 用源自报的帧率
   DecoderPref decoder   = DecoderPref::Auto;
 };
 
@@ -150,8 +162,17 @@ std::vector<HelpRow> help_rows() {
     {"--decoder", "MODE", sfmt("auto|cpu (默认 %s=ffmpeg 管道，探测失败回退 OpenCV;\n"
                                "cpu=强制 OpenCV; nvdec 已废弃，等价 auto)",
                                decoder_name(a.decoder))},
-    {"--no-kpts", "", sfmt("不画骨架 (默认%s画)", a.draw_kpts ? "" : "不")},
-    {"--preview", "", "开实时窗口（画布会缩放后显示，按 q/ESC 退出）"},
+    {"--no-kpts", "", sfmt("启动时不画骨架 (默认%s画，预览中按 1 切换)",
+                           a.ov.kpts ? "" : "不")},
+    {"--no-boxes", "", sfmt("启动时不画框与标签 (默认%s画，预览中按 2 切换)",
+                            a.ov.boxes ? "" : "不")},
+    {"--grid", "", sfmt("启动时画米制标尺网格，每 1 m 一条 (默认%s画，\n"
+                        "预览中按 3 切换；间距由 --ppm 决定)",
+                        a.ov.grid ? "" : "不")},
+    {"--fps", "F", "覆盖时间轴与限速用的帧率 (默认取源自报的值)。\n"
+                   "相机改成 30fps 而流里报错时用它对齐划水/速度"},
+    {"--preview", "", "开实时窗口（画布会缩放后显示，按 q/ESC 退出，\n"
+                      "1/2/3 切关键点/分析/网格）"},
     {"--preview-scale", "F", "预览缩放比 0.05~1（默认自适应 1600x900 以内），\n"
                              "给了它就等于同时开 --preview"},
     {"--show-fps", "", "实时打印吞吐"},
@@ -233,7 +254,10 @@ bool parse(int argc, char** argv, Args& a) {
       o.signal = v == "wrist_x_head" ? StrokeSignal::WristXHead
                                      : StrokeSignal::ElbowAngle;
     }
-    else if (k == "--no-kpts")     a.draw_kpts = false;
+    else if (k == "--no-kpts")     a.ov.kpts  = false;
+    else if (k == "--no-boxes")    a.ov.boxes = false;
+    else if (k == "--grid")        a.ov.grid  = true;
+    else if (k == "--fps")         a.fps = num(i, k, 1e-3, 1000.0);
     else if (k == "--show-fps")    a.show_fps = true;
     else if (k == "--preview")     a.preview = true;
     else if (k == "--preview-scale") {
@@ -263,7 +287,8 @@ bool parse(int argc, char** argv, Args& a) {
     }
   }
   SWIM_CHECK(a.input.empty() != a.cam_dir.empty(),
-             "--input（已拼画布）与 --cam-dir（六路实时拼接）必须且只能给一个");  if (a.lut.empty()) a.lut = o.models_dir + "/stitch.lut";
+             "--input（已拼画布）与 --cam-dir（六路实时拼接）必须且只能给一个");
+  if (a.lut.empty()) a.lut = o.models_dir + "/stitch.lut";
   // 只有要图像（落盘、预览或导出画布）才付整帧 D2H；纯分析模式只回读关键点
   o.need_image = !a.out.empty() || a.preview || !a.dump_canvas.empty();
   o.validate();
@@ -273,9 +298,9 @@ bool parse(int argc, char** argv, Args& a) {
 /// 按参数选帧源：给了 --cam-dir 走六路 NVDEC 拼接，否则读已拼好的画布。
 /// 两条路都产出同一个 GpuFrame（BGR uint8 显存），下游完全不感知差异。
 std::unique_ptr<FrameSource> make_source(const Args& a) {
-  if (a.cam_dir.empty()) return FrameSource::open(a.input, a.decoder);
+  if (a.cam_dir.empty()) return FrameSource::open(a.input, a.decoder, a.fps);
 #ifdef SWIM_HAS_STITCH
-  return StitchSource::open(a.cam_dir, a.lut);
+  return StitchSource::open(a.cam_dir, a.lut, a.fps);
 #else
   throw std::runtime_error(
       "本二进制未编入拼接源（configure 时没找到 FFmpeg libav*），"
@@ -347,10 +372,44 @@ class Writer {
   int64_t frames_ = 0;
 };
 
+/// 米制标尺网格：按 --ppm 每 1 m 一条线，每 5 m 加粗并标米数，左上角写出画布的
+/// 米制尺寸。用途是目视量距离、核对速度口径（速度 = 框中心位移 / ppm），
+/// 与标定无关，所以只要 ppm 和画面尺寸，画布与六路现拼两条路完全一样。
+/// 文案一律英文（图内文字规范），且画在缩放后的画面上，故坐标按 s 折算。
+void draw_grid(cv::Mat& img, float ppm, float s) {
+  const double step = double(ppm) * double(s);        // 1 m 在当前画面上的像素数
+  if (step < 4.0) return;                             // 太密画满屏噪声，直接不画
+  const cv::Scalar thin{90, 90, 90}, bold{0, 210, 210};
+  const double fs = std::max(0.35, 0.5 * double(s));
+  char buf[32];
+  auto axis = [&](bool vertical) {
+    const int len = vertical ? img.cols : img.rows;
+    for (int m = 0; double(m) * step < double(len); ++m) {
+      const int p = int(double(m) * step);
+      const bool major = m % 5 == 0;
+      const cv::Point a = vertical ? cv::Point{p, 0} : cv::Point{0, p};
+      const cv::Point b = vertical ? cv::Point{p, img.rows} : cv::Point{img.cols, p};
+      cv::line(img, a, b, major ? bold : thin, 1, cv::LINE_AA);
+      if (!major || m == 0) continue;
+      snprintf(buf, sizeof buf, "%d", m);
+      const cv::Point at = vertical ? cv::Point{p + 3, 14} : cv::Point{3, p - 3};
+      cv::putText(img, buf, at, cv::FONT_HERSHEY_SIMPLEX, fs, bold, 1, cv::LINE_AA);
+    }
+  };
+  axis(true);
+  axis(false);
+  snprintf(buf, sizeof buf, "%.1f x %.1f m", double(img.cols) / step,
+           double(img.rows) / step);
+  cv::putText(img, buf, {3, img.rows - 5}, cv::FONT_HERSHEY_SIMPLEX, fs, bold, 1,
+              cv::LINE_AA);
+}
+
 /// 画标注。`s` 是画面缩放比（预览窗口 <1，落盘视频为 1）：坐标乘 s，字号与
 /// 线宽跟着降但留下限，否则缩到 1/3 后文字糊成一团。
-void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts,
-          float s = 1.f) {
+/// ov 是三个叠加层开关（预览里按 1/2/3 实时切换），关掉的层连计算都跳过。
+void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
+          float ppm, float s = 1.f) {
+  if (ov.grid) draw_grid(img, ppm, s);
   const double fs = std::max(0.4, double(s));   // 字号下限，保证小窗仍可读
   const int    th = s < 0.6f ? 1 : 2;           // 线宽/字宽
   const int    r  = s < 0.6f ? 2 : 3;           // 关键点半径
@@ -360,24 +419,26 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, bool draw_kpts,
 
   for (const auto& p : fr.persons) {
     const auto col = id_color(p.track_id);
-    cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, th);
+    if (ov.boxes) {
+      cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, th);
 
-    char buf[96];
-    if (std::isnan(p.speed))
-      snprintf(buf, sizeof buf, "ID:%d S:%d", p.track_id, p.strokes);
-    else
-      snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s", p.track_id, p.strokes,
-               p.speed);
-    int base = 0;
-    const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, fs, th, &base);
-    const int tx = int(p.x1 * s);
-    const int ty = std::max(int(p.y1 * s) - 6, sz.height + 4);
-    cv::rectangle(img, {tx, ty - sz.height - 4}, {tx + sz.width + 4, ty + 2},
-                  col, cv::FILLED);
-    cv::putText(img, buf, {tx + 2, ty}, cv::FONT_HERSHEY_SIMPLEX, fs,
-                {255, 255, 255}, th, cv::LINE_AA);
+      char buf[96];
+      if (std::isnan(p.speed))
+        snprintf(buf, sizeof buf, "ID:%d S:%d", p.track_id, p.strokes);
+      else
+        snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s", p.track_id, p.strokes,
+                 p.speed);
+      int base = 0;
+      const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, fs, th, &base);
+      const int tx = int(p.x1 * s);
+      const int ty = std::max(int(p.y1 * s) - 6, sz.height + 4);
+      cv::rectangle(img, {tx, ty - sz.height - 4}, {tx + sz.width + 4, ty + 2},
+                    col, cv::FILLED);
+      cv::putText(img, buf, {tx + 2, ty}, cv::FONT_HERSHEY_SIMPLEX, fs,
+                  {255, 255, 255}, th, cv::LINE_AA);
+    }
 
-    if (!draw_kpts) continue;
+    if (!ov.kpts) continue;
     for (const auto& e : kSkel) {
       if (p.scores[e[0]] < kpt_thr || p.scores[e[1]] < kpt_thr) continue;
       cv::line(img, pt(p.kpts[e[0] * 2], p.kpts[e[0] * 2 + 1]),
@@ -404,21 +465,40 @@ class Preview {
       : s_(scale > 0 ? scale : std::min(1.f, std::min(1600.f / float(w),
                                                      900.f / float(h)))) {
     cv::namedWindow(kWin, cv::WINDOW_AUTOSIZE);
-    printf("[Preview] 窗口 %dx%d (x%.3f)，焦点在窗口上按 q / ESC 提前结束\n",
+    printf("[Preview] 窗口 %dx%d (x%.3f)，焦点在窗口上：q/ESC 退出，"
+           "1 关键点  2 分析框  3 米制网格\n",
            int(float(w) * s_), int(float(h) * s_), s_);
     fflush(stdout);
   }
 
   /// 返回 false 表示用户要求退出。raw 必须是**未画过**的原始帧。
-  bool show(const cv::Mat& raw, const FrameResult& fr, float kpt_thr, bool kpts) {
+  /// ov 按引用传：1/2/3 就地翻转，落盘那条路随即用同一份状态，
+  /// 于是「窗口里看到的」与「写进 mp4 的」永远一致，无需第二份开关。
+  bool show(const cv::Mat& raw, const FrameResult& fr, float kpt_thr,
+            Overlay& ov, float ppm) {
     cv::resize(raw, view_, {}, s_, s_, cv::INTER_AREA);
-    draw(view_, fr, kpt_thr, kpts, s_);
+    draw(view_, fr, kpt_thr, ov, ppm, s_);
     cv::imshow(kWin, view_);
-    const int k = cv::waitKey(1);
-    return k != 27 && k != 'q' && k != 'Q';
+    // waitKey 只在本线程（创建窗口的那个）有效，也是唯一能读到按键的地方。
+    // 高位是修饰键与平台位，取低 8 位才能与字符比。
+    const int k = cv::waitKey(1) & 0xff;
+    switch (k) {
+      case '1': toggle(ov.kpts,  "关键点"); break;
+      case '2': toggle(ov.boxes, "分析框"); break;
+      case '3': toggle(ov.grid,  "米制网格"); break;
+      case 27: case 'q': case 'Q': return false;
+      default: break;
+    }
+    return true;
   }
 
  private:
+  static void toggle(bool& flag, const char* name) {
+    flag = !flag;
+    printf("\n[Preview] %s %s\n", name, flag ? "开" : "关");
+    fflush(stdout);
+  }
+
   static constexpr const char* kWin = "swim_analyse";
   float   s_;
   cv::Mat view_;
@@ -490,14 +570,14 @@ int main(int argc, char** argv) try {
       // 而 writer 的 draw 是在整帧上原地画的。
       if (a.preview && !quit) {
         if (!preview) preview = std::make_unique<Preview>(fr.w, fr.h, a.preview_scale);
-        if (!preview->show(img, fr, a.opt.kpt_thr, a.draw_kpts)) {
+        if (!preview->show(img, fr, a.opt.kpt_thr, a.ov, a.opt.ppm)) {
           quit = true;
           printf("\n[Preview] 收到退出键，停止取帧（已入队的帧仍会处理完）\n");
           pipe.request_stop();
         }
       }
       if (writer) {
-        draw(img, fr, a.opt.kpt_thr, a.draw_kpts);
+        draw(img, fr, a.opt.kpt_thr, a.ov, a.opt.ppm);
         writer->write(img);
       }
     }

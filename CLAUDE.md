@@ -211,7 +211,7 @@ cpp/build/Release/swim_analyse.exe --cam-dir <六路片段目录> --models cpp/m
 ```
 
 **拼接基线（RTX 4080 Laptop，`20260730-4k-raw` 六路原片，3000 帧）**：画布 5002×2102、
-25141 人次、88 个 track、划水合计 387 次、26.2 ms/帧（38.2 fps）。
+25078 人次、91 个 track、划水合计 379 次、26.2 ms/帧（38.2 fps）。
 首帧画布与离线 CPU 参考差 **mean|d| 0.34 灰阶 / 最大 3 / 100% 在 2 灰阶内**。
 它与 `--input` 那条路是**两组不可 diff 的数字**（画布差 0.34 灰阶就足以让短 track
 数量变化），各自对自己的基线。
@@ -227,7 +227,7 @@ cpp/build/Release/swim_analyse.exe --cam-dir <六路片段目录> --models cpp/m
 | --- | --- |
 | Plan A / `data/20260629` / H800 | 19.3 人每帧、81 track、3000 帧约 21.5 分钟 |
 | Plan C(C++) / `data/20260730` 画布 / RTX 4080 Laptop | 8.0 人每帧、63 track、376 次划水、65–78 fps |
-| Plan C(C++) / `20260730-4k-raw` 六路现拼 / RTX 4080 Laptop | 88 track、387 次划水、38 fps |
+| Plan C(C++) / `20260730-4k-raw` 六路现拼 / RTX 4080 Laptop | 91 track、379 次划水、38 fps |
 | Plan C(C++) / `data/20260730` / H800 | 12.4 ms 每帧（80 fps） |
 
 两个数据集的人数密度差一倍以上，跨口径比较毫无意义。
