@@ -1,5 +1,6 @@
 // 六路 4K -> NVDEC -> CUDA 拼接 -> GpuFrame。设计取舍见 include/swim/stitch.h。
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -41,9 +42,19 @@ namespace {
 constexpr int kExtraHwFrames = 16;
 /// 每路预取深度：解码与拼接重叠够用，再深只是延迟增大。
 constexpr int kLaneQueue = 3;
-/// 直播流连续读失败多少次才认定断流。单次失败通常只是 socket 超时（我们下发了
-/// timeout=5s），当场判 EOF 会让整条链路在第一次网络抖动时静默停掉。
-constexpr int kMaxReadFails = 20;
+/// 直播流连续读失败多少次就判定要重连。单次失败通常是 5 s 的 socket 超时
+/// （我们下发了 timeout=5s），而 30fps 的流五秒没数据已经是掉线 —— 把同一个死
+/// socket 重试几十次只是白等。**重连的代价现在只有约 1 秒**（见 reopen()），
+/// 不再是「整条链路停」，所以这个数从 20 降到 3：只用来容一次瞬时抖动。
+constexpr int kMaxReadFails = 3;
+/// 重连失败后的退避。相机重启要几十秒，退避太短只是空转（每次尝试本身还要等
+/// 最多 5 s 的连接超时），太长现场等不起。
+constexpr int kReconnectWaitMs = 1000;
+/// 直播路 pop 的等待上限。超时就让调用方用上一帧顶住 —— 一路卡住不该把整块
+/// 画布拖停。只兜「本路还没被标记不健康」的那一小段（首次读失败前最多 5 s）：
+/// 一旦标记为不健康，pop 立刻返回 Stall，不再每帧陪它等这 300 ms。
+constexpr int kLiveStallMs = 300;
+
 
 std::string av_msg(const std::string& what, int code) {
   char buf[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -97,57 +108,25 @@ void open_options(const std::string& uri, AVDictionary** opt) {
 /// AVBufferRef 会让六路争同一把 hwctx 锁：满速解码的离线路几乎一直握着它，
 /// 直播路的 av_read_frame 迟迟得不到调度 → socket 缓冲堆积 → 相机侧发送阻塞
 /// → read 返回 ETIMEDOUT(-138)，表现为整条链路先掉到几 fps 再静默停住。
+///
+/// **直播路永不结束**：读失败连续 kMaxReadFails 次就在本线程内重开
+/// demux + 解码器（hw device context 与 surface 池不动，所以重连只花约 1 秒），
+/// 失败则退避后再试，直到 stop()。掉线期间 pop() 超时返回「本路无新帧」，
+/// 由 StitchFrameSource 用上一帧顶住，其余五路照常出画。
 class NvdecLane {
  public:
+  /// pop 的三种结果。Stall 只会出现在直播路：它不是错误，也不是结束。
+  enum class Got { Frame, End, Stall };
+
   explicit NvdecLane(const std::string& uri)
       : path_(uri), live_(is_stream(uri)) {
     int rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_CUDA, "0", nullptr,
                                     AV_CUDA_USE_PRIMARY_CONTEXT);
     SWIM_CHECK(rc >= 0, av_msg("创建 CUDA 硬解上下文", rc));
-    AVDictionary* opt = nullptr;
-    open_options(uri, &opt);
-    rc = avformat_open_input(&fmt_, uri.c_str(), nullptr, &opt);
-    av_dict_free(&opt);
-    SWIM_CHECK(rc >= 0, av_msg("打开 " + uri, rc));
-    rc = avformat_find_stream_info(fmt_, nullptr);
-    SWIM_CHECK(rc >= 0, av_msg("探测 " + uri, rc));
-    stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    SWIM_CHECK(stream_ >= 0, uri + " 没有视频流");
-    // 显式丢弃其它流（ZCam 的 RTSP 带一路 1536 kb/s 的 PCM 音频）。只在
-    // av_read_frame 里 unref 掉是不够的：libavformat 仍会为它们解析与排队，
-    // 而我们永远不消费，积压会让 read 的节奏越来越不稳。
-    for (unsigned i = 0; i < fmt_->nb_streams; ++i)
-      if (int(i) != stream_) fmt_->streams[i]->discard = AVDISCARD_ALL;
-    AVStream* st = fmt_->streams[stream_];
-
-    // NVDEC 支持 H.264 与 HEVC，两者的 cuvid 解码器名不同。现场给什么编码就用
-    // 对应的那个，别写死 —— 相机侧一个设置就能从 h264 切到 h265。
-    const char* name = cuvid_name(st->codecpar->codec_id);
-    SWIM_CHECK(name != nullptr,
-               uri + " 的编码不是 H.264/HEVC，NVDEC 这条路只支持这两种");
-    const AVCodec* dec = avcodec_find_decoder_by_name(name);
-    SWIM_CHECK(dec != nullptr, std::string("FFmpeg 里没有 ") + name + " 解码器");
-    ctx_ = avcodec_alloc_context3(dec);
-    SWIM_CHECK(ctx_ != nullptr, "分配解码器上下文失败");
-    rc = avcodec_parameters_to_context(ctx_, st->codecpar);
-    SWIM_CHECK(rc >= 0, av_msg("拷贝流参数", rc));
-    ctx_->hw_device_ctx = av_buffer_ref(hw_);
-    // 不设 pkt_timebase 会打印 "Invalid pkt_timebase" 并按原样传时间戳
-    ctx_->pkt_timebase = st->time_base;
-    // 我们会把解码帧一直扣到拼接读完（见 StitchFrameSource 的 slot 回收），
-    // 所以要让解码器多备这么多张 surface，否则它会等我们归还而卡住。
-    // 用 extra_hw_frames 而不是已废弃的 "surfaces" 选项。
-    ctx_->extra_hw_frames = kExtraHwFrames;
-    rc = avcodec_open2(ctx_, dec, nullptr);
-    SWIM_CHECK(rc >= 0, av_msg(std::string("打开 ") + name, rc));
-
-    w_ = st->codecpar->width;
-    h_ = st->codecpar->height;
-    const AVRational r = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
-    fps_ = r.den > 0 ? double(r.num) / double(r.den) : 0.0;
-    total_ = st->nb_frames > 0 ? st->nb_frames : -1;   // 直播流没有总帧数
     pkt_ = av_packet_alloc();
     SWIM_CHECK(pkt_ != nullptr, "分配 AVPacket 失败");
+    std::string err;
+    SWIM_CHECK(try_open(err), err);
   }
 
   ~NvdecLane() {
@@ -158,8 +137,7 @@ class NvdecLane {
       av_frame_free(&f);
     }
     if (pkt_) av_packet_free(&pkt_);
-    if (ctx_) avcodec_free_context(&ctx_);
-    if (fmt_) avformat_close_input(&fmt_);
+    close_input();
     if (hw_) av_buffer_unref(&hw_);        // 必须在解码器之后
   }
 
@@ -174,7 +152,7 @@ class NvdecLane {
     worker_ = std::thread([this] { loop(); });
   }
 
-  /// 停线程（幂等）。worker 可能阻塞在背压等待或 av_read_frame 上。
+  /// 停线程（幂等）。worker 可能阻塞在背压等待、av_read_frame 或重连退避上。
   void stop() noexcept {
     if (!worker_.joinable()) return;
     {
@@ -186,23 +164,33 @@ class NvdecLane {
     worker_.join();
   }
 
-  /// 取下一帧（阻塞）。返回 nullptr 表示本路结束；调用方负责 av_frame_free。
+  /// 取下一帧。Frame 时 out 归调用方所有（负责 av_frame_free）。
+  /// 离线路只会给出 Frame / End（队列空就阻塞等，丢帧会与基线对不上）。
+  /// 直播路还可能给 Stall：等了 kLiveStallMs 仍无新帧，或本路正在重连。
   /// 解码线程的异常在此 rethrow。
-  AVFrame* pop() {
+  Got pop(AVFrame*& out) {
     std::unique_lock<std::mutex> lk(mu_);
-    cv_ready_.wait(lk, [this] { return !queue_.empty() || done_ || stop_; });
+    const auto ready = [this] { return !queue_.empty() || done_ || stop_; };
+    if (live_) {
+      // 已知不健康时不再每帧陪它等 —— 直接顶上一帧，画布维持满帧率。
+      if (!healthy_ && queue_.empty()) return Got::Stall;
+      if (!cv_ready_.wait_for(lk, std::chrono::milliseconds(kLiveStallMs), ready))
+        return Got::Stall;
+    } else {
+      cv_ready_.wait(lk, ready);
+    }
     if (queue_.empty()) {
       if (err_) {
         auto e = err_;
         err_ = nullptr;
         std::rethrow_exception(e);
       }
-      return nullptr;
+      return Got::End;
     }
-    AVFrame* f = queue_.front();
+    out = queue_.front();
     queue_.pop();
     cv_room_.notify_one();
-    return f;
+    return Got::Frame;
   }
 
   int    width()  const { return w_; }
@@ -210,6 +198,7 @@ class NvdecLane {
   double fps()    const { return fps_; }
   int64_t total() const { return total_; }
   bool    live()  const { return live_; }
+  int64_t reconnects() const { return reconnects_; }
   int64_t dropped() const {                 // 只在 live_ 下非零
     std::lock_guard<std::mutex> lk(mu_);
     return dropped_;
@@ -217,28 +206,143 @@ class NvdecLane {
   const std::string& path() const { return path_; }
 
  private:
-  /// 解一帧到 out（已 ref）；返回 false 表示流结束。
+  /// 打开 demux + 解码器（可重复调用：先关掉旧的）。失败时把原因写进 err、
+  /// 不留半开状态。首次由构造函数转成异常，重连时用来决定要不要退避重试。
+  bool try_open(std::string& err) {
+    close_input();
+    AVDictionary* opt = nullptr;
+    open_options(path_, &opt);
+    int rc = avformat_open_input(&fmt_, path_.c_str(), nullptr, &opt);
+    av_dict_free(&opt);
+    if (rc < 0) return fail(av_msg("打开 " + path_, rc), err);
+    rc = avformat_find_stream_info(fmt_, nullptr);
+    if (rc < 0) return fail(av_msg("探测 " + path_, rc), err);
+    stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream_ < 0) return fail(path_ + " 没有视频流", err);
+    // 显式丢弃其它流（ZCam 的 RTSP 带一路 1536 kb/s 的 PCM 音频）。只在
+    // av_read_frame 里 unref 掉是不够的：libavformat 仍会为它们解析与排队，
+    // 而我们永远不消费，积压会让 read 的节奏越来越不稳。
+    for (unsigned i = 0; i < fmt_->nb_streams; ++i)
+      if (int(i) != stream_) fmt_->streams[i]->discard = AVDISCARD_ALL;
+    AVStream* st = fmt_->streams[stream_];
+
+    // NVDEC 支持 H.264 与 HEVC，两者的 cuvid 解码器名不同。现场给什么编码就用
+    // 对应的那个，别写死 —— 相机侧一个设置就能从 h264 切到 h265。
+    const char* name = cuvid_name(st->codecpar->codec_id);
+    if (!name)
+      return fail(path_ + " 的编码不是 H.264/HEVC，NVDEC 这条路只支持这两种", err);
+    const AVCodec* dec = avcodec_find_decoder_by_name(name);
+    if (!dec) return fail(std::string("FFmpeg 里没有 ") + name + " 解码器", err);
+    ctx_ = avcodec_alloc_context3(dec);
+    if (!ctx_) return fail("分配解码器上下文失败", err);
+    rc = avcodec_parameters_to_context(ctx_, st->codecpar);
+    if (rc < 0) return fail(av_msg("拷贝流参数", rc), err);
+    ctx_->hw_device_ctx = av_buffer_ref(hw_);
+    // 不设 pkt_timebase 会打印 "Invalid pkt_timebase" 并按原样传时间戳
+    ctx_->pkt_timebase = st->time_base;
+    // 我们会把解码帧一直扣到拼接读完（见 StitchFrameSource 的 slot 回收），
+    // 所以要让解码器多备这么多张 surface，否则它会等我们归还而卡住。
+    // 用 extra_hw_frames 而不是已废弃的 "surfaces" 选项。
+    ctx_->extra_hw_frames = kExtraHwFrames;
+    rc = avcodec_open2(ctx_, dec, nullptr);
+    if (rc < 0) return fail(av_msg(std::string("打开 ") + name, rc), err);
+
+    const int w = st->codecpar->width, h = st->codecpar->height;
+    // 重连后分辨率变了不能接着用：LUT 按单一源尺寸烘的，混着会越界采样。
+    // 现场把相机 movfmt 从 4K 改成 1080P 就会走到这里，明确报出来。
+    if (w_ && (w != w_ || h != h_))
+      return fail(path_ + " 重连后变成 " + std::to_string(w) + "x" +
+                      std::to_string(h) + "，与首次的 " + std::to_string(w_) +
+                      "x" + std::to_string(h_) + " 不一致（LUT 按前者烘制）",
+                  err);
+    w_ = w;
+    h_ = h;
+    const AVRational r = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
+    fps_ = r.den > 0 ? double(r.num) / double(r.den) : 0.0;
+    total_ = st->nb_frames > 0 ? st->nb_frames : -1;   // 直播流没有总帧数
+    flushed_ = false;
+    read_fails_ = 0;
+    healthy_ = true;
+    return true;
+  }
+
+  bool fail(std::string msg, std::string& err) {
+    close_input();
+    err = std::move(msg);
+    return false;
+  }
+
+  void close_input() noexcept {
+    if (ctx_) avcodec_free_context(&ctx_);
+    if (fmt_) avformat_close_input(&fmt_);
+    stream_ = -1;
+  }
+
+  /// 掉线重连（只在直播路、只在解码线程里调）。重开 demux + 解码器，
+  /// hw device context 与 surface 池不动，所以一次成功的重连约 1 秒。
+  /// 返回 false 表示外部要求停止。
+  bool reopen() {
+    healthy_ = false;
+    printf("[Stitch] %s 断流，开始重连（其余相机继续出画，本路用上一帧顶住）\n",
+           path_.c_str());
+    fflush(stdout);
+    for (int attempt = 1;; ++attempt) {
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (cv_room_.wait_for(lk, std::chrono::milliseconds(kReconnectWaitMs),
+                              [this] { return stop_; }))
+          return false;
+      }
+      std::string err;
+      if (try_open(err)) {
+        ++reconnects_;
+        printf("[Stitch] %s 重连成功（第 %lld 次，尝试 %d 回）\n", path_.c_str(),
+               static_cast<long long>(reconnects_), attempt);
+        fflush(stdout);
+        return true;
+      }
+      // 每次都打会淹掉日志（相机重启要几十秒），按 1/5/25… 递减频率报进展
+      if (attempt == 1 || attempt % 5 == 0) {
+        printf("[Stitch] %s 重连第 %d 次未成功: %s\n", path_.c_str(), attempt,
+               err.c_str());
+        fflush(stdout);
+      }
+    }
+  }
+
+  /// 解一帧到 out（已 ref）；返回 false 表示流结束（直播路只在 stop 时如此）。
   bool decode_one(AVFrame* out) {
     for (;;) {
       int rc = avcodec_receive_frame(ctx_, out);
       if (rc == 0) {
         SWIM_CHECK(out->format == AV_PIX_FMT_CUDA,
                    path_ + " 解出的不是 CUDA 帧（hw_device_ctx 没生效？）");
+        read_fails_ = 0;
+        healthy_ = true;
         return true;
       }
       SWIM_CHECK(rc == AVERROR(EAGAIN) || rc == AVERROR_EOF,
                  av_msg("接收解码帧", rc));
-      if (rc == AVERROR_EOF) return false;
+      if (rc == AVERROR_EOF) {
+        // 直播路的 EOF 是相机断开（RTSP 会话结束），重连而不是收摊
+        if (!live_) return false;
+        if (!reopen()) return false;
+        continue;
+      }
       rc = av_read_frame(fmt_, pkt_);
       if (rc < 0) {
         // 文件读完就是结束；直播流的读失败通常只是 socket 超时（我们下发了
         // timeout=5s），把它当 EOF 会让整条链路在第一次网络抖动时静默停掉 ——
         // 实测正是这样：lane 每 5 秒"结束"一次，端到端掉到 0.5 fps。
-        // 所以 live 下重试，只有连续多次才认定断流。
-        if (live_ && rc != AVERROR_EOF && ++read_fails_ < kMaxReadFails) {
-          if (read_fails_ == 1)
-            printf("[Stitch] %s 读取失败(%d)，重试中: %s\n", path_.c_str(), rc,
-                   av_msg("read", rc).c_str());
+        // 所以 live 下先重试几次容抖动，仍不行就重连（本路重开，其余路不受影响）。
+        if (live_) {
+          if (rc != AVERROR_EOF && ++read_fails_ < kMaxReadFails) {
+            printf("[Stitch] %s 读取失败(%d/%d): %s\n", path_.c_str(),
+                   read_fails_, kMaxReadFails, av_msg("read", rc).c_str());
+            fflush(stdout);
+            continue;
+          }
+          if (!reopen()) return false;
           continue;
         }
         if (flushed_) return false;
@@ -331,6 +435,10 @@ class NvdecLane {
   bool    pace_ = false;                    // 离线路按帧率限速（混合来源时）
   double  pace_fps_ = 0;                    // 限速用的帧率（画布帧率，可被 --fps 覆盖）
   int     read_fails_ = 0;                  // 连续读失败次数（live 下容忍抖动）
+  // 跨线程：解码线程写，消费者（next）读。不健康时 pop 立即返回 Stall，
+  // 不必每帧陪它等 kLiveStallMs。
+  std::atomic<bool>    healthy_{true};
+  std::atomic<int64_t> reconnects_{0};      // 成功重连次数（运维要看的数）
 
   std::thread             worker_;
   mutable std::mutex      mu_;
@@ -502,6 +610,7 @@ class StitchFrameSource final : public FrameSource {
     }
 
     bytes_ = size_t(lut_->canvas_w()) * lut_->canvas_h() * 3;
+    last_.resize(size_t(n), nullptr);
     SWIM_CUDA(cudaStreamCreate(&stream_));
     slots_.resize(size_t(ring_n_));
     for (auto& s : slots_) {
@@ -529,16 +638,25 @@ class StitchFrameSource final : public FrameSource {
   }
 
   ~StitchFrameSource() override {
-    // 直播流丢了多少帧是运维要看的数：持续增长说明这台机器追不上相机帧率
-    int64_t drops = 0;
+    // 直播流的运维三项：丢了多少帧（追不上相机帧率）、重连了几次、整帧靠旧帧
+    // 顶住了多少帧（掉线时长的直接度量）。持续增长都说明现场有问题。
+    int64_t drops = 0, recon = 0;
     for (auto& lane : lanes_)
-      if (lane && lane->live()) drops += lane->dropped();
+      if (lane && lane->live()) {
+        drops += lane->dropped();
+        recon += lane->reconnects();
+      }
     if (drops > 0)
       printf("[Stitch] 直播流累计丢弃 %lld 帧（追不上相机帧率时的正常行为）\n",
              static_cast<long long>(drops));
+    if (recon > 0 || held_ > 0)
+      printf("[Stitch] 掉线重连 %lld 次，整帧沿用旧画面 %lld 帧\n",
+             static_cast<long long>(recon), static_cast<long long>(held_));
     for (auto& lane : lanes_)
       if (lane) lane->stop();                    // 先停线程，再回收显存
     if (stream_) cudaStreamSynchronize(stream_);
+    for (auto*& f : last_)
+      if (f) av_frame_free(&f);
     for (auto& s : slots_) {
       for (auto*& f : s.frames)
         if (f) av_frame_free(&f);
@@ -560,9 +678,25 @@ class StitchFrameSource final : public FrameSource {
     for (auto*& f : s.frames)
       if (f) av_frame_free(&f);
 
+    int fresh = 0;                       // 本帧真正拿到新帧的路数
     for (int i = 0; i < n; ++i) {
       StitchLane lane = lut_->lanes_view()[size_t(i)];
-      if (!lanes_[size_t(i)]) {
+      NvdecLane* src = lanes_[size_t(i)].get();
+      AVFrame* f = nullptr;
+      if (src) {
+        // Stall（只可能是直播路）时用本路上一帧顶住：一台相机掉线不该让整块
+        // 画布停住。还没有可顶的帧（开机时相机未就绪）就让这一路留黑，
+        // 与「未配置的相机」同一条路 —— 绝不在这里空转等，否则 q/ESC 停不下来。
+        const NvdecLane::Got got = src->pop(f);
+        if (got == NvdecLane::Got::End) {   // 任一在用的路真结束即整体结束
+          for (int j = 0; j < i; ++j)
+            if (s.frames[size_t(j)]) av_frame_free(&s.frames[size_t(j)]);
+          return false;
+        }
+        if (got == NvdecLane::Got::Frame) ++fresh;
+        else if (last_[size_t(i)]) f = ref_of(last_[size_t(i)]);
+      }
+      if (!f) {
         // 未配置的相机：权重给 0，kernel 里这一路对累加无贡献（画布留黑）。
         // 指针置空是刻意的 —— 权重为 0 时 kernel 不会取样，留着野指针更危险。
         lane.weight = nullptr;
@@ -571,18 +705,26 @@ class StitchFrameSource final : public FrameSource {
         s.host_lanes[i] = lane;
         continue;
       }
-      AVFrame* f = lanes_[size_t(i)]->pop();
-      if (!f) {                                  // 任一在用的路结束即整体结束
-        for (int j = 0; j < i; ++j)
-          if (s.frames[size_t(j)]) av_frame_free(&s.frames[size_t(j)]);
-        return false;
-      }
       s.frames[size_t(i)] = f;
+      // 留一份引用当「上一帧」。引用的是同一张 surface（不拷像素），代价是每路
+      // 多扣一张 NV12（4K 约 12 MB），kExtraHwFrames 已含这份余量。
+      if (src && src->live()) {
+        if (last_[size_t(i)]) av_frame_free(&last_[size_t(i)]);
+        last_[size_t(i)] = ref_of(f);
+      }
       lane.luma = f->data[0];
       lane.chroma = f->data[1];
       lane.luma_pitch = f->linesize[0];
       lane.chroma_pitch = f->linesize[1];
       s.host_lanes[i] = lane;
+    }
+    // 一帧都没拿到新画面（唯一那台相机正在重连、或开机时还没出第一帧）：
+    // 按帧率放行，别空转刷同一张画布把 CPU 跑满。pop 的 300 ms 超时只在
+    // 「本路还没被标记不健康」时才会等，所以这一条是必需的兜底。
+    if (fresh == 0) {
+      ++held_;
+      std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(
+          fps_ > 0 ? 1000.0 / fps_ : 33.0));
     }
     SWIM_CUDA(cudaMemcpyAsync(s.dev_lanes, s.host_lanes,
                               sizeof(StitchLane) * size_t(n),
@@ -608,6 +750,19 @@ class StitchFrameSource final : public FrameSource {
   const char* backend() const override { return "nvdec-stitch"; }
 
  private:
+  /// 给同一张 surface 再加一个引用（不拷像素）。用于「掉线时顶住的上一帧」：
+  /// 它与画布环里的那一份指向同一块显存，各自 av_frame_free 独立计数。
+  static AVFrame* ref_of(const AVFrame* src) {
+    AVFrame* f = av_frame_alloc();
+    SWIM_CHECK(f != nullptr, "分配 AVFrame 失败");
+    const int rc = av_frame_ref(f, src);
+    if (rc < 0) {
+      av_frame_free(&f);
+      SWIM_CHECK(false, av_msg("引用上一帧", rc));
+    }
+    return f;
+  }
+
   /// 画布环的一格：画布显存 + 拼接完成事件 + 该帧的 lane 描述与源帧。
   struct Slot {
     void*        canvas = nullptr;
@@ -619,12 +774,14 @@ class StitchFrameSource final : public FrameSource {
 
   std::unique_ptr<StitchLut>  lut_;
   std::vector<std::unique_ptr<NvdecLane>> lanes_;
+  std::vector<AVFrame*>       last_;   // 每路最后一帧（只直播路留），掉线时顶住
   std::vector<Slot>           slots_;
   cudaStream_t stream_ = nullptr;
   size_t  bytes_ = 0;
   int     ring_n_ = 4;
   double  fps_ = 0;
   int64_t total_ = -1, idx_ = 0;
+  int64_t held_ = 0;                   // 整帧都是「顶住的旧帧」的次数
 };
 
 }  // namespace
