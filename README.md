@@ -151,7 +151,7 @@ scripts/                         全部用户入口，脚本自己 cd 到仓库�
   env.bat                        两个 bat 共用：解析命令行 + 定位输入源 + 前置检查，不单独跑
   install.sh run.sh test.sh      Python 入口（Linux / Git Bash）
   cams.sh                        六路 ZCam：探测 / 配 4K30 / 生成清单 / 起预览
-  dist.bat dist.sh               打交付包（双击；全能包 + 增量包两级）
+  dist.bat dist.ps1              打交付包（双击；全能包 + 增量包两级，纯 Windows 不需 bash）
 configs/
   pool_mesh.json                 泳池 mesh 标定（六路相机三角面片 + UV），Plan A 与 GPU 拼接共用
   rtmpose-m_swim-256x192.py      Plan A 的原相机 RTMPose 推理配置

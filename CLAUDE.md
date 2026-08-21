@@ -39,7 +39,7 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `scripts/run.sh` | Python 参考链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
 | `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
 | `scripts/dist.bat` | **打交付包**（双击：先构建再打包，`inc` 出增量、`zip` 顺手压缩） | Windows |
-| `scripts/dist.sh` | 同上的实现（`dist.bat` 调它；也可单独跑，见下） | Git Bash |
+| `scripts/dist.ps1` | 同上的实现（`dist.bat` 调它；也可单独跑，见下） | Windows PowerShell |
 
 两个 `.bat` 的第一个参数选输入源，语法完全一致（`env.bat` 统一解析）：
 
@@ -64,9 +64,17 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 
 | 命令 | 产物 | 大小 |
 | --- | --- | --- |
-| `dist.bat` / `bash scripts/dist.sh` | 全能包 `dist/swim_analyse/` | 约 3.0 GB / 42 文件 |
-| `dist.bat inc` / `dist.sh --inc` | 增量包 `dist/swim_analyse_update/` + `update.bat` | 通常 0.4 MB |
-| 追加 `zip` / `--zip` | 同名 `.zip`（无 `zip` 命令时退到 Windows 自带 `tar.exe -a`） | — |
+| `dist.bat` / `dist.ps1` | 全能包 `dist/swim_analyse/` | 约 3.0 GB / 42 文件 |
+| `dist.bat inc` / `dist.ps1 -Inc` | 增量包 `dist/swim_analyse_update/` + `update.bat` | 通常 0.4 MB |
+| 追加 `zip` / `-Zip` | 同名 `.zip`（Windows 自带 `tar.exe -a`，退到 `Compress-Archive`） | — |
+
+**打包用 PowerShell 而不是 bash**：交付链路只在 Windows 上跑，不该拖上 Git Bash 这个
+依赖。`cmd.exe` 调起的 bash 是**非登录 shell**，不读 `/etc/profile`，`dirname`/`md5sum`/
+`mktemp` 全部 `command not found`，而 `$(dirname …)` 返回空又会把错误伪装成
+「找不到 VC 运行库」，把人引去查一个完全健康的 Visual Studio（实测踩过）。
+PowerShell 5.1 随系统装，`Get-FileHash -Algorithm MD5` / `Copy-Item`（会跟随 winget
+的软链接取到 ffmpeg 真身）/ 通配 `Get-Item` 一样够用。
+`dist.ps1` 含中文，所以是 **UTF-8 带 BOM + CRLF** —— 见 `docs/windows.md`。
 
 **全能包 = 目标机零安装**，只要 NVIDIA 驱动 ≥ 550：exe + 运行期 DLL + `cudart64_12.dll` +
 四个 VC 运行库 + `ffmpeg`/`ffprobe`（462 MB）+ 预烘 engine + **ONNX 与
@@ -111,7 +119,7 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 | `tests/` | pytest，纯逻辑、无需 GPU 与数据 |
 | `docs/` | 环境与推导类文档；性能数字归属见下面『文档归属』 |
 | `data/` `output/` `weights/` | 输入、产物、权重，均不入库 |
-| `dist/` | `scripts/dist.sh` 出的交付包与 `*.manifest`（增量的基准），不入库；不要手工往里放东西（下次打包会整目录重建） |
+| `dist/` | `scripts/dist.ps1` 出的交付包与 `*.manifest`（增量的基准），不入库；不要手工往里放东西（下次打包会整目录重建） |
 
 ## Python 侧速查
 

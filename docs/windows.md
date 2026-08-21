@@ -49,6 +49,18 @@ Linux 是 `libnvinfer.so`。`cpp/CMakeLists.txt` 两套名字都找。
 powershell.exe -NoProfile -Command "[System.Management.Automation.Language.Parser]::ParseFile('<绝对路径>',[ref]$null,[ref]$err)|Out-Null; if($err){$err}else{'PARSE OK'}"
 ```
 
+`bash scripts/test.sh` 会把上表的前两行连同这条 `ParseFile` 一起跑掉（`.bat` 查
+「无 BOM + 纯 ASCII + CRLF」，`.ps1` 查「带 BOM + CRLF + 语法」），所以改完脚本跑一次
+自检就够，不必手工核字节。
+
+**Windows 上的入口一律不要依赖 Git Bash。** `cmd.exe` 调起的 bash 是**非登录 shell**，
+不读 `/etc/profile`，Git 的 `usr\bin` 不在 `PATH` 里 —— `dirname`/`md5sum`/`mktemp`/`rm`
+全部 `command not found`。更坏的是 `$(dirname …)` 静默返回空串，让脚本报出一个**完全
+不相关**的错（打包脚本当时报「找不到 VC 运行库 msvcp140.dll」，而 Visual Studio 一切正常）。
+所以 `scripts/dist.*` 这条链路是 `.bat` + `.ps1`：PowerShell 5.1 随系统装，
+`Get-FileHash -Algorithm MD5`、跟随软链接的 `Copy-Item`、通配 `Get-Item` 够覆盖全部需求。
+`.sh` 只留给本来就在 Git Bash / Linux 里跑的 Python 侧入口。
+
 源码侧同源的两个坑：MSVC 默认按 ACP 解 UTF-8 无 BOM 的 `.cpp`，会把中文注释的字节
 吃进语法 → CMake 已给 `/utf-8`（CXX）与 `-Xcompiler=/utf-8`（CUDA），
 运行期 `main()` 调 `SetConsoleOutputCP(CP_UTF8)`。

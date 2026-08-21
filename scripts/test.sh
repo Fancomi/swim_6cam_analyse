@@ -27,26 +27,47 @@ PYTHON="$ROOT/.venv/bin/python"
 [[ -x "$PYTHON" ]] || PYTHON="$ROOT/.venv/Scripts/python.exe"
 
 # ── 1. 入口脚本语法 ─────────────────────────────────────────────────────────
-for f in scripts/run.sh scripts/install.sh scripts/test.sh scripts/cams.sh scripts/dist.sh; do
+for f in scripts/run.sh scripts/install.sh scripts/test.sh scripts/cams.sh; do
   run "语法 $(basename "$f")" bash -n "$f"
 done
 
 # .bat 只能是「无 BOM + CRLF + 纯 ASCII」：cmd.exe 把 BOM 当第一条命令的一部分
 # （`@echo off` 变乱码），中文又按系统 ANSI 代码页解，换台机器就是乱码。
-# 破坏这三条不会在本机报错，只在交付机上现身，所以在这里挡住。
-# dist.sh 生成的 .bat（run_*.bat / update.bat）同规则，见其中的 crlf()。
+# .ps1 反过来：**必须带 BOM**，Windows PowerShell 5.1 对无 BOM 文件按系统 ANSI
+# 代码页解码，中文串的多字节序列被拆成全角字符、把引号吞进字符串，报的是
+# 「Missing closing '}'」这种完全指错地方的语法错。两者都得是 CRLF。
+# 破坏这些不会在本机报错，只在交付机上现身，所以在这里挡住。
+# dist.ps1 生成的 .bat（run_*.bat / update.bat）同 .bat 规则，见其中的 Write-Gen。
 # 行尾用「CR 数 == LF 数」判定：msys 的 grep 会先剥掉行尾 CR，`grep -v $'\r$'`
 # 因此对 CRLF 文件也全命中，测不出东西。
-bat_bad=""
+enc_bad=""
+has_bom() { [[ "$(head -c 3 "$1" | od -An -tx1 | tr -d ' ')" == efbbbf ]]; }
+is_crlf() { [[ "$(tr -dc '\r' < "$1" | wc -c)" == "$(tr -dc '\n' < "$1" | wc -c)" ]]; }
 for f in scripts/*.bat; do
   b="$(basename "$f")"
-  head -c 3 "$f" | od -An -tx1 | grep -q 'ef bb bf' && bat_bad+=" $b:BOM"
-  LC_ALL=C grep -q $'[\x80-\xff]' "$f" && bat_bad+=" $b:非ASCII"
-  [[ "$(tr -dc '\r' < "$f" | wc -c)" == "$(tr -dc '\n' < "$f" | wc -c)" ]] ||
-    bat_bad+=" $b:非CRLF"
+  has_bom "$f" && enc_bad+=" $b:BOM"
+  LC_ALL=C grep -q $'[\x80-\xff]' "$f" && enc_bad+=" $b:非ASCII"
+  is_crlf "$f" || enc_bad+=" $b:非CRLF"
 done
-[[ -z "$bat_bad" ]] && ok "bat 编码（无 BOM + CRLF + 纯 ASCII）" \
-                    || bad "bat 编码违规:$bat_bad"
+for f in scripts/*.ps1; do
+  b="$(basename "$f")"
+  has_bom "$f" || enc_bad+=" $b:缺BOM"
+  is_crlf "$f" || enc_bad+=" $b:非CRLF"
+done
+[[ -z "$enc_bad" ]] && ok "脚本编码（bat 无 BOM+ASCII / ps1 带 BOM / 均 CRLF）" \
+                    || bad "脚本编码违规:$enc_bad"
+
+# .ps1 语法：只信 Windows PowerShell 5.1 的 ParseFile —— pwsh 7 与 mac 上的
+# PowerShell 无 BOM 默认按 UTF-8 解，会让上面那类乱码问题在本机静默通过。
+if command -v powershell.exe >/dev/null; then
+  for f in scripts/*.ps1; do
+    w="$(cygpath -w "$ROOT/$f" 2>/dev/null || echo "$ROOT/$f")"
+    run "语法 $(basename "$f")" powershell.exe -NoProfile -Command \
+      "\$e=\$null; [System.Management.Automation.Language.Parser]::ParseFile('$w',[ref]\$null,[ref]\$e)|Out-Null; if(\$e){\$e;exit 1}"
+  done
+else
+  skip "语法 ps1" "非 Windows，没有 powershell.exe"
+fi
 
 # ── 2. 单元测试（纯逻辑，无需 GPU 与数据）───────────────────────────────────
 if [[ -x "$PYTHON" ]]; then
