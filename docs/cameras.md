@@ -77,11 +77,19 @@ $ curl "http://<ip>/ctrl/set?movfmt=4KP29.97"
 ```
 $ curl "http://<ip>/ctrl/get?k=send_stream"
 {...,"value":"Stream0","opts":["Stream0","Stream1","Stream0_with_backup"]}
+
+$ curl "http://<ip>/ctrl/set?send_stream=Stream1"     # 换流：一条 HTTP，URL 不变
 ```
+
+**换流不需要动代码**：地址永远是 `rtsp://<ip>/live_stream`，程序侧不感知换了哪路
+（`cams.sh setup` 的 `CAM_STREAM=0|1` 就是在下发上面这条）。但**换到 stream1 前要
+先烘一张对应分辨率的 LUT**：`stitch.lut` 按 3840×2160 烘死，构造时会核
+`lane 分辨率 == LUT 源尺寸`，拉 1920×1080 的子流会直接报错退出（这是刻意的，
+静默缩放等于接缝错位）。
 
 前身项目还有一条 libssp 的路（`zcam_ssp://<ip>:9999?ssp_stream=main`，
 `STREAM_MAIN`↔stream0、`STREAM_SEC`↔stream1），它带每帧时间戳，多机对齐更准。
-本项目暂时只用 RTSP —— 六路各自独立 demux，时间对齐留给后续（见第 6 节）。
+本项目暂时只用 RTSP —— 六路各自独立 demux，时间对齐留给后续（见第 7 节）。
 
 **同一台相机最多约 4 个并发 RTSP 会话**。实测 6 个独立进程同时拉：前 4 个正常
 （各约 620 帧/12 s），第 5、6 个直接失败拿不到帧。六路各一台相机时无碍，但要注意
@@ -139,8 +147,32 @@ $ curl "http://<ip>/ctrl/get?k=send_stream"
    拿不到就用该路上一帧的 `av_frame_ref`（同一张 surface，不拷像素）顶住；一整帧
    都没有新画面时按帧率 sleep 一帧。写成「循环重试直到有帧」会占满 CPU 且让
    q/ESC 停不下来（改的时候自己写错过一次）。
+8. **相机不能在「烘 engine」期间挂着不读**。`make_source()` 在 `Pipeline` 之前构造，
+   而 `Pipeline` 的构造要载/烘两个 TRT engine —— 换代显卡的首次启动是几分钟。
+   六路 RTSP 若这期间已经 PLAY 着没人读，就是第 3 条那个 -138：现场日志实测
+   五路同时刷「读取失败(1/3)(2/3) → 断流，开始重连 → 重连成功」，engine 转完还得
+   等六路各重连一次。修法是**先探后放**：构造时打开每路读出分辨率/帧率/编码
+   （这行日志现在会打出来），随即 `NvdecLane::park()` 关掉 demux 与解码器只留
+   hw device context 与已探到的参数，解码线程推迟到第一次 `next()` 才起、
+   在 `loop()` 开头补开连接。所以现在启动日志里能看到
+   「相机已探明，先松开连接」→ TRT 进度条 →「模型已就绪，开始取帧」三段。
+   开机时某路还没上电也不怕：补开失败就直接进重连那条路。
 
-## 6. 还没做的
+## 6. 现场 IP 与本机不同
+
+`cams.sh` 的默认是本机那台 `192.168.1.199`（六路全指向它，方便单机联调）。
+现场那批在 `192.168.3.101-106`，所以要覆盖：
+
+```bash
+CAM_BASE=192.168.3 CAM_MAP="cam1=101 cam2=102 cam3=103 cam4=104 cam5=105 cam6=106" \
+  bash scripts/cams.sh list > configs/cameras.txt
+```
+
+对应关系按**贴图实测**定，不要按 IP 尾数猜：`20260730` 那批 mesh 顺序是
+`cam3 cam2 cam1 cam4 cam5 cam6`（见 `CLAUDE.md`）。交付包里改
+`cameras.txt` 就行，`update.bat` 刻意跳过这个文件。
+
+## 7. 还没做的
 
 - **多机时间对齐**。现在六路各自 demux，没有共享时钟。ZCam 的 SSP 协议每帧带
   时间戳，前身项目用它对齐；RTSP 路要靠 RTP 时间戳或相机侧的 EzLink/PixelLink

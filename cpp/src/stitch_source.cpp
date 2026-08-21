@@ -152,6 +152,15 @@ class NvdecLane {
     worker_ = std::thread([this] { loop(); });
   }
 
+  /// 关掉 demux + 解码器，但保留已探到的 w/h/fps/codec，由 loop() 自己补开。
+  /// 用在「探完参数到真正开始取帧」之间那段空窗：首次在新 GPU 上要先烘 engine
+  /// （几分钟），这期间六路 RTSP 若已 PLAY 着没人读，TCP 缓冲堆满就会一路
+  /// -138 超时 + 重连刷屏 —— 现场日志实测正是这个。相机只在真要消费时才拉。
+  void park() {
+    close_input();
+    parked_ = true;
+  }
+
   /// 停线程（幂等）。worker 可能阻塞在背压等待、av_read_frame 或重连退避上。
   void stop() noexcept {
     if (!worker_.joinable()) return;
@@ -198,6 +207,8 @@ class NvdecLane {
   double fps()    const { return fps_; }
   int64_t total() const { return total_; }
   bool    live()  const { return live_; }
+  /// 实际用上的 cuvid 解码器名（h264_cuvid / hevc_cuvid），给启动摘要用。
+  const char* codec() const { return codec_ ? codec_ : "?"; }
   int64_t reconnects() const { return reconnects_; }
   int64_t dropped() const {                 // 只在 live_ 下非零
     std::lock_guard<std::mutex> lk(mu_);
@@ -231,6 +242,7 @@ class NvdecLane {
     const char* name = cuvid_name(st->codecpar->codec_id);
     if (!name)
       return fail(path_ + " 的编码不是 H.264/HEVC，NVDEC 这条路只支持这两种", err);
+    codec_ = name;                            // 字面量，生命期是整个进程
     const AVCodec* dec = avcodec_find_decoder_by_name(name);
     if (!dec) return fail(std::string("FFmpeg 里没有 ") + name + " 解码器", err);
     ctx_ = avcodec_alloc_context3(dec);
@@ -280,11 +292,12 @@ class NvdecLane {
 
   /// 掉线重连（只在直播路、只在解码线程里调）。重开 demux + 解码器，
   /// hw device context 与 surface 池不动，所以一次成功的重连约 1 秒。
+  /// why 非空时并进首行日志（首次打开失败时用得上，掉线路径留空）。
   /// 返回 false 表示外部要求停止。
-  bool reopen() {
+  bool reopen(const std::string& why = {}) {
     healthy_ = false;
-    printf("[Stitch] %s 断流，开始重连（其余相机继续出画，本路用上一帧顶住）\n",
-           path_.c_str());
+    printf("[Stitch] %s %s，开始重连（其余相机继续出画，本路用上一帧顶住）\n",
+           path_.c_str(), why.empty() ? "断流" : why.c_str());
     fflush(stdout);
     for (int attempt = 1;; ++attempt) {
       {
@@ -362,6 +375,13 @@ class NvdecLane {
   }
 
   void loop() try {
+    // park() 过的路在这里补开（探完参数就把流放掉了，见 park）。开不了就走
+    // 重连那条路：现场相机上电顺序不齐是常态，不该让整条链路起不来。
+    if (parked_) {
+      parked_ = false;
+      std::string err;
+      if (!try_open(err) && !reopen(err)) return finish(nullptr);
+    }
     // 混合来源（既有直播流又有离线文件）时，离线路必须按帧率限速。
     // 否则它们会以 200+ fps 满速解码，把 NVDEC 与 libav 内部占满，直播路的
     // av_read_frame 拿不到调度 → socket 缓冲堆积 → 相机侧发送阻塞 →
@@ -428,10 +448,12 @@ class NvdecLane {
   AVCodecContext*  ctx_ = nullptr;
   AVPacket*        pkt_ = nullptr;
   int     stream_ = -1, w_ = 0, h_ = 0;
+  const char* codec_ = nullptr;             // cuvid 解码器名（字面量，不拥有）
   double  fps_ = 0;
   int64_t total_ = -1;
   bool    flushed_ = false;
   bool    live_ = false;                    // 直播流：满队列丢旧帧而不是背压
+  bool    parked_ = false;                  // park() 过，等 loop() 补开
   bool    pace_ = false;                    // 离线路按帧率限速（混合来源时）
   double  pace_fps_ = 0;                    // 限速用的帧率（画布帧率，可被 --fps 覆盖）
   int     read_fails_ = 0;                  // 连续读失败次数（live 下容忍抖动）
@@ -576,9 +598,19 @@ class StitchFrameSource final : public FrameSource {
         lanes_.push_back(nullptr);
         continue;
       }
-      printf("[Stitch] lane %d = %-6s <- %s\n", i, lut_->camera(i).c_str(),
+      // 打开前先报地址：六路 RTSP 里若有一台不通，卡住的是哪一台要能一眼看出
+      // （avformat 的连接超时是 5 s，没有这行就只是黑屏等着）。
+      printf("[Stitch] lane %d = %-6s <- %s ...\n", i, lut_->camera(i).c_str(),
              uri.c_str());
-      lanes_.push_back(std::make_unique<NvdecLane>(uri));
+      fflush(stdout);
+      auto lane = std::make_unique<NvdecLane>(uri);
+      // 探到的实况：分辨率 / 帧率 / 编码 / 是流还是文件。现场最常问的
+      // 「我拉的到底是哪一路、多少帧率」在这一行里全了。
+      printf("[Stitch] lane %d = %-6s %dx%d %.2f fps %s %s\n", i,
+             lut_->camera(i).c_str(), lane->width(), lane->height(),
+             lane->fps(), lane->codec(), lane->live() ? "直播流" : "离线片段");
+      fflush(stdout);
+      lanes_.push_back(std::move(lane));
     }
     av_buffer_unref(&seed);
 
@@ -631,10 +663,18 @@ class StitchFrameSource final : public FrameSource {
     // （那是批处理，越快越好）；全直播时也不需要（各路本来就由相机定速）。
     bool any_file = false;
     for (auto& lane : lanes_) any_file = any_file || (lane && !lane->live());
-    const bool pace = live && any_file;
-    if (pace) printf("[Stitch] 混合来源：离线路按帧率限速，避免饿死直播路\n");
+    pace_ = live && any_file;
+    if (pace_) printf("[Stitch] 混合来源：离线路按帧率限速，避免饿死直播路\n");
+    // **解码线程推迟到第一次 next() 才起**，直播路的 socket 也先放掉（park）。
+    // 构造完到第一次取帧之间，主线程还要烘 TRT engine —— 换代显卡的首次启动是
+    // 几分钟。这期间若六路 RTSP 已经 PLAY 着没人读，TCP 缓冲堆满就会一路
+    // -138 超时 + 重连刷屏（现场日志实测），engine 转完还得等六路各重连一次。
+    // 探参数（分辨率/帧率/编码）必须在这之前做完，所以是「先探后放」。
     for (auto& lane : lanes_)
-      if (lane) lane->start(pace, fps_);
+      if (lane && lane->live()) lane->park();
+    if (live)
+      printf("[Stitch] 相机已探明，先松开连接；等模型就绪再开拉（避免空转堆缓冲）\n");
+    fflush(stdout);
   }
 
   ~StitchFrameSource() override {
@@ -671,6 +711,15 @@ class StitchFrameSource final : public FrameSource {
   }
 
   bool next(GpuFrame& out) override {
+    // 解码线程在这里才起（构造时只探参数）。放在 next() 而不是构造函数里，是为了
+    // 让「烘 engine 的那几分钟」发生在相机没被 PLAY 的时候，见构造函数末尾。
+    if (!started_) {
+      started_ = true;
+      printf("[Stitch] 模型已就绪，开始取帧（%d 路解码线程）\n", lut_->lanes());
+      fflush(stdout);
+      for (auto& lane : lanes_)
+        if (lane) lane->start(pace_, fps_);
+    }
     const int n = lut_->lanes();
     Slot& s = slots_[size_t(idx_ % ring_n_)];
     // 复用这一格前：等它上一轮的拼接读完源帧，然后把 surface 还给解码器
@@ -782,6 +831,8 @@ class StitchFrameSource final : public FrameSource {
   double  fps_ = 0;
   int64_t total_ = -1, idx_ = 0;
   int64_t held_ = 0;                   // 整帧都是「顶住的旧帧」的次数
+  bool    pace_ = false;               // 混合来源：离线路按帧率限速
+  bool    started_ = false;            // 解码线程已起（首次 next() 时置位）
 };
 
 }  // namespace

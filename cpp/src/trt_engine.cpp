@@ -18,17 +18,89 @@ namespace swim {
 namespace {
 
 class Logger : public nvinfer1::ILogger {
-  void log(Severity s, const char* msg) noexcept override {
-    // 错误走 stderr 并带级别前缀：构建失败时日志常被重定向，混在 stdout 里难定位
-    switch (s) {
-      case Severity::kINTERNAL_ERROR:
-      case Severity::kERROR:   fprintf(stderr, "[TRT/E] %s\n", msg); break;
-      case Severity::kWARNING: fprintf(stderr, "[TRT/W] %s\n", msg); break;
-      default: break;                       // kINFO/kVERBOSE 太啰嗦，丢弃
-    }
+ public:
+  /// 进静音期：错误只存不打，退出静音时留着给调用方取。用于「试着反序列化交付包
+  /// 自带的 engine」—— 换代显卡时它必然失败并让 TRT 打一条 Error Code 6，而那是
+  /// 预期路径（下一步就用 ONNX 现烘），直接刷 [TRT/E] 会让现场以为程序崩了。
+  /// 存下来的原因会并进我们自己的说明里，所以信息不丢反而更全。
+  void mute(bool on) {
+    std::lock_guard<std::mutex> lk(mu_);
+    muted_ = on;
+    if (on) first_.clear();
   }
+  /// 取静音期里的第一条错误（后续多是它的连锁反应）。
+  std::string take() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string s = std::move(first_);
+    first_.clear();
+    return s;
+  }
+
+ private:
+  void log(Severity s, const char* msg) noexcept override {
+    if (s > Severity::kWARNING) return;     // kINFO/kVERBOSE 太啰嗦，丢弃
+    std::lock_guard<std::mutex> lk(mu_);
+    if (muted_ && s <= Severity::kERROR) {
+      if (first_.empty()) first_ = msg;
+      return;
+    }
+    // 错误走 stderr 并带级别前缀：构建失败时日志常被重定向，混在 stdout 里难定位
+    fprintf(stderr, s <= Severity::kERROR ? "[TRT/E] %s\n" : "[TRT/W] %s\n", msg);
+  }
+
+  std::mutex  mu_;
+  bool        muted_ = false;
+  std::string first_;
 };
 Logger g_logger;
+
+/// engine 构建进度。TRT 承诺回调可能来自内部多个线程，所以整体加锁；阶段是
+/// 嵌套的树，只跟最内层那个（它才带步数），一行原地刷新 —— 构建有上百个阶段，
+/// 逐行打会把启动日志刷没。回答的是现场最常问的那句「到底转完了没」。
+class BuildProgress : public nvinfer1::IProgressMonitor {
+ public:
+  explicit BuildProgress(double t0) : t0_(t0) {}
+
+  void phaseStart(const char* name, const char*, int32_t steps) noexcept override {
+    std::lock_guard<std::mutex> lk(mu_);
+    cur_ = name;
+    steps_ = steps > 0 ? steps : 1;         // 文档说必为正，除零的代价太大不赌
+    step_ = 0;
+    draw();
+  }
+  bool stepComplete(const char* name, int32_t step) noexcept override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cur_ == name) {
+      step_ = step + 1;
+      draw();
+    }
+    return true;                            // 返回 false 会让 TRT 中止构建
+  }
+  void phaseFinish(const char* name) noexcept override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cur_ == name) cur_.clear();
+  }
+
+ private:
+  /// 定宽 + 行尾补空格：原地刷新时短名字才不会拖着上一行的残字。
+  /// 限频到 10 Hz：实测一次构建有 240 万次回调（阶段是嵌套树，每个 tactic 都
+  /// 进出一次 phaseStart），逐次 printf+fflush 会把构建本身拖慢，而原地刷新的
+  /// 进度条给人看，10 Hz 已经足够顺滑。
+  void draw() {
+    const double t = now_ms();
+    if (t - drawn_ms_ < 100.0) return;
+    drawn_ms_ = t;
+    printf("\r[TRT] 构建中 %-32.32s %3d%%  已用 %4.0f s   ", cur_.c_str(),
+           int(100.0 * step_ / steps_), (t - t0_) / 1000.0);
+    fflush(stdout);
+  }
+
+  std::mutex  mu_;
+  std::string cur_;
+  double      t0_;
+  double      drawn_ms_ = 0;
+  int         steps_ = 1, step_ = 0;
+};
 
 struct FileStamp {
   int64_t mtime = 0, size = 0;
@@ -111,7 +183,13 @@ size_t binding_bytes(const nvinfer1::ICudaEngine& engine, const Binding& b) {
 void build_engine(const std::string& onnx, const std::string& out,
                   const std::string& dyn_input, int min_b, int opt_b, int max_b,
                   bool fp16) {
+  const double t0 = now_ms();
+  // 首次在新架构的机器上要几分钟，且过程中没有任何 stdout —— 现场只能看着黑屏
+  // 猜是不是卡死。所以先说清「要等」，再由 IProgressMonitor 原地刷进度。
   printf("[TRT] 构建 engine: %s -> %s (fp16=%d)\n", onnx.c_str(), out.c_str(), fp16);
+  printf("[TRT] 首次在本机构建要几分钟（之后启动秒开）。构建期间不会出画面。\n");
+  fflush(stdout);
+  BuildProgress progress(t0);
   TrtPtr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(g_logger));
   SWIM_CHECK(builder, "createInferBuilder 失败");
   TrtPtr<nvinfer1::INetworkDefinition> net(builder->createNetworkV2(0));
@@ -121,6 +199,7 @@ void build_engine(const std::string& onnx, const std::string& out,
   SWIM_CHECK(parser->parse(buf.data(), buf.size()), "ONNX 解析失败 " + onnx);
 
   TrtPtr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
+  cfg->setProgressMonitor(&progress);       // 生命期覆盖 buildSerializedNetwork
   if (fp16) {
     cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
   } else {
@@ -170,7 +249,11 @@ void build_engine(const std::string& onnx, const std::string& out,
   }
   std::remove(out.c_str());                   // Windows 的 rename 不覆盖已存在文件
   SWIM_CHECK(std::rename(tmp.c_str(), out.c_str()) == 0, "重命名失败 " + tmp);
-  printf("[TRT] engine %.1f MB 已写入 %s\n", plan->size() / 1e6, out.c_str());
+  // 进度是原地刷新的，这里换行收尾，并给出总耗时 —— 「转了多久」是现场唯一能
+  // 用来估下次开机等多久的数。
+  printf("\n[TRT] engine %.1f MB 已写入 %s（耗时 %.0f s）\n", plan->size() / 1e6,
+         out.c_str(), (now_ms() - t0) / 1000.0);
+  fflush(stdout);
 }
 
 }  // namespace
@@ -211,8 +294,16 @@ std::unique_ptr<TrtEngine> TrtEngine::load(
   // 释放（engine 有几百 MB，不该多留一份在内存里）。
   auto try_load = [&e, &dynamic_input, max_b](const std::string& p) -> std::string {
     auto blob = read_file(p);
+    // 反序列化失败在这条路上是**预期**分支（换代显卡时交付包自带的 engine 必然
+    // 不匹配），TRT 会打一条 Error Code 6。静音起来，把原因并进我们的说明里，
+    // 免得现场把「正在按计划现烘」看成崩溃。
+    g_logger.mute(true);
     e->engine_.reset(e->runtime_->deserializeCudaEngine(blob.data(), blob.size()));
-    if (!e->engine_) return "反序列化失败（GPU 架构或 TensorRT 版本不符，也可能文件损坏）";
+    const std::string trt_err = g_logger.take();
+    g_logger.mute(false);
+    if (!e->engine_)
+      return "反序列化失败（GPU 架构或 TensorRT 版本不符，也可能文件损坏）" +
+             (trt_err.empty() ? std::string() : "：" + trt_err);
     // 预构建 engine 的 batch 上限由打包时决定，可能小于本次 --max-persons。
     // 不查的话会在 init_bindings 的 setInputShape 处以晦涩的失败现身。
     if (!dynamic_input.empty()) {
