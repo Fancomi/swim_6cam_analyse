@@ -105,8 +105,14 @@ cmake -S cpp -B cpp/build -G "Visual Studio 17 2022" \
 cmake --build cpp/build --config Release
 ```
 
-`CMAKE_CUDA_ARCHITECTURES`：H800=90，RTX40xx=89，RTX30xx=86，RTX50xx=120。
-默认值 `86 89 90` 不含 50 系且多架构编译慢很多，台式机务必显式指定。
+`CMAKE_CUDA_ARCHITECTURES`：RTX30xx=86，RTX40xx=89，H800=90，RTX50xx(Blackwell)=120
+（`120` 要 nvcc ≥ 12.8，CMakeLists 会在更老的 toolkit 上自动剔掉它）。
+`scripts/build.bat` 默认 **`89;120`** —— 交付包要同时覆盖开发机（40 系）与现场
+可能是 50 系的机器，而**我们自己的 CUDA kernel 只能靠编进 exe 的 cubin**：
+TRT engine 可以在目标机用 ONNX 现烘，kernel 不行，缺了那一档就退化成驱动 JIT
+（首次启动多等几十秒）。只在本机跑、想省一半 CUDA 编译时间就 `set SWIM_CUDA_ARCH=89`。
+产物带了哪几档用 `cuobjdump --list-elf cpp/build/Release/swim_analyse.exe` 核，
+`scripts/dist.ps1` 打包时也会核一遍并写进交付包的 `README.txt`。
 OpenCV 由 vcpkg 提供（`vcpkg install opencv4:x64-windows`）时传它的 toolchain file 即可，
 `find_package(OpenCV)` 会自动解析；用官方预编译包则改传 `-DOpenCV_DIR=C:/opencv/build`。
 多配置生成器（VS）**必须加 `--config Release`**，否则拿到的是慢一个量级的 Debug 二进制。

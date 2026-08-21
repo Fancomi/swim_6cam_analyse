@@ -14,7 +14,11 @@ rem
 rem Override paths / rebuild behaviour:
 rem   set SWIM_TRT_ROOT=<TensorRT-10.11 root>
 rem   set SWIM_VCPKG=<vcpkg root>
-rem   set SWIM_CUDA_ARCH=89        RTX40=89  RTX50=120  RTX30=86
+rem   set SWIM_CUDA_ARCH=89;120    RTX30=86  RTX40=89  RTX50=120  H800=90
+rem                                default covers 40 and 50 series natively.
+rem                                Trim it to one arch to halve CUDA compile time,
+rem                                but then the exe only runs on that card family
+rem                                (other cards fall back to slow driver JIT).
 rem   set SWIM_FRESH=1             delete cpp\build and reconfigure
 rem   set SWIM_NO_PAUSE=1          do not wait for a keypress (used by dist.bat)
 
@@ -26,7 +30,7 @@ set "RC=0"
 
 if not defined SWIM_TRT_ROOT set "SWIM_TRT_ROOT=D:\WindowsProject\workspace\TRT\TensorRT-10.11.0.33"
 if not defined SWIM_VCPKG    set "SWIM_VCPKG=D:\BaiduNetdiskDownload\vcpkg-2025.12.12"
-if not defined SWIM_CUDA_ARCH set "SWIM_CUDA_ARCH=89"
+if not defined SWIM_CUDA_ARCH set "SWIM_CUDA_ARCH=89;120"
 
 if not exist "%SWIM_TRT_ROOT%\include\NvInfer.h" (
   echo [error] TensorRT not found: "%SWIM_TRT_ROOT%\include\NvInfer.h"
@@ -49,14 +53,20 @@ if not exist "%TOOLCHAIN%" (
 
 if defined SWIM_FRESH if exist cpp\build rmdir /s /q cpp\build
 
-rem cmake re-runs configure by itself when CMakeLists.txt changes, so only the
-rem very first time needs the full command line.
-if not exist cpp\build\CMakeCache.txt (
+rem cmake re-runs configure by itself when CMakeLists.txt changes, but not when
+rem SWIM_CUDA_ARCH changes - the arch list is a cache entry, and a stale one
+rem silently yields an exe that JITs (or refuses) on the target card. So compare
+rem it against the cache and reconfigure when it moved.
+set "ARCH_OK="
+if exist cpp\build\CMakeCache.txt for /f "tokens=2 delims==" %%v in (
+  'findstr /b /c:"CMAKE_CUDA_ARCHITECTURES:" cpp\build\CMakeCache.txt'
+) do if "%%v"=="%SWIM_CUDA_ARCH%" set "ARCH_OK=1"
+if not defined ARCH_OK (
   echo [build] configure  arch=%SWIM_CUDA_ARCH%
   cmake -S cpp -B cpp\build -G "Visual Studio 17 2022" ^
         -DTRT_ROOT="%SWIM_TRT_ROOT:\=/%" ^
         -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN:\=/%" ^
-        -DCMAKE_CUDA_ARCHITECTURES=%SWIM_CUDA_ARCH% || goto :fail
+        -DCMAKE_CUDA_ARCHITECTURES="%SWIM_CUDA_ARCH%" || goto :fail
 )
 
 echo [build] compile Release

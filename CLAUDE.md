@@ -86,6 +86,13 @@ PowerShell 5.1 随系统装，`Get-FileHash -Algorithm MD5` / `Copy-Item`（会�
 **带 ONNX 是刻意的**：engine 与「GPU 架构 + TRT 版本」烘死，带着它换代机器能自己现烘
 （几分钟，之后秒开）。要省这 1.8 GB 就 `SWIM_DIST_LEAN=1`，代价是换架构即失效。
 
+**换代显卡是两件独立的事，别以为 ONNX 全包了**：engine 靠 ONNX 现烘；**我们自己的
+CUDA kernel 只能靠编进 exe 的 cubin**（`kernels.cu` / `stitch.cu`），ONNX 与它无关。
+所以 `scripts/build.bat` 默认 `SWIM_CUDA_ARCH=89;120`（RTX40 + RTX50/Blackwell），
+`dist.ps1` 打包时用 `cuobjdump --list-elf` 核一遍、缺档就告警，并把实际架构列表写进
+交付包的 `README.txt`。TRT 侧不必担心：`nvinfer_10.dll` 自带 sm_100/103/120 的 cubin。
+缺档不会报错，只是退化成驱动 JIT 那份 PTX —— 首次启动多等几十秒，没验证过。
+
 **增量包 = 相对最近一次全能包的累积差异**，按 `dist/<名>.manifest`（只在全能包时写）
 判断，所以必须先打过全能包；累积而非逐次差分，中间漏几个增量包也只需应用最新的。
 `update.bat` **只覆盖不删除**，且跳过 `cameras.txt`（现场 IP 在里面）。

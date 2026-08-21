@@ -27,9 +27,19 @@ if(CMAKE_CONFIGURATION_TYPES)
   message(STATUS "多配置生成器：构建必须加 --config Release，否则拿到的是 Debug 二进制（慢一个量级）")
 endif()
 
-# H800=90, RTX40xx=89, RTX30xx=86；台式机按需覆盖 -DCMAKE_CUDA_ARCHITECTURES=89
+# RTX30=86, RTX40=89, H800=90, RTX50(Blackwell)=120。交付包的 exe 由
+# scripts/build.bat 用 89;120 构建，覆盖现场两代卡；这里的默认值只在手工
+# cmake（Linux 居多）时生效，故多带 86/90。少列一档能减半 CUDA 编译时间，
+# 但漏掉的架构只能靠驱动 JIT 那份 PTX，首次启动会多等几十秒。
 if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86 89 90)
+  set(CMAKE_CUDA_ARCHITECTURES 86 89 90 120)
+endif()
+# sm_120 要 nvcc ≥ 12.8。老 toolkit 上给它是「Unsupported gpu architecture」
+# 编译失败，而不是忽略，所以在这里剔掉 —— 上面的默认值与 build.bat 传进来的
+# 显式列表都过这一道，老机器上不必改脚本。
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+  list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES 120)
+  message(WARNING "nvcc ${CMAKE_CUDA_COMPILER_VERSION} < 12.8，已剔除 sm_120：产物在 RTX50 上只能靠驱动 JIT")
 endif()
 
 find_package(CUDAToolkit REQUIRED)

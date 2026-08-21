@@ -19,6 +19,10 @@ ffmpeg/ffprobe、预烘 engine、ONNX + TRT 构建资源、拼接查找表、两
 （几分钟，之后秒开），不必回来重新打包。要省这 1.8 GB 就 SWIM_DIST_LEAN=1，
 代价是换架构即失效（trt_engine.cpp 会给出「请在本机重新构建后再打包」）。
 
+**换代显卡分两件事，别混**：engine 靠上面的 ONNX 现烘解决；**我们自己的 CUDA
+kernel 只能靠编进 exe 的 cubin**，ONNX 帮不上。所以 build.bat 默认按 89;120
+（RTX40 + RTX50/Blackwell）双架构编译，本脚本用 cuobjdump 核一遍并写进 README.txt。
+
 **增量包 = 相对最近一次全能包的累积差异** + 一个 update.bat（拷进目标目录）。
 通常只有 swim_analyse.exe 变（0.4 MB），改了权重才会带上 engine/ONNX。
 按 dist\<名>.manifest 判断「上次全能包里是什么」，所以必须先打过一次全能包。
@@ -91,6 +95,33 @@ if (-not (Test-Path -LiteralPath (Join-Path $Bin 'swim_analyse.exe'))) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $Root 'cpp\models\stitch.lut'))) {
   Die '缺少 cpp\models\stitch.lut，先跑 scripts\build.bat'
+}
+
+# exe 里带了哪些 GPU 架构的机器码。engine 能靠包内 ONNX 在目标机现烘，**我们自己的
+# CUDA kernel 不能** —— 它只有编进 exe 的那几档 cubin，缺了就退化成驱动 JIT 那份
+# PTX（首次启动多等几十秒，且是没验证过的路径）。build.bat 默认 89;120 覆盖
+# RTX40/50，这里只是拦住「用单架构构建目录打包」的情况，不改行为。
+# 优先问 cuobjdump（查的是真二进制），没装 CUDA 工具链就退到 CMakeCache 的配置值。
+$Arches = @()
+if (Get-Command cuobjdump.exe -EA SilentlyContinue) {
+  $Arches = (cuobjdump.exe --list-elf (Join-Path $Bin 'swim_analyse.exe') 2>$null |
+             Select-String -Pattern 'sm_\d+a?' -AllMatches).Matches.Value | Sort-Object -Unique
+}
+if (-not $Arches) {
+  $cache = Join-Path $Root 'cpp\build\CMakeCache.txt'
+  if (Test-Path -LiteralPath $cache) {
+    $line = Select-String -LiteralPath $cache -Pattern '^CMAKE_CUDA_ARCHITECTURES:.*=(.*)$' |
+            Select-Object -First 1
+    if ($line) { $Arches = $line.Matches[0].Groups[1].Value -split '[;, ]+' |
+                           Where-Object { $_ } | ForEach-Object { "sm_$_" } }
+  }
+}
+$missing = @('sm_89', 'sm_120') | Where-Object { $Arches -notcontains $_ }
+# 按数字排序而不是字符串（否则 sm_120 排在 sm_89 前面，读起来像漏了低档）
+$Arches = $Arches | Sort-Object { [int]($_ -replace '\D', '') }
+if ($Arches -and $missing) {
+  Say "警告：exe 只含 $($Arches -join ' ')，缺 $($missing -join ' ')"
+  Say '     那些卡上只能靠驱动 JIT。要原生支持就 set SWIM_CUDA_ARCH=89;120 后重跑 build.bat'
 }
 
 # engine 的文件名带身份戳（sm/TRT/batch/精度/onnx 戳），包里统一改成裸名 ——
@@ -296,6 +327,7 @@ rem Chinese notes are in README.txt.
 '@ 'cameras.txt' 'models\stitch.lut' '--cam-dir'
 
 $Arch = if ((Split-Path -Leaf $DetectEngine) -match '\.(sm\d+)-') { $Matches[1] } else { '未知架构' }
+$ArchList = if ($Arches) { $Arches -join ' ' } else { '未探测' }
 $Readme = @"
 游泳动作分析 —— 交付包
 ========================
@@ -317,8 +349,12 @@ $Readme = @"
 前置要求
 --------
 * NVIDIA 显卡，驱动 >= 550。就这一条。
-* 换了显卡架构也能跑：包里预烘的 engine 是 $Arch（RTX 40 系），架构不符时
-  程序会用包内的 ONNX 现场重烘，**首次运行多花几分钟**，之后秒开。
+* 支持的显卡代次：本包的 exe 编进了 $ArchList 的机器码
+  （sm_89 = RTX 40 系，sm_120 = RTX 50 系 / Blackwell）。这两代开箱即用。
+  更老的卡（30 系 sm_86 等）也能跑，但 CUDA kernel 要由驱动现场 JIT，
+  首次启动多等几十秒。
+* 换了显卡代次时 TensorRT engine 会自动重烘：包里预烘的那份是 $Arch，
+  与本机不符时程序用包内的 ONNX 现场重建，**首次运行多花几分钟**，之后秒开。
   重烘的 engine 落在 models/ 下，带 sm/TRT 版本戳，不会覆盖原来那份。
 
 相机侧配置（4K + 30fps）
