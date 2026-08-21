@@ -306,7 +306,8 @@ rem   run_1cam.bat <file.mp4>      any video file works too
 rem   run_1cam.bat --max-frames 300              flags pass through
 rem
 rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
-rem q/ESC = quit.
+rem q/ESC = quit. Resize or maximize it freely - the picture is scaled to
+rem fit and stays centred.
 rem
 rem Every frame runs detect + pose + tracking; nothing is replayed.
 rem Decoding goes through the bundled ffmpeg (about 78 fps here).
@@ -327,7 +328,8 @@ rem   run_6cam.bat --fps 30        force the time axis to 30fps
 rem   run_6cam.bat <list.txt>      use a different camera list
 rem
 rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
-rem q/ESC = quit. Toggles also apply to what --out writes.
+rem q/ESC = quit. Toggles also apply to what --out writes. Resize or
+rem maximize the window freely - the picture is scaled to fit and centred.
 rem
 rem Edit cameras.txt to match the venue's IPs. Camera names on the left must
 rem stay as they are - they are tied to the pool calibration in stitch.lut.
@@ -400,6 +402,9 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   2     分析框与 ID/划水/速度 标签开关
   3     米制标尺网格开关（每 1 m 一条，5 m 加粗标米数）
   q/ESC 退出
+
+窗口可随意拖拽缩放或最大化：画面按窗口等比放到最大并居中，四周补黑边，
+不会只占左上一角。--preview-scale 只决定初始窗口大小。
 
 窗口里看到的就是 --out 写进 mp4 的：热键切换会同时作用于落盘。
 想一开始就是某个状态，用 --no-kpts / --no-boxes / --grid。

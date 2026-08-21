@@ -452,8 +452,9 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
   }
 }
 
-/// 实时预览窗口。画布 5002x2102 装不进任何屏幕，先缩到 --preview-scale
-/// （默认自适应 1600x900 以内）再画标注，所以窗口里的字号/线宽是原生清晰度。
+/// 实时预览窗口。画布 5002x2102 装不进任何屏幕，先缩小再画标注，所以窗口里的
+/// 字号/线宽是原生清晰度而不是被一起缩糊。**窗口可自由缩放/最大化**：画面按当前
+/// 客户区等比放到最大并居中（letterbox），不会只占左上一角。
 ///
 /// 必须在**后处理线程**里构造与使用：Win32 的消息队列按线程分，窗口只能由
 /// 创建它的线程 pump（waitKey 做的就是 pump），跨线程会不刷新甚至卡住。
@@ -461,13 +462,17 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
 /// main 线程 SendMessage(WM_CLOSE) 反而会等一个已死的线程。
 class Preview {
  public:
+  /// scale 只决定**初始**窗口大小（0 = 自适应到 1600x900 以内）；之后随窗口变。
   Preview(int w, int h, float scale)
-      : s_(scale > 0 ? scale : std::min(1.f, std::min(1600.f / float(w),
-                                                     900.f / float(h)))) {
-    cv::namedWindow(kWin, cv::WINDOW_AUTOSIZE);
-    printf("[Preview] 窗口 %dx%d (x%.3f)，焦点在窗口上：q/ESC 退出，"
-           "1 关键点  2 分析框  3 米制网格\n",
-           int(float(w) * s_), int(float(h) * s_), s_);
+      : s0_(scale > 0 ? scale : std::min(1.f, std::min(1600.f / float(w),
+                                                      900.f / float(h)))) {
+    // 必须 WINDOW_NORMAL：AUTOSIZE 把窗口钉在图像尺寸上，最大化后画面仍按原
+    // 尺寸缩在左上角、四周留灰，且 resizeWindow 对它无效。
+    cv::namedWindow(kWin, cv::WINDOW_NORMAL);
+    cv::resizeWindow(kWin, int(float(w) * s0_), int(float(h) * s0_));
+    printf("[Preview] 窗口 %dx%d (x%.3f)，可缩放/最大化（等比居中）；"
+           "焦点在窗口上：q/ESC 退出，1 关键点  2 分析框  3 米制网格\n",
+           int(float(w) * s0_), int(float(h) * s0_), s0_);
     fflush(stdout);
   }
 
@@ -476,9 +481,13 @@ class Preview {
   /// 于是「窗口里看到的」与「写进 mp4 的」永远一致，无需第二份开关。
   bool show(const cv::Mat& raw, const FrameResult& fr, float kpt_thr,
             Overlay& ov, float ppm) {
-    cv::resize(raw, view_, {}, s_, s_, cv::INTER_AREA);
-    draw(view_, fr, kpt_thr, ov, ppm, s_);
-    cv::imshow(kWin, view_);
+    fit(raw.cols, raw.rows);
+    // 直接缩到画板的画面区里：尺寸与类型都和 roi_ 一致，resize 不会重新分配，
+    // 于是每帧只有一次缩放、零额外拷贝（黑边是建 pad_ 时就写好的）。
+    cv::Mat view = pad_(roi_);
+    cv::resize(raw, view, roi_.size(), 0, 0, cv::INTER_AREA);
+    draw(view, fr, kpt_thr, ov, ppm, s_);   // 标注画在画面区内，溢不到黑边上
+    cv::imshow(kWin, pad_);
     // waitKey 只在本线程（创建窗口的那个）有效，也是唯一能读到按键的地方。
     // 高位是修饰键与平台位，取低 8 位才能与字符比。
     const int k = cv::waitKey(1) & 0xff;
@@ -493,6 +502,21 @@ class Preview {
   }
 
  private:
+  /// 按当前客户区算「等比放到最大 + 居中」的画板与画面矩形；尺寸没变则沿用，
+  /// 所以稳态下只多一次 getWindowImageRect。自己做 letterbox 而不用
+  /// WINDOW_KEEPRATIO：后者在 Win32 后端与 Qt 后端行为不一致，自己算则处处相同。
+  void fit(int w, int h) {
+    const cv::Rect r = cv::getWindowImageRect(kWin);
+    const int cw = r.width  > 0 ? r.width  : int(float(w) * s0_);
+    const int ch = r.height > 0 ? r.height : int(float(h) * s0_);
+    if (cw == pad_.cols && ch == pad_.rows) return;
+    s_ = std::min(float(cw) / float(w), float(ch) / float(h));
+    const int vw = std::max(1, int(float(w) * s_));
+    const int vh = std::max(1, int(float(h) * s_));
+    pad_ = cv::Mat::zeros(ch, cw, CV_8UC3);   // 黑边只在这里建一次，之后恒黑
+    roi_ = cv::Rect((cw - vw) / 2, (ch - vh) / 2, vw, vh);
+  }
+
   static void toggle(bool& flag, const char* name) {
     flag = !flag;
     printf("\n[Preview] %s %s\n", name, flag ? "开" : "关");
@@ -500,8 +524,10 @@ class Preview {
   }
 
   static constexpr const char* kWin = "swim_analyse";
-  float   s_;
-  cv::Mat view_;
+  float    s0_;                         // 初始窗口缩放（--preview-scale）
+  float    s_ = 1.f;                    // 当前画面缩放，随窗口变
+  cv::Mat  pad_;                        // 整块客户区（画面 + 黑边）
+  cv::Rect roi_;                        // 画面在 pad_ 里的位置（居中）
 };
 
 }  // namespace
