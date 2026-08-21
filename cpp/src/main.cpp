@@ -379,15 +379,21 @@ class Writer {
 /// 所以画布 21 m = 0.5 + 20 + 0.5，横向 50 m 是完整池长、不需要内缩。
 /// 改了标定就核这几个顶点；写死一个常数是刻意的 —— 网格只是目视标尺，
 /// 不值得为它把 LUT 的几何再读一遍进来。
-constexpr double kGridMarginM = 0.5;
+constexpr double kGridMarginM = 0.5;    // 池岸宽：纵向刻度零点的内缩量
+constexpr double kLanePitchM  = 2.5;    // 泳道宽：粗线就是分道绳（8 条 = 20 m）
+constexpr int    kLaneSubdiv  = 5;      // 每条泳道均分 5 格 → 细线 0.5 m，与池岸同宽
 
-/// 米制标尺网格：按 --ppm 每 1 m 一条线，每 5 m 加粗并标米数，左下角写出泳池的
-/// 米制尺寸。用途是目视量距离、核对速度口径（速度 = 框中心位移 / ppm），
-/// 与标定的几何无关，所以只要 ppm 和画面尺寸，画布与六路现拼两条路完全一样。
+/// 米制标尺网格：**粗线是泳道分割线**（每 2.5 m，纵向正落在那 9 排分道绳上），
+/// 细线以它为基准把每条泳道均分 5 格（0.5 m）。用途是目视量距离、核对速度口径
+/// （速度 = 框中心位移 / ppm）；只用 --ppm 与画面尺寸换算，不读标定，所以画布与
+/// 六路现拼两条路画出来的是同一套刻度。
 /// 文案一律英文（图内文字规范），且画在缩放后的画面上，故坐标按 s 折算。
 void draw_grid(cv::Mat& img, float ppm, float s) {
   const double step = double(ppm) * double(s);        // 1 m 在当前画面上的像素数
-  if (step < 4.0) return;                             // 太密画满屏噪声，直接不画
+  const double lane = kLanePitchM * step;             // 一条泳道的像素宽
+  const double fine = lane / kLaneSubdiv;
+  if (lane < 4.0) return;                     // 连泳道线都挤成一团，画了只是噪声
+  const bool fine_ok = fine >= 4.0;           // 细线太密时只留泳道线，不整片糊掉
   const cv::Scalar thin{90, 90, 90}, bold{0, 210, 210};
   const double fs = std::max(0.35, 0.5 * double(s));
   const double off = kGridMarginM * step;             // 纵向 0 m 线的内缩量
@@ -398,14 +404,16 @@ void draw_grid(cv::Mat& img, float ppm, float s) {
   char buf[32];
   auto axis = [&](bool vertical) {
     const double o = vertical ? 0.0 : off, len = span[vertical ? 0 : 1];
-    for (int m = 0; double(m) * step <= len; ++m) {
-      const int p = int(o + double(m) * step);
-      const bool major = m % 5 == 0;
+    for (int k = 0; double(k) * fine <= len; ++k) {
+      const bool major = k % kLaneSubdiv == 0;
+      if (!major && !fine_ok) continue;
+      const int p = int(o + double(k) * fine);
       const cv::Point a = vertical ? cv::Point{p, 0} : cv::Point{0, p};
       const cv::Point b = vertical ? cv::Point{p, img.rows} : cv::Point{img.cols, p};
       cv::line(img, a, b, major ? bold : thin, 1, cv::LINE_AA);
-      if (!major || m == 0) continue;
-      snprintf(buf, sizeof buf, "%d", m);
+      if (!major || k == 0) continue;
+      // 只有粗线标米数。%g 去掉多余的 .0，于是 2.5 / 5 / 7.5 混排也整齐
+      snprintf(buf, sizeof buf, "%g", double(k) * kLanePitchM / kLaneSubdiv);
       const cv::Point at = vertical ? cv::Point{p + 3, int(off) + 14}
                                     : cv::Point{3, p - 3};
       cv::putText(img, buf, at, cv::FONT_HERSHEY_SIMPLEX, fs, bold, 1, cv::LINE_AA);
