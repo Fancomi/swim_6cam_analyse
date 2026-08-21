@@ -223,9 +223,9 @@ Write-Gen cameras.txt @'
 #   curl "http://<ip>/ctrl/stream_setting?index=stream0&venc=h264"
 #   curl "http://<ip>/ctrl/get?k=movfmt"             # 回读校验，相机会静默拒绝
 
-cam3=rtsp://192.168.3.101/live_stream
+cam1=rtsp://192.168.3.101/live_stream
 cam2=rtsp://192.168.3.102/live_stream
-cam1=rtsp://192.168.3.103/live_stream
+cam3=rtsp://192.168.3.103/live_stream
 cam4=rtsp://192.168.3.104/live_stream
 cam5=rtsp://192.168.3.105/live_stream
 cam6=rtsp://192.168.3.106/live_stream

@@ -50,6 +50,12 @@ class FrameSource {
   virtual int64_t total() const = 0;
   virtual const char* backend() const = 0;
 
+  /// 运行期健康状况的一行摘要，跟在 --show-fps 那行后面（空串则不显示）。
+  /// 存在的理由：端到端帧率掉了，要能当场分清是「某一路网络跟不上」还是
+  /// 「GPU/推理慢」—— 前者六路的到帧率会分叉，后者六路一起降。默认空实现，
+  /// 只有多路那条实现有意义（单路的到帧率就是端到端帧率，没有新信息）。
+  virtual std::string status() const { return {}; }
+
   /// uri 为视频文件路径或流地址（rtsp://、rtmp:// 等）。
   /// prefetch=true 时内部起一个解码线程预取，使解码与推理真正重叠 ——
   /// 5002x2102 的 CPU 解码 13~17 ms/帧，不重叠会直接吃掉一半吞吐。

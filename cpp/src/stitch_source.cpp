@@ -210,6 +210,8 @@ class NvdecLane {
   /// 实际用上的 cuvid 解码器名（h264_cuvid / hevc_cuvid），给启动摘要用。
   const char* codec() const { return codec_ ? codec_ : "?"; }
   int64_t reconnects() const { return reconnects_; }
+  /// 解出并入队的累计帧数。无锁：只给 --show-fps 算「本路到帧率」，差一帧无碍。
+  int64_t decoded() const { return decoded_; }
   int64_t dropped() const {                 // 只在 live_ 下非零
     std::lock_guard<std::mutex> lk(mu_);
     return dropped_;
@@ -427,6 +429,7 @@ class NvdecLane {
         ++dropped_;
       }
       queue_.push(f);
+      ++decoded_;
       cv_ready_.notify_one();
     }
     finish(nullptr);
@@ -468,6 +471,7 @@ class NvdecLane {
   std::queue<AVFrame*>    queue_;
   bool                    stop_ = false, done_ = false;
   int64_t                 dropped_ = 0;     // 因追不上而丢弃的帧数（只在 live_）
+  std::atomic<int64_t>    decoded_{0};      // 解出并入队的帧数（--show-fps 用）
   std::exception_ptr      err_;
 };
 
@@ -717,6 +721,8 @@ class StitchFrameSource final : public FrameSource {
       started_ = true;
       printf("[Stitch] 模型已就绪，开始取帧（%d 路解码线程）\n", lut_->lanes());
       fflush(stdout);
+      stat_decoded_.assign(lanes_.size(), 0);   // 到帧率的差分基准从此刻起算
+      stat_ms_ = now_ms();
       for (auto& lane : lanes_)
         if (lane) lane->start(pace_, fps_);
     }
@@ -798,6 +804,34 @@ class StitchFrameSource final : public FrameSource {
   int64_t total()  const override { return total_; }
   const char* backend() const override { return "nvdec-stitch"; }
 
+  /// 每路的**到帧率**（上次调用以来解出的帧数 / 墙钟）+ 三项累计计数。
+  /// 端到端帧率掉下来时，这一行当场把责任分清：某一路明显低于其余路 = 那台相机
+  /// 或它那段网络的问题；六路一起低 = 下游（NVDEC 吞吐 / 推理）跟不上。
+  /// 从前这三项只在退出时打一次，掉帧发生在运行中却看不见，只能事后猜。
+  std::string status() const override {
+    const double t = now_ms();
+    const double dt = (t - stat_ms_) / 1000.0;
+    stat_ms_ = t;
+    std::string s = "| 到帧";
+    char buf[32];
+    int64_t drops = 0, recon = 0;
+    for (size_t i = 0; i < lanes_.size(); ++i) {
+      const int64_t d = lanes_[i] ? lanes_[i]->decoded() : 0;
+      snprintf(buf, sizeof buf, " %.1f",
+               dt > 0 ? double(d - stat_decoded_[i]) / dt : 0.0);
+      stat_decoded_[i] = d;
+      s += buf;
+      if (lanes_[i] && lanes_[i]->live()) {
+        drops += lanes_[i]->dropped();
+        recon += lanes_[i]->reconnects();
+      }
+    }
+    snprintf(buf, sizeof buf, " 丢%lld 顶%lld 重连%lld",
+             static_cast<long long>(drops), static_cast<long long>(held_),
+             static_cast<long long>(recon));
+    return s + buf;
+  }
+
  private:
   /// 给同一张 surface 再加一个引用（不拷像素）。用于「掉线时顶住的上一帧」：
   /// 它与画布环里的那一份指向同一块显存，各自 av_frame_free 独立计数。
@@ -831,6 +865,10 @@ class StitchFrameSource final : public FrameSource {
   double  fps_ = 0;
   int64_t total_ = -1, idx_ = 0;
   int64_t held_ = 0;                   // 整帧都是「顶住的旧帧」的次数
+  // status() 的差分基准。const 方法里要更新，故 mutable —— 它只被后处理线程
+  // （--show-fps 的打印处）调用，单读者，不需要加锁。
+  mutable double               stat_ms_ = 0;
+  mutable std::vector<int64_t> stat_decoded_;
   bool    pace_ = false;               // 混合来源：离线路按帧率限速
   bool    started_ = false;            // 解码线程已起（首次 next() 时置位）
 };

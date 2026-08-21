@@ -372,34 +372,48 @@ class Writer {
   int64_t frames_ = 0;
 };
 
-/// 米制标尺网格：按 --ppm 每 1 m 一条线，每 5 m 加粗并标米数，左上角写出画布的
+/// 画布纵向两端各有一条池岸不属于水面，网格的 0 m 线要落在池边而不是画布边缘。
+/// 取值来自标定本身：`configs/pool_mesh.json` 的 y 顶点是
+/// 4.2358 / 4.7358 / 7.2358 … 22.2358 / 24.7358 / 25.2358 —— 中间 9 行按 2.5 m
+/// 等距（8 条泳道，正好是转出的画布里那 9 排红色分道绳），首尾各多出 0.5 m。
+/// 所以画布 21 m = 0.5 + 20 + 0.5，横向 50 m 是完整池长、不需要内缩。
+/// 改了标定就核这几个顶点；写死一个常数是刻意的 —— 网格只是目视标尺，
+/// 不值得为它把 LUT 的几何再读一遍进来。
+constexpr double kGridMarginM = 0.5;
+
+/// 米制标尺网格：按 --ppm 每 1 m 一条线，每 5 m 加粗并标米数，左下角写出泳池的
 /// 米制尺寸。用途是目视量距离、核对速度口径（速度 = 框中心位移 / ppm），
-/// 与标定无关，所以只要 ppm 和画面尺寸，画布与六路现拼两条路完全一样。
+/// 与标定的几何无关，所以只要 ppm 和画面尺寸，画布与六路现拼两条路完全一样。
 /// 文案一律英文（图内文字规范），且画在缩放后的画面上，故坐标按 s 折算。
 void draw_grid(cv::Mat& img, float ppm, float s) {
   const double step = double(ppm) * double(s);        // 1 m 在当前画面上的像素数
   if (step < 4.0) return;                             // 太密画满屏噪声，直接不画
   const cv::Scalar thin{90, 90, 90}, bold{0, 210, 210};
   const double fs = std::max(0.35, 0.5 * double(s));
+  const double off = kGridMarginM * step;             // 纵向 0 m 线的内缩量
+  // 竖线沿 x 量池长（从画布左边缘起，跨度即 50 m 池长）；横线沿 y 量池宽
+  // （从池边起，两端各扣掉一条池岸）。两者只差起点与跨度，故共用一个 lambda。
+  const double span[2] = {double(img.cols),
+                          std::max(0.0, double(img.rows) - 2.0 * off)};
   char buf[32];
   auto axis = [&](bool vertical) {
-    const int len = vertical ? img.cols : img.rows;
-    for (int m = 0; double(m) * step < double(len); ++m) {
-      const int p = int(double(m) * step);
+    const double o = vertical ? 0.0 : off, len = span[vertical ? 0 : 1];
+    for (int m = 0; double(m) * step <= len; ++m) {
+      const int p = int(o + double(m) * step);
       const bool major = m % 5 == 0;
       const cv::Point a = vertical ? cv::Point{p, 0} : cv::Point{0, p};
       const cv::Point b = vertical ? cv::Point{p, img.rows} : cv::Point{img.cols, p};
       cv::line(img, a, b, major ? bold : thin, 1, cv::LINE_AA);
       if (!major || m == 0) continue;
       snprintf(buf, sizeof buf, "%d", m);
-      const cv::Point at = vertical ? cv::Point{p + 3, 14} : cv::Point{3, p - 3};
+      const cv::Point at = vertical ? cv::Point{p + 3, int(off) + 14}
+                                    : cv::Point{3, p - 3};
       cv::putText(img, buf, at, cv::FONT_HERSHEY_SIMPLEX, fs, bold, 1, cv::LINE_AA);
     }
   };
   axis(true);
   axis(false);
-  snprintf(buf, sizeof buf, "%.1f x %.1f m", double(img.cols) / step,
-           double(img.rows) / step);
+  snprintf(buf, sizeof buf, "%.1f x %.1f m", span[0] / step, span[1] / step);
   cv::putText(img, buf, {3, img.rows - 5}, cv::FONT_HERSHEY_SIMPLEX, fs, bold, 1,
               cv::LINE_AA);
 }
@@ -609,9 +623,11 @@ int main(int argc, char** argv) try {
     }
     if (a.show_fps && now_ms() - last_log > 1000) {
       const double el = (now_ms() - t0) / 1000.0;
-      printf("\r[%.0fs] %lld 帧 %.1f fps  当前 %zu 人   ", el,
+      // 源侧摘要（六路现拼才有：每路到帧率 + 丢/顶/重连）跟在后面。掉帧时能当场
+      // 分清是「某一路网络」还是「下游算不过来」，见 FrameSource::status()。
+      printf("\r[%.0fs] %lld 帧 %.1f fps  当前 %zu 人 %s  ", el,
              static_cast<long long>(fr.index + 1), (fr.index + 1) / el,
-             fr.persons.size());
+             fr.persons.size(), src->status().c_str());
       fflush(stdout);
       last_log = now_ms();
     }
