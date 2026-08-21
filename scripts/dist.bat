@@ -6,9 +6,19 @@ rem
 rem Two levels, matching "first copy" vs "every update after that":
 rem
 rem   dist.bat            FULL     -> dist\swim_analyse\         about 3.0 GB
-rem   dist.bat inc        UPDATE   -> dist\swim_analyse_update\  only what changed
+rem   dist.bat inc        UPDATE   -> dist\swim_analyse_update\  about 0.5 MB
+rem   dist.bat rebase     mark the current FULL package as "what the target has"
 rem   dist.bat zip        FULL + dist\swim_analyse.zip
 rem   dist.bat inc zip    UPDATE + zip
+rem
+rem The UPDATE package always carries the base files (exe + launchers + README,
+rem 0.5 MB together) and adds a big file (DLL / ffmpeg / engine / ONNX / lut)
+rem only when its md5 differs from the baseline. The baseline is written once,
+rem by the first FULL package, and after that only by "dist.bat rebase" - run
+rem that right after you actually deploy a FULL package. Packaging locally is
+rem not deploying, so it must not move the baseline: it would then think the
+rem target already has files it never received, and the update would silently
+rem miss them.
 rem
 rem Both levels build first (cmake --build is a no-op when nothing changed), so
 rem "double-click, wait, copy the folder" is the whole workflow.
@@ -26,9 +36,11 @@ cd /d "%~dp0.."
 
 set "MODE="
 set "ZIP="
+set "REBASE="
 :args
 if "%~1"=="" goto :parsed
 if /I "%~1"=="inc" set "MODE=-Inc"
+if /I "%~1"=="rebase" set "REBASE=1"
 if /I "%~1"=="zip" set "ZIP=-Zip"
 rem shift /1 leaves %0 alone. Plain "shift" moves %0 to %1, and then the
 rem %~dp0 below resolves to the current directory instead of scripts\ -
@@ -37,6 +49,11 @@ shift /1
 goto :args
 :parsed
 
+rem rebase only rewrites the baseline; it must hash exactly the files the last
+rem FULL package shipped, so it deliberately skips the build step (a rebuild
+rem could re-export the ONNX and move every engine stamp).
+if defined REBASE goto :rebase
+
 rem 1) build. Skips whatever is already done; SWIM_NO_PAUSE keeps it from
 rem    stopping for a keypress in the middle of this script.
 echo.
@@ -44,6 +61,18 @@ echo [dist] step 1/2  build
 set "SWIM_NO_PAUSE=1"
 call "%~dp0build.bat" || goto :fail
 set "SWIM_NO_PAUSE="
+goto :package
+
+:rebase
+echo.
+echo [dist] rebase baseline (no build, no package)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist.ps1" -Rebase || goto :fail
+echo.
+echo [dist] ok.
+set "RC=0"
+goto :end
+
+:package
 
 rem 2) package. Windows PowerShell 5.1 ships with the OS, so packaging needs no
 rem    extra tooling - no Git Bash, no coreutils. -ExecutionPolicy Bypass because
@@ -60,15 +89,13 @@ echo.
 echo [dist] ok.
 set "RC=0"
 if not defined MODE goto :say_full
-rem dist.ps1 removes the update folder when nothing changed, so check
-rem before telling anyone to copy it.
-if not exist "dist\swim_analyse_update" goto :end
 echo        Copy dist\swim_analyse_update\ to the target machine and
 echo        double-click update.bat inside it.
 goto :end
 :say_full
 echo        Copy dist\swim_analyse\ to the target machine and
 echo        double-click run_6cam.bat inside it. Nothing to install there.
+echo        Once it is deployed, run: scripts\dist.bat rebase
 goto :end
 
 :fail

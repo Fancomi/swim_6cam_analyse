@@ -65,7 +65,8 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | 命令 | 产物 | 大小 |
 | --- | --- | --- |
 | `dist.bat` / `dist.ps1` | 全能包 `dist/swim_analyse/` | 约 3.0 GB / 42 文件 |
-| `dist.bat inc` / `dist.ps1 -Inc` | 增量包 `dist/swim_analyse_update/` + `update.bat` | 通常 0.4 MB |
+| `dist.bat inc` / `dist.ps1 -Inc` | 增量包 `dist/swim_analyse_update/` + `update.bat` | 0.5 MB |
+| `dist.bat rebase` / `dist.ps1 -Rebase` | 只重写基准，不构建不出包 | — |
 | 追加 `zip` / `-Zip` | 同名 `.zip`（Windows 自带 `tar.exe -a`，退到 `Compress-Archive`） | — |
 
 **打包用 PowerShell 而不是 bash**：交付链路只在 Windows 上跑，不该拖上 Git Bash 这个
@@ -93,9 +94,20 @@ CUDA kernel 只能靠编进 exe 的 cubin**（`kernels.cu` / `stitch.cu`），ON
 交付包的 `README.txt`。TRT 侧不必担心：`nvinfer_10.dll` 自带 sm_100/103/120 的 cubin。
 缺档不会报错，只是退化成驱动 JIT 那份 PTX —— 首次启动多等几十秒，没验证过。
 
-**增量包 = 相对最近一次全能包的累积差异**，按 `dist/<名>.manifest`（只在全能包时写）
-判断，所以必须先打过全能包；累积而非逐次差分，中间漏几个增量包也只需应用最新的。
+**增量包 = 基础件（每次必带）+ 变了的大件**。基础件是 exe 与三个生成文本
+（两个入口 + `README.txt`），合 0.5 MB —— 改代码只动这几个，不值得为省这点体积去赌
+「检测对不对」，所以一律带上、不做判断。大件（DLL / ffmpeg / engine / ONNX /
+`stitch.lut`）按 `dist/<名>.manifest` 比 md5，真变了才进包，并打印一行提示
+「建议改打全能包」。
 `update.bat` **只覆盖不删除**，且跳过 `cameras.txt`（现场 IP 在里面）。
+
+**基准（manifest）只在第一次全能包时写，之后只有 `dist.bat rebase` 会重写。**
+它记的是「**目标机手上是哪一份**」，而本地多打一次全能包并不等于拷过去了：旧实现
+每次全能包都覆盖它，于是「打了全能包 #2 没部署、接着打增量」会把 #2 当基准，漏掉
+目标机其实还缺的大件（现场表现为更新完仍是旧行为）。所以流程是
+**打全能包 → 拷去部署 → `dist.bat rebase`**；忘了 rebase 只会让后续增量多带几个
+大件，不会漏，方向是安全的那一边。`rebase` 刻意不跑 `build.bat`（重新构建可能重导
+ONNX、把每个 engine 的身份戳都推走）。
 
 一份清单（`<md5> <包内路径> <源路径>`）同时喂两级，两者对「包里该有什么」不会分叉；
 顺手拿到的 md5 又当拷贝校验 —— 一次静默坏拷贝在目标机上表现为「反序列化失败」，

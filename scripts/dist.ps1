@@ -2,7 +2,8 @@
 打交付包。两级，对应「第一次拷过去」与「之后每次更新」：
 
   scripts\dist.bat            全能包  dist\swim_analyse\         约 3.0 GB
-  scripts\dist.bat inc        增量包  dist\swim_analyse_update\  只含变了的文件
+  scripts\dist.bat inc        增量包  dist\swim_analyse_update\  约 0.5 MB
+  scripts\dist.bat rebase     把「目标机手上是哪一份」更新为当前全能包
   scripts\dist.bat zip        顺手压一个同名 .zip
   powershell -File scripts\dist.ps1 -Out D:\x    换输出位置
 
@@ -23,14 +24,22 @@ ffmpeg/ffprobe、预烘 engine、ONNX + TRT 构建资源、拼接查找表、两
 kernel 只能靠编进 exe 的 cubin**，ONNX 帮不上。所以 build.bat 默认按 89;120
 （RTX40 + RTX50/Blackwell）双架构编译，本脚本用 cuobjdump 核一遍并写进 README.txt。
 
-**增量包 = 相对最近一次全能包的累积差异** + 一个 update.bat（拷进目标目录）。
-通常只有 swim_analyse.exe 变（0.4 MB），改了权重才会带上 engine/ONNX。
-按 dist\<名>.manifest 判断「上次全能包里是什么」，所以必须先打过一次全能包。
-累积而非逐次差分：中间漏掉几个增量包也没关系，只应用最新的那个就对了。
+**增量包 = 基础件（每次必带）+ 变了的大件** + 一个 update.bat（拷进目标目录）。
+基础件只有 exe 与三个生成的文本（两个入口 + README），合起来约 0.5 MB —— 改代码
+只动这几个，不值得为省这点体积去赌「检测对不对」，所以一律带上，不做判断。
+大件（DLL / ffmpeg / engine / ONNX / stitch.lut）按 dist\<名>.manifest 比 md5，
+真变了才进包；有大件进包就说明该重打一次全能包，日志会点出来。
+
+manifest 只在**第一次**全能包时写，之后要用 dist.bat rebase 才重写。它记的是
+「目标机手上是哪一份」，而本地多打一次全能包并不等于拷过去了：旧实现每次全能包
+都覆盖它，于是「打了全能包 #2 没部署、接着打增量」会把 #2 当基准，漏掉目标机其实
+还缺的大件（现场表现为更新完仍是旧行为）。把全能包拷去部署之后再 rebase。
+基准偏旧只会让增量多带几个大件，不会漏 —— 方向是安全的那一边。
 #>
 [CmdletBinding()]
 param(
   [switch]$Inc,
+  [switch]$Rebase,
   [switch]$Zip,
   [string]$Out
 )
@@ -46,7 +55,8 @@ $Bin      = Join-Path $Root 'cpp\build\Release'
 $TrtLib   = if ($env:SWIM_TRT_LIB) { $env:SWIM_TRT_LIB }
             else { 'D:\WindowsProject\workspace\TRT\TensorRT-10.11.0.33\lib' }
 $Lean     = $env:SWIM_DIST_LEAN -eq '1'
-$Manifest = "$Out.manifest"   # 全能包写、增量包读：上次包里有哪些文件与其 md5
+# 「目标机手上是哪一份」。全能包首次写，之后只有 -Rebase 会重写 —— 见文件头。
+$Manifest = "$Out.manifest"
 
 # 生成的文本文件（清单模板 / 入口 / README）先落到这里，再与拷贝的文件走同一条
 # 「md5 -> 比清单 -> 入包」的路，增量包才能自动带上改过的入口脚本。
@@ -138,15 +148,19 @@ function Get-Engine ($what) {   # detect|pose -> 最新那份的完整路径
 # 一份清单同时喂全能包与增量包，两者对「包里该有什么」的理解不可能分叉。
 # 顺手拿到的 md5 又当了拷贝校验：engine 有一百多兆，一次静默的坏拷贝会让目标机报
 # 「反序列化失败 / 与本机架构不匹配」，把人引向完全错误的方向（实测踩过一次）。
-$Plan = New-Object Collections.ArrayList   # 每项：@{ Md5; Rel; Src }
+#
+# Base=$true 的是「基础件」：改代码就会变、又小（合起来 0.5 MB），增量包一律带上
+# 不做 md5 判断 —— 判断本身才是风险源（基准偏了就静默漏更新），省的体积不值当。
+# 其余是「大件」，按 manifest 比 md5，真变了才进包。
+$Plan = New-Object Collections.ArrayList   # 每项：@{ Md5; Rel; Src; Base }
 function Get-Md5 ($p) { (Get-FileHash -LiteralPath $p -Algorithm MD5).Hash.ToLower() }
-function Add-File ($src, $rel) {   # $rel 省略则取源的文件名
+function Add-File ($src, $rel, [switch]$Base) {   # $rel 省略则取源的文件名
   if (-not $rel) { $rel = Split-Path -Leaf $src }
   if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Die "清单里的文件不存在: $src" }
-  $Plan.Add(@{ Md5 = (Get-Md5 $src); Rel = $rel; Src = $src }) | Out-Null
+  $Plan.Add(@{ Md5 = (Get-Md5 $src); Rel = $rel; Src = $src; Base = [bool]$Base }) | Out-Null
 }
 
-Add-File (Join-Path $Bin 'swim_analyse.exe')
+Add-File (Join-Path $Bin 'swim_analyse.exe') -Base
 Get-ChildItem -Path (Join-Path $Bin '*.dll') | ForEach-Object { Add-File $_.FullName }
 foreach ($d in 'nvinfer_10.dll', 'nvonnxparser_10.dll') {
   $p = Join-Path $TrtLib $d
@@ -189,9 +203,9 @@ function Write-Text ($path, $text, $bom) {
   $text = (($text -replace "`r`n", "`n").TrimEnd("`n") + "`n") -replace "`n", "`r`n"
   [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $bom))
 }
-function Write-Gen ($name, $text, $bom) {
+function Write-Gen ($name, $text, $bom, [switch]$Base) {
   Write-Text (Join-Path $Gen $name) $text $bom
-  Add-File (Join-Path $Gen $name) $name
+  Add-File (Join-Path $Gen $name) $name -Base:$Base
 }
 
 # 相机名必须与 stitch.lut 里的一致（由 configs\pool_mesh.json 的 meshes 顺序定），
@@ -291,7 +305,7 @@ echo.
 echo Press any key to close...
 pause >nul
 endlocal
-"@ $false
+"@ $false -Base
 }
 
 Write-Launcher run_1cam.bat @'
@@ -411,9 +425,10 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
 
 怎么更新
 --------
-开发侧双击 scripts\dist.bat inc 出一个增量包（通常只有几百 KB），把整个
-swim_analyse_update 文件夹拷进本目录，双击里面的 update.bat 即可。
+开发侧双击 scripts\dist.bat inc 出一个增量包（约 0.5 MB：程序本体 + 两个入口 +
+本文件），把整个 swim_analyse_update 文件夹拷进本目录，双击里面的 update.bat。
 它只覆盖不删除，也不动 cameras.txt（现场 IP 在里面）。不要手工挑文件拷。
+增量包里若还带了 models\ 或 DLL，说明模型/依赖也变了，照样双击即可。
 
 看不懂报错时
 ------------
@@ -444,7 +459,7 @@ swim_analyse_update 文件夹拷进本目录，双击里面的 update.bat 即可
   六路现拼 + 分析   约 38 fps（瓶颈是 NVDEC，六路 4K 已把解码器跑满）
   加 --out 落盘     约 27~35 fps（libx264 与解码抢 CPU）
 "@
-Write-Gen README.txt $Readme $true
+Write-Gen README.txt $Readme $true -Base
 
 # ── 出包 ────────────────────────────────────────────────────────────────────
 # 拷完逐字节复核。目标是 engine/lut 这些一百多兆的大文件：一次静默的坏拷贝在
@@ -460,23 +475,40 @@ function Copy-Verified ($md5, $src, $dst) {
 if ($Inc) {
   $Out = "${Out}_update"
   if (-not (Test-Path -LiteralPath $Manifest)) {
-    Die "找不到 $Manifest：增量是相对上一次全能包的，先跑一次 scripts\dist.bat"
+    Die "找不到 $Manifest：先跑一次 scripts\dist.bat 出全能包（它建立这个基准）"
   }
+}
+
+# rebase 只重写基准，不出包。语义是「刚把全能包部署到目标机了」——
+# 之后的增量就相对这一份算大件差异。刻意做成显式动作：本地多打几次全能包
+# 并不等于部署过，让打包去猜就会静默漏更新（这正是旧实现的问题）。
+if ($Rebase) {
+  if (-not (Test-Path -LiteralPath $Manifest)) { Die "找不到 $Manifest：先跑一次 scripts\dist.bat" }
+  Write-Text $Manifest (($Plan | ForEach-Object { "$($_.Md5) $($_.Rel)" }) -join "`n") $false
+  Say "已把基准更新为当前全能包（$($Plan.Count) 个文件）。之后的增量只带基础件 + 变了的大件"
+  Remove-Gen
+  exit 0
 }
 
 Remove-Item -LiteralPath $Out -Recurse -Force -EA SilentlyContinue
 New-Item -ItemType Directory -Path $Out -Force | Out-Null
 
-# 增量包：md5 与上次全能包里一致就跳过。整行比对（md5 + 包内路径），避免
-# 「md5 相同但路径不同」或「路径相同但 md5 不同」被当成命中。
+# 增量包的取舍：基础件（exe + 入口 + README，合 0.5 MB）无条件带；大件按整行
+# 比对基准（md5 + 包内路径，避免「md5 同而路径不同」或反之被当成命中）。
 # @() 包一层：清单只剩一行时 Get-Content 返回单个字符串，直接转 HashSet[string]
 # 会按 IEnumerable<char> 拆成一堆单字符。
-$Base = if ($Inc) {
+$Have = if ($Inc) {
   [Collections.Generic.HashSet[string]] @(Get-Content -LiteralPath $Manifest)
 } else { $null }
 $n = 0
+# 增量里进包的大件。cameras.txt 不算：它是模板，update.bat 刻意跳过不覆盖
+# （现场 IP 在里面），带上只是提醒人去手工 diff，不代表目标机的依赖过时。
+$bigs = New-Object Collections.ArrayList
 foreach ($it in $Plan) {
-  if ($Inc -and $Base.Contains("$($it.Md5) $($it.Rel)")) { continue }
+  if ($Inc -and -not $it.Base) {
+    if ($Have.Contains("$($it.Md5) $($it.Rel)")) { continue }
+    if ($it.Rel -ne 'cameras.txt') { $bigs.Add($it.Rel) | Out-Null }
+  }
   Copy-Verified $it.Md5 $it.Src (Join-Path $Out $it.Rel)
   $n++
 }
@@ -488,16 +520,16 @@ function Show-Size ($p) {   # 目录或文件的总字节 -> 人话
 }
 
 if (-not $Inc) {
-  # 清单只在全能包时写：增量包是相对「上次完整拷过去的那份」，不该移动这个基准
-  Write-Text $Manifest (($Plan | ForEach-Object { "$($_.Md5) $($_.Rel)" }) -join "`n") $false
+  # 基准只在第一次建立，之后要 dist.bat rebase 才动 —— 见文件头那段。
+  if (Test-Path -LiteralPath $Manifest) {
+    Say "基准保持不变（$(Split-Path -Leaf $Manifest)）。这份全能包部署到目标机后跑 scripts\dist.bat rebase"
+  } else {
+    Write-Text $Manifest (($Plan | ForEach-Object { "$($_.Md5) $($_.Rel)" }) -join "`n") $false
+    Say "已建立基准 $(Split-Path -Leaf $Manifest)：之后的增量相对这一份算"
+  }
   Say "全能包 $n 个文件 $(Show-Size $Out)$(if ($Lean) { '（精简）' })"
   Say "engine: $(Split-Path -Leaf $DetectEngine) -> models\detect.engine"
   Say "目标机零安装：自带 cudart / VC 运行库 / ffmpeg$(if (-not $Lean) { ' / ONNX + TRT 构建资源' })"
-} elseif ($n -eq 0) {
-  Remove-Item -LiteralPath $Out -Force
-  Say '增量包：与上次全能包无差异，什么都不用拷'
-  Remove-Gen
-  exit 0
 } else {
   # 覆盖脚本。刻意不删目标目录里的旧文件：增量只做覆盖，删文件要人来判断
   # （目标机上可能有现场改过的 cameras.txt、跑出来的 json、重烘的 engine）。
@@ -561,6 +593,11 @@ endlocal & exit /b %RC%
 '@
   Write-Text (Join-Path $Out 'update.bat') $upd $false
   Say "增量包 $n 个文件 $(Show-Size $Out) + update.bat"
+  if ($bigs.Count) {
+    # 大件进了增量包，说明目标机手上那份的模型/依赖已经过时。增量能覆盖，
+    # 但一路累积下去就不再是「几百 KB 的小更新」，该重打一次全能包并 rebase。
+    Say "注意：本次带上了大件（$($bigs -join ' ')）—— 建议改打全能包，部署后 scripts\dist.bat rebase"
+  }
   Say "用法：整个 $(Split-Path -Leaf $Out)\ 拷到目标机，双击里面的 update.bat"
 }
 
