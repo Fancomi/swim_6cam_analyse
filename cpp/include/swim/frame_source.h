@@ -62,10 +62,14 @@ class FrameSource {
   /// ring 为环深度，须 >= 2（预取需要至少一格给消费者、一格给生产者）。
   /// fps > 0 时覆盖容器/流自报的帧率（时间轴由它定）：直播流常报错帧率，
   /// 实测 ZCam 的 rtsp 在 MSMF 下报 30.00 而真值 59.94，划水与速度会整体偏。
+  /// rot180 让画面整体转 180°（尺寸不变）。**定向是帧源的职责**，各后端在自己
+  /// 本来就要过一遍像素的地方顺手做掉，链路下游一律不知道有这回事：ffmpeg 管道
+  /// 交给子进程的滤镜（与本进程的 GPU 工作天然并行，不占显存带宽）；OpenCV 兜底
+  /// 路没有滤镜链，只能整帧再搬一次，故直接拒绝（用 --decoder auto）。
   static std::unique_ptr<FrameSource> open(const std::string& uri,
                                            DecoderPref pref = DecoderPref::Auto,
-                                           double fps = 0, int ring = 4,
-                                           bool prefetch = true);
+                                           double fps = 0, bool rot180 = false,
+                                           int ring = 4, bool prefetch = true);
 };
 
 }  // namespace swim

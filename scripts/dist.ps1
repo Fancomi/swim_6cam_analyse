@@ -295,7 +295,11 @@ echo   source : %SRC%
 echo   press q or ESC on the preview window to stop
 echo.
 
-"%EXE%" $flag "%SRC%" --models models --preview --show-fps%ARGS%
+rem The canvas is rendered rotated 180 degrees (the rig hangs upside down).
+rem It costs nothing: the stitch kernel just writes each pixel to the mirrored
+rem slot, and the single-camera path lets the decoder do it. Append
+rem --no-rot180 to turn it off - later flags win over the ones set here.
+"%EXE%" $flag "%SRC%" --models models --preview --show-fps --rot180%ARGS%
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" echo [error] exited with code %RC% - see README.txt
@@ -318,6 +322,7 @@ rem   double-click                 use the URL below
 rem   run_1cam.bat rtsp://1.2.3.4/live_stream    override it
 rem   run_1cam.bat <file.mp4>      any video file works too
 rem   run_1cam.bat --max-frames 300              flags pass through
+rem   run_1cam.bat --no-rot180     render upright (180 rotation is the default)
 rem
 rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
 rem q/ESC = quit. Resize or maximize it freely - the picture is scaled to
@@ -340,10 +345,15 @@ rem   run_6cam.bat --json out.json      also write per-swimmer results
 rem   run_6cam.bat --out out.mp4        also write an annotated video
 rem   run_6cam.bat --fps 30        force the time axis to 30fps
 rem   run_6cam.bat --ghost 0       stop holding boxes over detector misses
+rem   run_6cam.bat --no-rot180     render upright (180 rotation is the default)
 rem   run_6cam.bat <list.txt>      use a different camera list
 rem
 rem A box that the detector missed is held in place for 5 frames, drawn just
 rem like a real one; held boxes never enter the counts or --json.
+rem
+rem The picture comes out rotated 180 degrees, which is how the rig is hung.
+rem The rotation is free: it happens where the pixels are already being written
+rem (stitch destination index / decoder filter), not in a second pass.
 rem
 rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
 rem q/ESC = quit. Toggles also apply to what --out writes. Resize or
@@ -413,7 +423,16 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   run_6cam.bat --preview-scale 0.4  预览窗口缩放比
   run_6cam.bat --fps 30             按 30fps 算时间轴（流报错帧率时用）
   run_6cam.bat --ghost 0            关掉丢检占位（默认停 5 帧，画法同真检出）
+  run_6cam.bat --no-rot180          画面转回正向（两个入口默认都转 180°）
   swim_analyse.exe --help           全部参数
+
+画面为什么是转 180° 的
+----------------------
+机位是倒挂的，所以两个入口都默认加了 --rot180。这个旋转**不是后处理**：六路那条
+路只是把拼接 kernel 的写入落点改成对角镜像（读写次数一模一样），单相机那条路交给
+解码器的滤镜顺手做掉，两者都不多花一帧的时间、也不多占一块显存。画布尺寸不变，
+相机顺序、标定、检测与统计全都不受影响。临时想看正向就追加 --no-rot180 ——
+后写的参数生效。
 
 预览窗口的热键（焦点要在窗口上）
 --------------------------------

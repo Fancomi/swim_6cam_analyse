@@ -66,6 +66,9 @@ struct Args {
   std::string dump_canvas;              // 首帧画布原样落 PNG（拼接对照用）
   Overlay     ov;                       // 叠加层初始状态
   bool        show_fps = false, preview = false;
+  /// 画面整体转 180°。**由帧源就地完成**（六路拼接改落点、单画布走解码器滤镜），
+  /// 不是后处理：下游拿到的画布本身就已转好，检测/跟踪/渲染全不知道有这回事。
+  bool        rot180 = false;
   float       preview_scale = 0.f;      // 0 = 自适应到 1600x900 以内
   float       fps = 0.f;                // 0 = 用源自报的帧率
   DecoderPref decoder   = DecoderPref::Auto;
@@ -173,6 +176,12 @@ std::vector<HelpRow> help_rows() {
     {"--grid", "", sfmt("启动时画米制标尺网格，每 1 m 一条 (默认%s画，\n"
                         "预览中按 3 切换；间距由 --ppm 决定)",
                         a.ov.grid ? "" : "不")},
+    {"--rot180", "", sfmt("画面整体转 180°（默认%s转，尺寸不变）。在帧源里就地\n"
+                          "完成而非后处理：六路拼接只改写入落点，单画布走解码器\n"
+                          "滤镜，两者都零额外开销；检测与统计不受影响。\n"
+                          "--no-rot180 是它的反向开关（同时给时后写的生效），\n"
+                          "供交付包的入口脚本默认开启、现场临时关掉",
+                          a.rot180 ? "" : "不")},
     {"--fps", "F", "覆盖时间轴与限速用的帧率 (默认取源自报的值)。\n"
                    "相机改成 30fps 而流里报错时用它对齐划水/速度"},
     {"--preview", "", "开实时窗口（画布会缩放后显示，按 q/ESC 退出，\n"
@@ -262,6 +271,10 @@ bool parse(int argc, char** argv, Args& a) {
     else if (k == "--no-kpts")     a.ov.kpts  = false;
     else if (k == "--no-boxes")    a.ov.boxes = false;
     else if (k == "--grid")        a.ov.grid  = true;
+    // 成对开关：交付包的入口脚本把 --rot180 写死在命令行里，用户追加的参数排在
+    // 它后面，所以「后写的生效」就等于现场能用 --no-rot180 临时转回来。
+    else if (k == "--rot180")      a.rot180   = true;
+    else if (k == "--no-rot180")   a.rot180   = false;
     else if (k == "--fps")         a.fps = num(i, k, 1e-3, 1000.0);
     else if (k == "--show-fps")    a.show_fps = true;
     else if (k == "--preview")     a.preview = true;
@@ -301,11 +314,13 @@ bool parse(int argc, char** argv, Args& a) {
 }
 
 /// 按参数选帧源：给了 --cam-dir 走六路 NVDEC 拼接，否则读已拼好的画布。
-/// 两条路都产出同一个 GpuFrame（BGR uint8 显存），下游完全不感知差异。
+/// 两条路都产出同一个 GpuFrame（BGR uint8 显存），下游完全不感知差异 ——
+/// --rot180 也在这一层各自消化掉（拼接改落点 / 解码器加滤镜），见两边的注释。
 std::unique_ptr<FrameSource> make_source(const Args& a) {
-  if (a.cam_dir.empty()) return FrameSource::open(a.input, a.decoder, a.fps);
+  if (a.cam_dir.empty())
+    return FrameSource::open(a.input, a.decoder, a.fps, a.rot180);
 #ifdef SWIM_HAS_STITCH
-  return StitchSource::open(a.cam_dir, a.lut, a.fps);
+  return StitchSource::open(a.cam_dir, a.lut, a.fps, a.rot180);
 #else
   throw std::runtime_error(
       "本二进制未编入拼接源（configure 时没找到 FFmpeg libav*），"
@@ -571,8 +586,9 @@ int main(int argc, char** argv) try {
   if (!parse(argc, argv, a)) return 0;
 
   auto src = make_source(a);
-  printf("[Input] %dx%d %.2f fps 总帧 %lld 后端 %s\n", src->width(), src->height(),
-         src->fps(), static_cast<long long>(src->total()), src->backend());
+  printf("[Input] %dx%d %.2f fps 总帧 %lld 后端 %s%s\n", src->width(), src->height(),
+         src->fps(), static_cast<long long>(src->total()), src->backend(),
+         a.rot180 ? " 旋转180°" : "");
 
   Pipeline pipe(a.opt, src->fps());
 

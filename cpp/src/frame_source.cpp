@@ -276,14 +276,19 @@ Probe probe(const std::string& uri) {
 /// 附带好处：解码在独立进程，与本进程的 GPU 推理天然并行。
 class FfmpegSource final : public PrefetchSource {
  public:
-  FfmpegSource(const std::string& uri, const Probe& pr, int ring, bool prefetch)
+  FfmpegSource(const std::string& uri, const Probe& pr, bool rot180, int ring,
+               bool prefetch)
       : PrefetchSource("ffmpeg-pipe"),
         // -noautorotate：保证输出帧尺寸恒等于 ffprobe 报的 stream 宽高。带旋转元数据
         // 时自动旋转会输出 h×w（字节数相同！），按 w×h 解读就是整帧错切且无从察觉。
         // stream_opts 里的 rtsp_transport=tcp 对直播流是必需的，见那里的注释。
+        // 180° 定向交给子进程的滤镜（vflip 只是把 linesize 取负，零拷贝；hflip 是
+        // SIMD 行内反转），与本进程的 GPU 推理天然并行，且不多占一分显存带宽 ——
+        // 这条路没有 mesh 可改，解码器就是唯一「本来就要过一遍像素」的地方。
         pipe_("ffmpeg -hide_banner -loglevel error -nostdin -noautorotate " +
-                  stream_opts(uri) + "-i \"" + uri +
-                  "\" -map 0:v:0 -an -f rawvideo -pix_fmt bgr24 pipe:1",
+                  stream_opts(uri) + "-i \"" + uri + "\" -map 0:v:0 -an" +
+                  (rot180 ? " -vf hflip,vflip" : "") +
+                  " -f rawvideo -pix_fmt bgr24 pipe:1",
               Proc::Mode::Read, 128u << 20) {   // 128 MB 缓冲，理由见 proc.h
     SWIM_CHECK(bool(pipe_), "无法启动 ffmpeg 解码管道（PATH 里有 ffmpeg 吗？）");
     start(pr.w, pr.h, pr.fps, pr.total, ring, prefetch);
@@ -353,7 +358,8 @@ class CpuSource final : public PrefetchSource {
 
 std::unique_ptr<FrameSource> FrameSource::open(const std::string& uri,
                                               DecoderPref pref, double fps,
-                                              int ring, bool prefetch) {
+                                              bool rot180, int ring,
+                                              bool prefetch) {
   Probe pr = pref == DecoderPref::Cpu ? Probe{} : probe(uri);
   // --fps 覆盖：探测到的帧率只用于时间轴（划水/速度），改它不影响解码。
   // 放在这里而不是各子类里，两条 CPU 路径就都被覆盖到。
@@ -364,9 +370,13 @@ std::unique_ptr<FrameSource> FrameSource::open(const std::string& uri,
 
   // 首选 ffmpeg 管道（约 13 ms/帧，已贴住 ffmpeg CLI 自身地板，且与 Python 的
   // cv2 逐字节一致）；探测不到才回退 OpenCV/MSMF（16.9 ms/帧，像素值有差异）。
-  if (pr.ok) return std::make_unique<FfmpegSource>(uri, pr, ring, prefetch);
+  if (pr.ok) return std::make_unique<FfmpegSource>(uri, pr, rot180, ring, prefetch);
   if (pref != DecoderPref::Cpu)
     printf("[Source] ffprobe 探测失败，回退 OpenCV 解码（更慢，且像素值与 ffmpeg 不同）\n");
+  // OpenCV 路没有滤镜链，转 180° 只能整帧再搬一次（5002x2102 每帧 30 MB），
+  // 与「零消耗」的要求相悖，故直接拒绝而不是悄悄退化。
+  SWIM_CHECK(!rot180, "--rot180 需要 ffmpeg 解码路径（OpenCV 兜底路没有滤镜链，"
+                      "转 180° 要整帧再搬一次）：请装好 ffmpeg 并用 --decoder auto");
   return std::make_unique<CpuSource>(uri, fps, ring, prefetch);
 }
 

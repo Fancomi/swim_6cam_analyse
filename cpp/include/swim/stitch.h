@@ -79,9 +79,15 @@ class StitchLut {
 /// NV12 采样复刻离线参考的插值顺序：先把 4 个双线性 tap 各自转成 BGR（chroma
 /// 点复制、bt601 limited->full、floor 取整），再在 BGR 上混合。反过来（先插值
 /// chroma 再转色）在 chroma 边缘会偏最多 35 灰阶，实测 mean|d| 1.69 vs 1.08。
+///
+/// rot180=true 时画布整体转 180°（相机顺序、覆盖关系、采样值全不变）：只把这一
+/// 个像素的**落点**改成 (cw-1-x, ch-1-y)。它与「烘表时把 mesh 顶点绕画布中心转
+/// 180°」严格等价 —— 该映射在整数网格上是精确双射，不引入任何重采样 —— 但定向
+/// 因此与 LUT 解耦：一份表两种定向都能跑，换定向不必重烘表、不必重启标定。
+/// 代价为零：读写次数与地址跨度都不变，没有额外遍数，也没有中间画布。
 void launch_stitch(const StitchLane* lanes, int n_lanes, uint8_t* canvas,
                    int canvas_w, int canvas_h, int src_w, int src_h,
-                   cudaStream_t stream);
+                   bool rot180, cudaStream_t stream);
 
 /// 六路视频拼接帧源。uri 语法见 open()。
 class StitchSource {
@@ -92,9 +98,11 @@ class StitchSource {
   /// lut_path 缺省取 models_dir/stitch.lut。ring 为画布环深度，须 >= 3。
   /// fps > 0 时覆盖各路自报帧率的最大值，同时用于离线路限速（见 stitch_source
   /// 的 pace）；相机已配成 30fps 而流里报 59.94 时靠它把时间轴摆正。
+  /// rot180 把画布整体转 180°（尺寸不变），在拼接落点上完成，见 launch_stitch。
   static std::unique_ptr<FrameSource> open(const std::string& spec,
                                            const std::string& lut_path,
-                                           double fps = 0, int ring = 4);
+                                           double fps = 0, bool rot180 = false,
+                                           int ring = 4);
 };
 
 }  // namespace swim

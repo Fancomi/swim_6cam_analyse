@@ -574,8 +574,9 @@ LaneUris uris_from_list(const std::string& path, const StitchLut& lut) {
 class StitchFrameSource final : public FrameSource {
  public:
   StitchFrameSource(const std::string& spec, bool spec_is_list,
-                    const std::string& lut_path, double fps, int ring)
-      : ring_n_(ring) {
+                    const std::string& lut_path, double fps, bool rot180,
+                    int ring)
+      : ring_n_(ring), rot180_(rot180) {
     SWIM_CHECK(ring_n_ >= 3, "拼接画布环深须 >= 3");
     // 顺序要紧：av_hwdevice_ctx_create(AV_CUDA_USE_PRIMARY_CONTEXT) 要设置
     // primary context 的 flags，若 CUDA runtime API（cudaMalloc 等）已激活它就会
@@ -786,7 +787,7 @@ class StitchFrameSource final : public FrameSource {
                               cudaMemcpyHostToDevice, stream_));
     launch_stitch(s.dev_lanes, n, static_cast<uint8_t*>(s.canvas),
                   lut_->canvas_w(), lut_->canvas_h(), lut_->src_w(),
-                  lut_->src_h(), stream_);
+                  lut_->src_h(), rot180_, stream_);
     SWIM_CUDA(cudaEventRecord(s.done, stream_));
     // 下游在别的 stream 上读它，而 Pipeline 不做跨 stream 等待，故在此等一次
     SWIM_CUDA(cudaEventSynchronize(s.done));
@@ -862,6 +863,7 @@ class StitchFrameSource final : public FrameSource {
   cudaStream_t stream_ = nullptr;
   size_t  bytes_ = 0;
   int     ring_n_ = 4;
+  bool    rot180_ = false;             // 画布整体转 180°，在拼接落点上完成
   double  fps_ = 0;
   int64_t total_ = -1, idx_ = 0;
   int64_t held_ = 0;                   // 整帧都是「顶住的旧帧」的次数
@@ -877,11 +879,13 @@ class StitchFrameSource final : public FrameSource {
 
 std::unique_ptr<FrameSource> StitchSource::open(const std::string& spec,
                                                 const std::string& lut_path,
-                                                double fps, int ring) {
+                                                double fps, bool rot180,
+                                                int ring) {
   // 目录 = 一批离线片段，文件 = 相机清单（每行 `相机=地址`，地址可为 rtsp://）。
   // 两者都只是「怎么给六个地址」，NvdecLane 内部不区分。
   const bool is_list = !std::filesystem::is_directory(spec);
-  return std::make_unique<StitchFrameSource>(spec, is_list, lut_path, fps, ring);
+  return std::make_unique<StitchFrameSource>(spec, is_list, lut_path, fps,
+                                             rot180, ring);
 }
 
 }  // namespace swim

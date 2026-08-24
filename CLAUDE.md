@@ -82,6 +82,8 @@ PowerShell 5.1 随系统装，`Get-FileHash -Algorithm MD5` / `Copy-Item`（会�
 `nvinfer_builder_resource`（合 1.8 GB）** + `stitch.lut` + `cameras.txt` 模板 +
 `README.txt`（UTF-8 带 BOM）+ 两个入口 `run_1cam.bat`（单相机联调，`--input`）/
 `run_6cam.bat`（六路上线，`--cam-dir`，改 `cameras.txt` 的 IP 即可）。
+两个入口都**默认带 `--rot180`**（机位倒挂），现场追加 `--no-rot180` 转回正向 ——
+旋转在帧源里就地完成、零额外开销，口径见 `cpp/README.md`「画面定向」。
 入口自己 `set "PATH=%~dp0;%PATH%"`，所以自带的 ffmpeg 一定被用上（回退 OpenCV/MSMF
 是 5.7 fps vs 77.7，且帧率报成 30.00 而真值 59.94）。
 **带 ONNX 是刻意的**：engine 与「GPU 架构 + TRT 版本」烘死，带着它换代机器能自己现烘
@@ -227,6 +229,12 @@ cpp/build/Release/swim_analyse.exe --cam-dir <六路片段目录> --models cpp/m
 首帧画布与离线 CPU 参考差 **mean|d| 0.34 灰阶 / 最大 3 / 100% 在 2 灰阶内**。
 它与 `--input` 那条路是**两组不可 diff 的数字**（画布差 0.34 灰阶就足以让短 track
 数量变化），各自对自己的基线。
+
+**`--rot180` 又各自是一组基线**（画布 24233 人次 / 90 track / 361 划水；六路现拼
+25578 / 119 / 359）：detect 对定向不是旋转等变的，转与不转不能相互 diff。旋转本身
+的正确性用 `--dump-canvas` 验：转过的首帧应与「不转的首帧再 `[::-1,::-1]`」
+**逐字节相同**，这是灵敏且与推理无关的判据。耗时不应变化（实测 +0.1 ms/帧，
+在 run 间抖动内）。口径与实现见 `cpp/README.md`「画面定向」。
 
 改了 Python 侧，用同一段跑 `bash scripts/run.sh C --max-frames N` 前后对比 `result.json`。
 注意 `output/*/cache.pkl` 会跳过 Stage1/2，验证推理改动前先删。

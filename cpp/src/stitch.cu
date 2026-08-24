@@ -103,9 +103,14 @@ __device__ __forceinline__ float3 sample_nv12(const uint8_t* luma, int lpitch,
 
 // 逐画布像素累加各路贡献。每线程一个像素，寄存器里累加后写一次，
 // 无原子、无中间 float 画布；累加顺序固定为 lane 顺序，故逐位可复现。
+//
+// rot180：只改**落点**（写到 (cw-1-x, ch-1-y)），采样与累加一字不动。它等价于
+// 把 mesh 顶点绕画布中心转 180° 后重烘表，但不必真去重烘 —— 该映射在整数网格上
+// 是精确双射，不引入重采样，两条路的画布逐字节相同。开销为零：读写次数与地址
+// 跨度都不变（同一 warp 内仍是连续 32 像素，只是方向相反），没有额外遍数。
 __global__ void stitch_kernel(const StitchLane* lanes, int n_lanes,
                               uint8_t* canvas, int cw, int ch,
-                              int src_w, int src_h) {
+                              int src_w, int src_h, bool rot180) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= cw || y >= ch) return;
@@ -127,7 +132,9 @@ __global__ void stitch_kernel(const StitchLane* lanes, int n_lanes,
     sum.z += wq * v.z;
     wsum += wq;
   }
-  uint8_t* p = canvas + (size_t(y) * cw + size_t(x)) * 3;
+  const int ox = rot180 ? cw - 1 - x : x;
+  const int oy = rot180 ? ch - 1 - y : y;
+  uint8_t* p = canvas + (size_t(oy) * cw + size_t(ox)) * 3;
   if (wsum <= 0.f) {                     // 未覆盖像素写黑（画布 100% 覆盖，兜底）
     p[0] = p[1] = p[2] = 0;
     return;
@@ -146,12 +153,12 @@ __global__ void stitch_kernel(const StitchLane* lanes, int n_lanes,
 
 void launch_stitch(const StitchLane* lanes, int n_lanes, uint8_t* canvas,
                    int canvas_w, int canvas_h, int src_w, int src_h,
-                   cudaStream_t stream) {
+                   bool rot180, cudaStream_t stream) {
   const dim3 block(32, 8);
   const dim3 grid((canvas_w + block.x - 1) / block.x,
                   (canvas_h + block.y - 1) / block.y);
   stitch_kernel<<<grid, block, 0, stream>>>(lanes, n_lanes, canvas, canvas_w,
-                                            canvas_h, src_w, src_h);
+                                            canvas_h, src_w, src_h, rot180);
 }
 
 std::unique_ptr<StitchLut> StitchLut::load(const std::string& path) {
