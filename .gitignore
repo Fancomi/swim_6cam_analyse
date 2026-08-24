@@ -14,8 +14,14 @@ data/
 output/
 *.mp4
 *.pkl
-# 模型权重：开发机训练产物，由外部交付，不入库（来源见 docs/权重来源与复现.md）
-weights/
+# 模型权重：四个交付权重走 Git LFS 入库（见 .gitattributes），其余训练中间产物
+# （ckpt/last.pt 之类）不入库。来源与复现见 docs/权重来源与复现.md
+weights/*
+!weights/plans/
+!weights/*.pt
+!weights/*.pth
+!weights/plans/*.pt
+!weights/plans/*.pth
 # 交接原版代码与对照脚本（仅本地验收用）
 .probe/
 .exp/

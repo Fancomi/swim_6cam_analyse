@@ -139,7 +139,8 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 | `configs/` | 模型推理配置与泳池 mesh 标定 |
 | `tests/` | pytest，纯逻辑、无需 GPU 与数据 |
 | `docs/` | 环境与推导类文档；性能数字归属见下面『文档归属』 |
-| `data/` `output/` `weights/` | 输入、产物、权重，均不入库 |
+| `data/` `output/` | 输入与产物，不入库 |
+| `weights/` | 四个交付权重**走 Git LFS 入库**（新克隆跑 `git lfs pull` 取真身）；其余训练中间产物不入库 |
 | `dist/` | `scripts/dist.ps1` 出的交付包与 `*.manifest`（增量的基准），不入库；不要手工往里放东西（下次打包会整目录重建） |
 
 ## Python 侧速查

@@ -28,3 +28,12 @@ CMakeLists.txt text eol=lf
 *.pth       binary
 *.onnx      binary
 *.engine    binary
+
+# 权重走 Git LFS（四个文件各 110~126 MB，直接入库会把 clone 撑成一个多 GB 的
+# 历史；LFS 只在库里存 134 字节的指针）。**必须排在上面 binary 那组之后** ——
+# 同一属性由最后命中的规则定，写在前面会被 `*.pt binary` 的 -diff/-merge 盖掉。
+# 新克隆的人跑 `git lfs pull` 取真身；没装 git-lfs 就只会拿到指针文本。
+weights/*.pt        filter=lfs diff=lfs merge=lfs -text
+weights/*.pth       filter=lfs diff=lfs merge=lfs -text
+weights/plans/*.pt  filter=lfs diff=lfs merge=lfs -text
+weights/plans/*.pth filter=lfs diff=lfs merge=lfs -text
