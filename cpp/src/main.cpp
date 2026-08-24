@@ -152,10 +152,10 @@ std::vector<HelpRow> help_rows() {
     {"--track-iou", "F", sfmt("跟踪匹配的 IoU 阈值 (0,1] (默认 %g)", d.track_iou)},
     {"--track-max-lost", "N", sfmt("track 连续丢失多少帧后销毁 (默认 %d)",
                                    d.track_max_lost)},
-    {"--ghost", "SEC", sfmt("检测漏检时框原地停留的秒数 (默认 %g, 0=关闭)。\n"
-                            "占位框标 HOLD 且画得弱一档，只进画面，\n"
-                            "不进人次/track/划水统计与 --dump",
-                            d.ghost_sec)},
+    {"--ghost", "N", sfmt("检测漏检时框原地停留的帧数 (默认 %d, 0=关闭)。\n"
+                          "占位框标 HOLD 且画得弱一档，只进画面，\n"
+                          "不进人次/track/划水统计与 --dump",
+                          d.ghost)},
     {"--queue-depth", "N", sfmt("推理->后处理队列深度 1..%d (默认 %d)。渲染时每格\n"
                                 "多占一整帧锁页内存，调大只在后处理抖动时有用",
                                 kMaxQueueDepth, d.queue_depth)},
@@ -248,7 +248,7 @@ bool parse(int argc, char** argv, Args& a) {
     else if (k == "--track-iou")   o.track_iou   = frac(i, k);
     else if (k == "--track-max-lost")
       o.track_max_lost = int(integer(i, k, 1, 1 << 20));
-    else if (k == "--ghost")        o.ghost_sec = num(i, k, 0.0, 60.0);
+    else if (k == "--ghost")        o.ghost = int(integer(i, k, 0, 1 << 20));
     else if (k == "--queue-depth")
       o.queue_depth = int(integer(i, k, 1, kMaxQueueDepth));
     else if (k == "--stroke-type") o.stroke_type = need(i);
@@ -672,10 +672,10 @@ int main(int argc, char** argv) try {
          static_cast<long long>(n_person), summary.size());
   // 占位框数只在开了 ghost 时报：占 人次 的比例就是 detect 的漏检率
   if (n_ghost)
-    printf("[Summary] ghost 占位 %lld 个框 (%.2f%% of 人次), 每框最长 %.2f s\n",
+    printf("[Summary] ghost 占位 %lld 个框 (%.2f%% of 人次), 每框最长 %d 帧\n",
            static_cast<long long>(n_ghost),
            100.0 * double(n_ghost) / double(std::max<int64_t>(n_person, 1)),
-           double(a.opt.ghost_sec));
+           a.opt.ghost);
   int total_strokes = 0;
   for (const auto& [tid, v] : summary) total_strokes += v.first;
   printf("[Summary] 划水合计 %d 次\n", total_strokes);

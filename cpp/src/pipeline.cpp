@@ -1,7 +1,6 @@
 #include "swim/pipeline.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 
 namespace swim {
@@ -40,7 +39,7 @@ void PipelineOptions::validate() const {
   SWIM_CHECK(containment > 0.f && containment <= 1.f, "包含率阈值须在 (0,1]");
   SWIM_CHECK(track_iou > 0.f && track_iou <= 1.f, "跟踪 IoU 阈值须在 (0,1]");
   SWIM_CHECK(track_max_lost >= 1, "track_max_lost 须 >=1");
-  SWIM_CHECK(ghost_sec >= 0.f, "--ghost 不能为负");
+  SWIM_CHECK(ghost >= 0, "--ghost 不能为负");
   SWIM_CHECK(ppm > 0.f, "--ppm 须为正（否则速度为 inf）");
   SWIM_CHECK(valid_stroke(stroke_type),
              "--stroke-type 只能是: " + std::string(kStrokeTypes));
@@ -63,9 +62,7 @@ void Pipeline::alloc_ring(std::vector<Slot<T>>& ring, size_t elems) {
 
 Pipeline::Pipeline(const PipelineOptions& opt, double fps)
     : opt_(opt), fps_(fps), chan_(opt.queue_depth),
-      // ghost 的秒数在这里一次换成帧数：跟踪器只认帧，帧率只有这里知道
-      tracker_(opt.track_iou, opt.track_max_lost,
-               int(std::lround(std::max(0.0, opt.ghost_sec * fps)))),
+      tracker_(opt.track_iou, opt.track_max_lost, opt.ghost),
       metrics_(fps, opt.ppm, opt.kpt_thr,
                MetricsTracker::split_sides(opt.stroke_type), opt.signal) {
   opt_.validate();
