@@ -43,9 +43,9 @@ namespace {
 constexpr int kSkel[][2] = {{15,13},{13,11},{16,14},{14,12},{11,12},{5,11},{6,12},
                             {5,6},{5,7},{7,9},{6,8},{8,10},{1,2},{0,1},{0,2},{1,3},{2,4}};
 
-cv::Scalar id_color(int id, double k = 1.0) {   // 与 Python 版同思路：按 id 稳定散列
+cv::Scalar id_color(int id) {   // 与 Python 版同思路：按 id 稳定散列
   const uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
-  return cv::Scalar(((h >> 16) & 255) * k, ((h >> 8) & 255) * k, (h & 255) * k);
+  return cv::Scalar((h >> 16) & 255, (h >> 8) & 255, h & 255);
 }
 
 /// 叠加层的三个开关。预览窗口里按 1/2/3 实时切换，`--out` 落盘用当前状态
@@ -153,7 +153,7 @@ std::vector<HelpRow> help_rows() {
     {"--track-max-lost", "N", sfmt("track 连续丢失多少帧后销毁 (默认 %d)",
                                    d.track_max_lost)},
     {"--ghost", "N", sfmt("检测漏检时框原地停留的帧数 (默认 %d, 0=关闭)。\n"
-                          "占位框标 HOLD 且画得弱一档，只进画面，\n"
+                          "占位框与真检出画法一致，只进画面，\n"
                           "不进人次/track/划水统计与 --dump",
                           d.ghost)},
     {"--queue-depth", "N", sfmt("推理->后处理队列深度 1..%d (默认 %d)。渲染时每格\n"
@@ -445,22 +445,19 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
   };
 
   for (const auto& p : fr.persons) {
-    // ghost（丢检占位）画得弱一档：颜色减半、线宽最细、标签加 HOLD 后缀，
-    // 于是"人还在但这一帧没检出"与"真检出"在画面上一眼可分。
-    const bool  gh  = p.lost > 0;
-    const auto  col = id_color(p.track_id, gh ? 0.5 : 1.0);
-    const int   lw  = gh ? 1 : th;
-    const double dim = gh ? 0.5 : 1.0;
+    // ghost（丢检占位）与真检出**画法完全一致**（同色、同线宽、同标签）：
+    // 画面上要的是"人一直在"，一帧检没检出是内部状态，弱化反而变成新的闪烁。
+    // 两者的分野只在数据出口 —— 统计/落盘/划水信号只认 lost==0，见 Person::lost。
+    const auto col = id_color(p.track_id);
     if (ov.boxes) {
-      cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, lw);
+      cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, th);
 
       char buf[96];
-      const char* tag = gh ? " HOLD" : "";
       if (std::isnan(p.speed))
-        snprintf(buf, sizeof buf, "ID:%d S:%d%s", p.track_id, p.strokes, tag);
+        snprintf(buf, sizeof buf, "ID:%d S:%d", p.track_id, p.strokes);
       else
-        snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s%s", p.track_id, p.strokes,
-                 p.speed, tag);
+        snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s", p.track_id, p.strokes,
+                 p.speed);
       int base = 0;
       const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, fs, th, &base);
       const int tx = int(p.x1 * s);
@@ -468,7 +465,7 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
       cv::rectangle(img, {tx, ty - sz.height - 4}, {tx + sz.width + 4, ty + 2},
                     col, cv::FILLED);
       cv::putText(img, buf, {tx + 2, ty}, cv::FONT_HERSHEY_SIMPLEX, fs,
-                  {255 * dim, 255 * dim, 255 * dim}, th, cv::LINE_AA);
+                  {255, 255, 255}, th, cv::LINE_AA);
     }
 
     if (!ov.kpts) continue;
@@ -476,12 +473,12 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
       if (p.scores[e[0]] < kpt_thr || p.scores[e[1]] < kpt_thr) continue;
       cv::line(img, pt(p.kpts[e[0] * 2], p.kpts[e[0] * 2 + 1]),
                pt(p.kpts[e[1] * 2], p.kpts[e[1] * 2 + 1]),
-               {0, 255 * dim, 0}, lw, cv::LINE_AA);
+               {0, 255, 0}, th, cv::LINE_AA);
     }
     for (int k = 0; k < kNumKpts; ++k)
       if (p.scores[k] >= kpt_thr)
-        cv::circle(img, pt(p.kpts[k * 2], p.kpts[k * 2 + 1]), r,
-                   {0, 0, 255 * dim}, cv::FILLED, cv::LINE_AA);
+        cv::circle(img, pt(p.kpts[k * 2], p.kpts[k * 2 + 1]), r, {0, 0, 255},
+                   cv::FILLED, cv::LINE_AA);
   }
 }
 

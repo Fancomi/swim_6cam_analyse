@@ -342,8 +342,8 @@ rem   run_6cam.bat --fps 30        force the time axis to 30fps
 rem   run_6cam.bat --ghost 0       stop holding boxes over detector misses
 rem   run_6cam.bat <list.txt>      use a different camera list
 rem
-rem A box that the detector missed is held in place for 5 frames and tagged
-rem HOLD; held boxes are drawn only - they never enter the counts or --json.
+rem A box that the detector missed is held in place for 5 frames, drawn just
+rem like a real one; held boxes never enter the counts or --json.
 rem
 rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
 rem q/ESC = quit. Toggles also apply to what --out writes. Resize or
@@ -412,7 +412,7 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   run_6cam.bat --max-frames 300     只跑前 300 帧
   run_6cam.bat --preview-scale 0.4  预览窗口缩放比
   run_6cam.bat --fps 30             按 30fps 算时间轴（流报错帧率时用）
-  run_6cam.bat --ghost 0            关掉丢检占位（默认停 5 帧，标 HOLD）
+  run_6cam.bat --ghost 0            关掉丢检占位（默认停 5 帧，画法同真检出）
   swim_analyse.exe --help           全部参数
 
 预览窗口的热键（焦点要在窗口上）

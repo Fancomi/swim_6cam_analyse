@@ -61,7 +61,7 @@ struct Person {
   int   strokes  = 0;                          // 累计划水次数（后处理填）
   float speed    = std::numeric_limits<float>::quiet_NaN();   // m/s
   /// 0 = 本帧真检出；>0 = ghost 占位框，值为已连续丢检的帧数（见 Tracker）。
-  /// 统计与落盘只认 lost==0，渲染两者都画（ghost 画得弱一档）。
+  /// 统计与落盘只认 lost==0；渲染两者一视同仁（画法完全一致）。
   int   lost     = 0;
   std::array<float, kNumKpts * 2> kpts{};      // x,y 交替
   std::array<float, kNumKpts>     scores{};
