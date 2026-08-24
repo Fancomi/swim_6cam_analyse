@@ -1,4 +1,39 @@
-weights/*.pth filter=lfs diff=lfs merge=lfs -text
-weights/*.pt filter=lfs diff=lfs merge=lfs -text
+# 行尾统一：本仓库跨 Linux / Windows 开发。库里存的一直是 LF（已核对 HEAD 的 blob），
+# 但那是靠开发机各自的 core.autocrlf 设置撑着的 —— 谁把它设成 false 再提交，
+# CRLF 就会进库，而 `#!/usr/bin/env bash\r` 在 Linux 上是 bad interpreter。
+# 这里把「必须 LF」的类型钉死，不再依赖个人配置。
+* text=auto
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.cpp       text eol=lf
+*.cu        text eol=lf
+*.h         text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.cmake     text eol=lf
+CMakeLists.txt text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# Windows 专属脚本反过来必须 CRLF（cmd.exe 对 LF 的多行语句解析不稳）
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+
+# 二进制：别做行尾转换，也别在 diff 里刷屏
+*.mp4       binary
+*.pkl       binary
+*.pt        binary
+*.pth       binary
+*.onnx      binary
+*.engine    binary
+
+# 权重走 Git LFS（四个文件各 110~126 MB，直接入库会把 clone 撑成一个多 GB 的
+# 历史；LFS 只在库里存 134 字节的指针）。**必须排在上面 binary 那组之后** ——
+# 同一属性由最后命中的规则定，写在前面会被 `*.pt binary` 的 -diff/-merge 盖掉。
+# 新克隆的人跑 `git lfs pull` 取真身；没装 git-lfs 就只会拿到指针文本。
+weights/*.pt        filter=lfs diff=lfs merge=lfs -text
+weights/*.pth       filter=lfs diff=lfs merge=lfs -text
+weights/plans/*.pt  filter=lfs diff=lfs merge=lfs -text
 weights/plans/*.pth filter=lfs diff=lfs merge=lfs -text
-weights/plans/*.pt filter=lfs diff=lfs merge=lfs -text

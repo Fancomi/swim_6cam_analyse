@@ -1,10 +1,13 @@
 """三套关键点方案（Plan A/B/C）的统一封装。
 
 三者的差别只在"如何从画布视频得到每个人的框与关键点"，之后的划水计数、速度、
-渲染完全共用（见 pipeline.py 的 Stage3/4）。因此这里把它们抽象成同一个接口：
+渲染完全共用（见 cli.py 的 Stage3/4）。因此这里把它们抽象成同一个接口：
 
     plan.run(canvas_video, total) -> (all_boxes, raw_seq)
     plan.to_canvas(raw_seq, interp) -> canvas_kpts        # 关键点转画布坐标供绘制
+
+run() 里"开画布视频 -> 逐帧 read -> 收集 -> 释放"的骨架三套一字不差，故只在基类
+留一份（模板方法）：子类实现 _setup()/_frame()，A 另需 _context()/_finish()。
 
 数据约定（三套完全一致，Stage3/4 无需知道用了哪套）：
     all_boxes  {frame_idx: [(track_id, x1, y1, x2, y2, conf)]}   画布坐标
@@ -19,20 +22,30 @@
 │ C 两阶段│ 画布（RTMPose 按框） │ 检测与关键点解耦，各自最优；速度与 B 持平     │
 └────────┴──────────────────────┴─────────────────────────────────────────────┘
 
-实测对比见 docs/plans.md。
+三套方案的实测指标对比见 README.md 的三套方案对比表。
 """
 
-import os
+import contextlib
 import time
 
 import cv2
-import numpy as np
 
 from .geometry import MultiCameraProjector
-from .tracking import SimpleTracker, filter_contained_boxes
+from .tracking import SimpleTracker, contained_keep_mask, filter_contained_boxes
 from .video import MultiVideoReader
 
 CANVAS_CAM = -1          # cam_idx 哨兵：关键点已在画布坐标系
+
+
+def _boxes_of(result):
+    """ultralytics 结果 -> [(x1,y1,x2,y2,conf)]（保序），无框时 []。
+
+    这里不顺手去重：Plan B 还要用与本列表同序的关键点数组，只能自己拿掩码筛。
+    """
+    if result.boxes is None or not len(result.boxes):
+        return []
+    return [(*map(float, b), float(c)) for b, c in
+            zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy())]
 
 
 class Plan:
@@ -46,16 +59,86 @@ class Plan:
         self.args = args
         self.canvas_h = canvas_h
         self.timings = {}
+        # 三套都在画布坐标上跟踪、参数也相同，故在基类统一构造
+        self.tracker = SimpleTracker(args.track_iou, args.track_max_lost)
+        # 纯数字的 --device 视为 CUDA 序号，其余（cpu / cuda:1 等）原样透传
+        self.device = (f"cuda:{args.device}" if str(args.device).isdigit()
+                       else args.device)
 
-    # ── 子类实现 ────────────────────────────────────────────────────────────
     def run(self, canvas_video, total):
+        """逐帧驱动 + 收集，子类只实现 _frame()。"""
+        self._setup()
+        cap = cv2.VideoCapture(canvas_video)
+        if not cap.isOpened():          # 否则读到 0 帧只会静默返回空结果
+            raise RuntimeError(f"无法打开视频: {canvas_video}")
+        self.all_boxes, self.raw_seq = {}, {}
+        try:
+            with self._context():
+                for fi in range(total):
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    self._frame(fi, frame)
+        finally:
+            cap.release()
+        self._finish()
+        return self.all_boxes, self.raw_seq
+
+    # ── 子类钩子 ────────────────────────────────────────────────────────────
+    def _setup(self):
+        """加载本方案的模型；run() 内才调用，保持惰性（见 _load_yolo）。"""
+
+    def _context(self):
+        """逐帧循环期间要持有的额外资源；只有 Plan A 需要（六路相机 reader）。"""
+        return contextlib.nullcontext()
+
+    def _frame(self, fi, frame):
+        """处理画布第 fi 帧，结果写进 self.all_boxes / self.raw_seq。"""
         raise NotImplementedError
+
+    def _finish(self):
+        """收尾输出；只有 Plan A 需要（打印补检次数）。"""
 
     def to_canvas(self, raw_seq, interp):
         """默认：关键点已是画布坐标，直接用。"""
         return {tid: dict(frames) for tid, frames in interp.items()}
 
     # ── 共享工具 ────────────────────────────────────────────────────────────
+    def _load_yolo(self, path):
+        """加载 YOLO 权重并搬到 self.device。
+
+        局部 import：ultralytics/mmpose 各要几秒才 import 完，而 Plan B 不需要
+        mmpose、A/C 不需要 yolo-pose —— 都推迟到真正 run() 时才付出。
+        """
+        from ultralytics import YOLO
+
+        model = YOLO(path)
+        model.to(self.device)
+        return model
+
+    def _setup_det_rtmpose(self):
+        """A/C 共用：画布检测器 + RTMPose（config/checkpoint 各自不同）。"""
+        from .pose import RTMPoseEstimator
+
+        a = self.args
+        self.det = self._load_yolo(a.yolo_model)
+        self.pose = RTMPoseEstimator(a.pose_config, a.pose_checkpoint, a.device)
+
+    def _detect_track(self, fi, frame):
+        """A/C 共用的前半段：检测去重 -> 跟踪 -> 记框，返回 tracked（无框时 []）。
+
+        tracked[i][1:5] 就是去重后的框坐标本身（tracker 只在前面加了 tid、不改
+        数值），下游要框直接切片，不必再单独接一份 boxes。
+        """
+        a = self.args
+        boxes = self._timeit("detect", self._detect, self.det, frame,
+                             a.conf, a.iou, a.containment)
+        if not boxes:
+            return []
+        tracked = self.tracker.update(boxes)
+        self.all_boxes[fi] = tracked
+        return tracked
+
     def _timeit(self, key, fn, *a, **kw):
         t0 = time.time()
         try:
@@ -72,11 +155,7 @@ class Plan:
     @staticmethod
     def _detect(model, frame, conf, iou, containment):
         """YOLO 检测 + 包含率去重，返回 [(x1,y1,x2,y2,conf)]（保序）。"""
-        r = model(frame, conf=conf, iou=iou, verbose=False)[0]
-        if r.boxes is None or not len(r.boxes):
-            return []
-        boxes = [(*map(float, b), float(c)) for b, c in
-                 zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy())]
+        boxes = _boxes_of(model(frame, conf=conf, iou=iou, verbose=False)[0])
         return filter_contained_boxes(boxes, containment)
 
 
@@ -93,71 +172,69 @@ class PlanA_CrossCamera(Plan):
     description = "画布 detect + 原相机 RTMPose + mesh 反投影（交接原版）"
     needs_cameras = True
 
-    def run(self, canvas_video, total):
-        from ultralytics import YOLO
-        from .pose import RTMPoseEstimator
-
+    def _setup(self):
         a = self.args
-        det = YOLO(a.yolo_model)
-        det.to(f"cuda:{a.device}" if str(a.device).isdigit() else a.device)
-        pose = RTMPoseEstimator(a.pose_config, a.pose_checkpoint, a.device)
+        self._setup_det_rtmpose()
         self.projector = MultiCameraProjector(
             a.mesh, a.camera_videos, canvas_h=self.canvas_h,
             ppm=a.ppm, unit_scale=a.unit_scale, neg_v=a.neg_v)
-        tracker = SimpleTracker(a.track_iou, a.track_max_lost)
+        self.n_retry = 0
 
-        cap = cv2.VideoCapture(canvas_video)
-        all_boxes, raw_seq, n_retry = {}, {}, 0
-        with MultiVideoReader(a.camera_videos) as reader:
-            for fi in range(total):
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                boxes = self._timeit("detect", self._detect, det, frame,
-                                     a.conf, a.iou, a.containment)
-                if not boxes:
-                    continue
-                tracked = tracker.update(boxes)
-                all_boxes[fi] = tracked
+    @contextlib.contextmanager
+    def _context(self):
+        """六路原相机的帧级随机读取器，只在逐帧循环期间持有。"""
+        with MultiVideoReader(self.args.camera_videos) as reader:
+            self.reader = reader
+            yield
 
-                # 每个目标按投影面积排序候选相机；最清晰那路按相机分组批量推理
-                ranked, by_cam = {}, {}
-                for tid, x1, y1, x2, y2, _c in tracked:
-                    cams = self._timeit("geometry", self.projector.rank_cameras,
-                                        (x1, y1, x2, y2))
-                    if not cams:
-                        continue
-                    ranked[tid] = cams
-                    by_cam.setdefault(cams[0][0], []).append((tid, cams[0][1]))
+    def _frame(self, fi, frame):
+        a = self.args
+        tracked = self._detect_track(fi, frame)
+        if not tracked:
+            return
 
-                low = []
-                for ci, entries in by_cam.items():
-                    cf = self._timeit("video_io", reader.read, ci, fi)
-                    if cf is None:
-                        continue
-                    res = self._timeit("pose", pose, cf, [b for _, b in entries])
-                    for (tid, box), (kp, sc) in zip(entries, res):
-                        if float(sc.mean()) < a.kpt_thr:
-                            low.append((tid, ci, box, kp, sc))
-                        else:
-                            raw_seq.setdefault(tid, []).append((fi, kp, sc, ci))
+        # 每个目标按投影面积排序候选相机；最清晰那路按相机分组批量推理
+        ranked, by_cam = {}, {}
+        for tid, x1, y1, x2, y2, _c in tracked:
+            cams = self._timeit("geometry", self.projector.rank_cameras,
+                                (x1, y1, x2, y2))
+            if not cams:
+                continue
+            ranked[tid] = cams
+            by_cam.setdefault(cams[0][0], []).append((tid, cams[0][1]))
 
-                # 最清晰相机置信度不足 -> 用次清晰相机补检一次
-                for tid, ci, box, kp, sc in low:
-                    second = next((c for c in ranked[tid] if c[0] != ci), None)
-                    if second is not None:
-                        t0 = time.time()
-                        cf2 = reader.read(second[0], fi)
-                        if cf2 is not None:
-                            (kp2, sc2), = pose(cf2, [second[1]])
-                            if float(sc2.mean()) >= a.kpt_thr:
-                                ci, kp, sc = second[0], kp2, sc2
-                                n_retry += 1
-                        self.timings["retry"] = self.timings.get("retry", 0.0) + time.time() - t0
-                    raw_seq.setdefault(tid, []).append((fi, kp, sc, ci))
-        cap.release()
-        print(f"[{self.name}] 次清晰相机补检成功 {n_retry} 次")
-        return all_boxes, raw_seq
+        low = []
+        for ci, entries in by_cam.items():
+            cf = self._timeit("video_io", self.reader.read, ci, fi)
+            if cf is None:
+                continue
+            res = self._timeit("pose", self.pose, cf, [b for _, b in entries])
+            for (tid, _box), (kp, sc) in zip(entries, res):
+                if float(sc.mean()) < a.pose_score_thr:
+                    low.append((tid, ci, kp, sc))
+                else:
+                    self.raw_seq.setdefault(tid, []).append((fi, kp, sc, ci))
+
+        # 最清晰相机置信度不足 -> 用次清晰相机补检一次
+        for tid, ci, kp, sc in low:
+            second = next((c for c in ranked[tid] if c[0] != ci), None)
+            if second is not None:
+                better = self._timeit("retry", self._retry, fi, *second)
+                if better is not None:
+                    ci, (kp, sc) = second[0], better
+                    self.n_retry += 1
+            self.raw_seq.setdefault(tid, []).append((fi, kp, sc, ci))
+
+    def _retry(self, fi, cam_idx, box):
+        """次清晰相机上重推一次；读不到帧或仍不达标都返回 None（沿用原结果）。"""
+        cf = self.reader.read(cam_idx, fi)
+        if cf is None:
+            return None
+        (kp, sc), = self.pose(cf, [box])
+        return (kp, sc) if float(sc.mean()) >= self.args.pose_score_thr else None
+
+    def _finish(self):
+        print(f"[{self.name}] 次清晰相机补检成功 {self.n_retry} 次")
 
     def to_canvas(self, raw_seq, interp):
         """关键点在各自相机坐标系，需经 mesh 反投影回画布。"""
@@ -183,47 +260,30 @@ class PlanB_UnifiedCanvas(Plan):
     name = "PlanB"
     description = "画布 yolo26-pose 一体（detect+pose 单次前向）"
 
-    def run(self, canvas_video, total):
-        from ultralytics import YOLO
+    def _setup(self):
+        self.model = self._load_yolo(self.args.pose_model)
 
+    def _frame(self, fi, frame):
         a = self.args
-        model = YOLO(a.pose_model)
-        model.to(f"cuda:{a.device}" if str(a.device).isdigit() else a.device)
-        tracker = SimpleTracker(a.track_iou, a.track_max_lost)
+        # 一次前向同时出框与点，故整帧只有这一项耗时，全部计入 pose
+        r = self._timeit("pose", self.model, frame, conf=a.conf, verbose=False)[0]
+        boxes = _boxes_of(r)
+        if not boxes:
+            return
 
-        cap = cv2.VideoCapture(canvas_video)
-        all_boxes, raw_seq = {}, {}
-        for fi in range(total):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            t0 = time.time()
-            r = model(frame, conf=a.conf, verbose=False)[0]
-            self.timings["pose"] = self.timings.get("pose", 0.0) + time.time() - t0
-            if r.boxes is None or not len(r.boxes):
-                continue
+        # yolo-pose 的 data 是 (N,17,3)：x, y, 可见性；只取 x,y
+        kpts = r.keypoints.data.cpu().numpy()[:, :, :2]       # (N,17,2)
+        scores = r.keypoints.conf.cpu().numpy()               # (N,17)
 
-            boxes = [(*map(float, b), float(c)) for b, c in
-                     zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy())]
-            # yolo-pose 的 data 是 (N,17,3)：x, y, 可见性；只取 x,y
-            kpts = [k[:, :2] for k in r.keypoints.data.cpu().numpy()]
-            scores = list(r.keypoints.conf.cpu().numpy())
+        # 去重掩码直接用于同步筛掉对应关键点（不做浮点相等反查下标）
+        keep = contained_keep_mask(boxes, a.containment)
+        kept = [b for b, k in zip(boxes, keep) if k]
+        kpts, scores = kpts[keep], scores[keep]
 
-            # 去重后要同步丢弃对应关键点：filter 保序，按坐标回查下标
-            kept = filter_contained_boxes(boxes, a.containment)
-            idx = []
-            for kb in kept:
-                for i, db in enumerate(boxes):
-                    if all(abs(kb[j] - db[j]) < 1e-6 for j in range(5)):
-                        idx.append(i)
-                        break
-
-            tracked = tracker.update(kept)
-            all_boxes[fi] = tracked
-            for (tid, *_), i in zip(tracked, idx):
-                raw_seq.setdefault(tid, []).append((fi, kpts[i], scores[i], CANVAS_CAM))
-        cap.release()
-        return all_boxes, raw_seq
+        tracked = self.tracker.update(kept)
+        self.all_boxes[fi] = tracked
+        for (tid, *_), kp, sc in zip(tracked, kpts, scores):
+            self.raw_seq.setdefault(tid, []).append((fi, kp, sc, CANVAS_CAM))
 
 
 class PlanC_CanvasTwoStage(Plan):
@@ -239,34 +299,17 @@ class PlanC_CanvasTwoStage(Plan):
     name = "PlanC"
     description = "画布 yolo26 detect + 画布 RTMPose（两阶段，均在画布坐标）"
 
-    def run(self, canvas_video, total):
-        from ultralytics import YOLO
-        from .pose import RTMPoseEstimator
+    def _setup(self):
+        self._setup_det_rtmpose()
 
-        a = self.args
-        det = YOLO(a.yolo_model)
-        det.to(f"cuda:{a.device}" if str(a.device).isdigit() else a.device)
-        pose = RTMPoseEstimator(a.pose_config, a.pose_checkpoint, a.device)
-        tracker = SimpleTracker(a.track_iou, a.track_max_lost)
-
-        cap = cv2.VideoCapture(canvas_video)
-        all_boxes, raw_seq = {}, {}
-        for fi in range(total):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            boxes = self._timeit("detect", self._detect, det, frame,
-                                 a.conf, a.iou, a.containment)
-            if not boxes:
-                continue
-            tracked = tracker.update(boxes)
-            all_boxes[fi] = tracked
-            # 一帧的所有人一次推完（不像 Plan A 要按相机分组）
-            res = self._timeit("pose", pose, frame, [b[:4] for b in boxes])
-            for (tid, *_), (kp, sc) in zip(tracked, res):
-                raw_seq.setdefault(tid, []).append((fi, kp, sc, CANVAS_CAM))
-        cap.release()
-        return all_boxes, raw_seq
+    def _frame(self, fi, frame):
+        tracked = self._detect_track(fi, frame)
+        if not tracked:
+            return
+        # 一帧的所有人一次推完（不像 Plan A 要按相机分组）
+        res = self._timeit("pose", self.pose, frame, [t[1:5] for t in tracked])
+        for (tid, *_), (kp, sc) in zip(tracked, res):
+            self.raw_seq.setdefault(tid, []).append((fi, kp, sc, CANVAS_CAM))
 
 
 PLANS = {"A": PlanA_CrossCamera, "B": PlanB_UnifiedCanvas, "C": PlanC_CanvasTwoStage}

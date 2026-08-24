@@ -85,10 +85,20 @@ def _local_stats(x, win):
     return mean, span
 
 
+def _prepare(signal):
+    """平滑 + 幅度检查：返回 (平滑信号, 峰峰值)；峰峰值 < 1e-6 表示无有效波动。
+
+    两种检测都得先做这一步：峰峰值为 0 的常量信号（全 NaN 被 _fill_nan 填成 0、
+    或该目标始终低于置信度阈值）在自适应阈值/滞回阈值下都会退化，必须先短路。
+    """
+    smoothed = _smooth(_fill_nan(signal))
+    return smoothed, float(np.ptp(smoothed))
+
+
 def _detect_valleys(signal, fps):
     """局部自适应阈值的波谷检测，返回 (平滑信号, 波谷索引)。"""
-    smoothed = _smooth(_fill_nan(signal))
-    if float(np.ptp(smoothed)) < 1e-6:
+    smoothed, amplitude = _prepare(signal)
+    if amplitude < 1e-6:
         return smoothed, np.array([], int)
     distance = max(1, int(fps * MIN_STROKE_INTERVAL))
     inverted = -smoothed                     # find_peaks 只找峰，取负后峰即原信号的谷
@@ -102,8 +112,7 @@ def _detect_valleys(signal, fps):
 
 def _detect_zero_crossings(signal, fps):
     """滞回式"由负转正"过零检测，返回 (平滑信号, 穿越索引)。"""
-    smoothed = _smooth(_fill_nan(signal))
-    amplitude = float(np.ptp(smoothed))
+    smoothed, amplitude = _prepare(signal)
     if amplitude < 1e-6:
         return smoothed, np.array([], int)
     delta = amplitude * HYSTERESIS_RATIO

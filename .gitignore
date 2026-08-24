@@ -2,29 +2,39 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
+# Python 打包产物，以及 scripts/dist.sh 出的交付包 dist/swim_analyse/
 dist/
-
+.pytest_cache/
 # 虚拟环境
 .venv/
-
+# C++ 构建目录（cpp/build），以及 Python 的 build/
+build/
 # 数据与产物（体积大，不入库）
 data/
 output/
 *.mp4
 *.pkl
-
+# 模型权重：四个交付权重走 Git LFS 入库（见 .gitattributes），其余训练中间产物
+# （ckpt/last.pt 之类）不入库。来源与复现见 docs/权重来源与复现.md
+weights/*
+!weights/plans/
+!weights/*.pt
+!weights/*.pth
+!weights/plans/*.pt
+!weights/plans/*.pth
 # 交接原版代码与对照脚本（仅本地验收用）
 .probe/
-
-.vscode/
-.idea/
-.DS_Store
-
-# 实验目录（数据集、训练产物，体积大）
 .exp/
 runs/
 yolo/
-*.pt
-!weights/*.pt
-!weights/plans/*.pt
+.vscode/
+.idea/
+.DS_Store
+.claude/settings.local.json
+# C++ 构建产物与模型中间物
+cpp/models/*.onnx
+cpp/models/*.engine
+# 拼接查找表：由 configs/pool_mesh.json 现场烘（cpp/tools/build_stitch_lut.py），109 MB
+cpp/models/*.lut
+# 现场相机清单：由 scripts/cams.sh 按机器生成，含具体 IP
+configs/cameras.txt

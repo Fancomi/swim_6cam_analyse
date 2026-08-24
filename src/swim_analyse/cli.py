@@ -13,13 +13,15 @@
     Stage3    关键点插值 -> 划水次数（肘角度波谷 / 手腕过零）+ 瞬时速度
     Stage4    叠加框/标签/骨架，H264 编码输出
 
-Stage1/2 的结果缓存到 output_dir/cache.pkl（含 plan 名），重跑时若缓存存在
-且 plan 一致则直接跳到 Stage3 —— 调信号参数、换绘制选项都不必重跑 GPU。
+Stage1/2 的结果缓存到 output_dir/cache.pkl，键是"所有影响该结果的参数 + 输入
+视频/权重文件的 (大小, mtime)"的哈希：键一致才复用 —— 调信号参数、换绘制选项
+都不必重跑 GPU，而换模型或改阈值一定会重算（见 cache_key）。
 
-用法见 run.sh，或 `python -m swim_analyse.cli --help`。
+用法见 scripts/run.sh，或 `python -m swim_analyse.cli --help`。
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pickle
@@ -33,7 +35,7 @@ from .draw import draw_label, draw_skeleton, id_color
 from .metrics import (SIGNALS, compute_speed, count_strokes, cumulative_counts,
                       save_signal_plots)
 from .plans import PLANS
-from .pose import KPT_THR, interpolate_keypoints
+from .pose import KPT_THR, POSE_SCORE_THR, interpolate_keypoints
 from .video import video_meta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,7 +70,9 @@ def parse_args(argv=None):
 
     g = p.add_argument_group("检测与跟踪")
     g.add_argument("--conf", type=float, default=0.25)
-    g.add_argument("--iou", type=float, default=0.3, help="检测 NMS 的 IoU")
+    g.add_argument("--iou", type=float, default=0.3,
+                   help="检测 NMS 的 IoU；yolo26 end2end 权重下无效（NMS 已在图内，"
+                        "ultralytics 会短路该参数），仅对传统 NMS 权重生效")
     g.add_argument("--containment", type=float, default=0.7,
                    help="包含率去重阈值：交集/自身面积 超过此值视为重复框")
     g.add_argument("--track-iou", type=float, default=0.3)
@@ -84,7 +88,10 @@ def parse_args(argv=None):
     g.add_argument("--stroke-type", default="freestyle",
                    choices=["freestyle", "backstroke", "butterfly", "breaststroke", "unknown"])
     g.add_argument("--signal", default="elbow_angle", choices=sorted(SIGNALS))
-    g.add_argument("--kpt-thr", type=float, default=KPT_THR)
+    g.add_argument("--kpt-thr", type=float, default=KPT_THR,
+                   help="单个关键点的置信度阈值（绘制骨架用）")
+    g.add_argument("--pose-score-thr", type=float, default=POSE_SCORE_THR,
+                   help="Plan A 换相机门限：17 点平均置信度低于此值改用次清晰相机重推")
 
     g = p.add_argument_group("输出")
     g.add_argument("--output-dir", required=True)
@@ -113,6 +120,71 @@ def _check(parser, a):
             parser.error("Plan C 需要 --pose-config 与 --pose-checkpoint（画布 RTMPose）")
 
 
+# Stage1/2 的结果只取决于这些参数：按 plan 取它真正用到的那几项，Stage3/4 的
+# 参数（signal、stroke-type、kpt-thr、绘制、codec）改动不会失效缓存。
+_KEY_ARGS = {
+    "*": ("plan", "device", "conf", "containment", "track_iou", "track_max_lost"),
+    "A": ("yolo_model", "iou", "pose_config", "pose_checkpoint", "pose_score_thr",
+          "mesh", "ppm", "unit_scale", "neg_v"),
+    "B": ("pose_model",),
+    "C": ("yolo_model", "iou", "pose_config", "pose_checkpoint"),
+}
+# 上述参数里指向文件的项：额外把 (大小, mtime) 计入，同名权重被覆盖也能发现
+_KEY_FILES = ("yolo_model", "pose_model", "pose_checkpoint", "pose_config", "mesh")
+
+
+def _stamp(path):
+    """文件指纹 (路径, 大小, mtime_ns)；不存在时后两项为 None。
+
+    mtime 取纳秒：秒级精度下"同一秒内被同尺寸文件覆盖"会算出相同 key 而静默
+    复用旧缓存 —— 同架构 checkpoint 重训后字节数往往一模一样，并非纯理论风险。
+    """
+    if not path or not os.path.exists(path):
+        return [path, None, None]
+    st = os.stat(path)
+    return [path, st.st_size, st.st_mtime_ns]
+
+
+def cache_key(args, total):
+    """Stage1/2 缓存键：相关参数 + 输入视频/权重文件指纹 的稳定哈希。"""
+    # .get：新增 plan 未登记时按"只用公共参数"处理，不让 cache_key 崩在 Stage1 前
+    payload = {k: getattr(args, k)
+               for k in _KEY_ARGS["*"] + _KEY_ARGS.get(args.plan, ())}
+    for k in _KEY_FILES:
+        if k in payload:
+            payload[k] = _stamp(payload[k])
+    payload["total"] = total
+    payload["canvas_video"] = _stamp(args.canvas_video)
+    if PLANS[args.plan].needs_cameras:
+        payload["camera_videos"] = [_stamp(p) for p in args.camera_videos]
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
+def load_cache(path, key):
+    """读缓存，key 不符/旧格式/读不出来都当作 miss 返回 None（不抛异常）。"""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+    except Exception as e:                      # 截断、pickle 版本不兼容等
+        print(f"[Cache] {path} 无法读取（{e}），重新计算")
+        return None
+    # 下游要取 all_boxes 与 raw_seq 两项，缺任一都不能算命中
+    if not isinstance(cached, dict) or not {"all_boxes", "raw_seq"} <= cached.keys():
+        print(f"[Cache] {path} 内容不完整（写入中断或非本程序产物），重新计算")
+        return None
+    if "key" not in cached:                     # 无 key 字段：早于缓存校验的产物
+        print(f"[Cache] {path} 是旧版本产物（无校验键），重新计算")
+        return None
+    if cached["key"] != key:
+        print(f"[Cache] 参数或输入文件已变（缓存 key={cached['key']}，"
+              f"当前 {key}），重新计算")
+        return None
+    return cached
+
+
 def main(argv=None):
     args = parse_args(argv)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -125,14 +197,8 @@ def main(argv=None):
     print(f"[Plan {args.plan}] {plan.description}")
     print(f"[Meta] {w}x{h} {fps:.2f}fps 处理 {total} 帧 -> {args.canvas_video}")
 
-    cached = None
-    if os.path.exists(cache_path):
-        with open(cache_path, "rb") as f:
-            cached = pickle.load(f)
-        if cached.get("plan") != args.plan:
-            print(f"[Cache] 缓存来自 Plan {cached.get('plan')}，与当前 Plan "
-                  f"{args.plan} 不符，重新计算")
-            cached = None
+    key = cache_key(args, total)
+    cached = load_cache(cache_path, key)
 
     if cached:
         print(f"[Cache] 复用 {cache_path}（删除该文件可强制重跑）")
@@ -147,8 +213,9 @@ def main(argv=None):
         all_boxes, raw_seq = plan.run(args.canvas_video, total)
         plan.report(time.time() - t0, total)
         with open(cache_path, "wb") as f:
-            pickle.dump({"plan": args.plan, "all_boxes": all_boxes,
-                         "raw_seq": raw_seq, "meta": (w, h, fps, total)}, f)
+            pickle.dump({"key": key, "plan": args.plan,
+                         "all_boxes": all_boxes, "raw_seq": raw_seq,
+                         "meta": (w, h, fps, total)}, f)
         print(f"[Cache] 已写 {cache_path}")
     print(f"[Stage1/2] {len(all_boxes)} 帧有检测，{len(raw_seq)} 个 track 有关键点")
 
@@ -195,6 +262,9 @@ def render(canvas_video, out_path, all_boxes, cum_map, meta, canvas_kpts=None,
 
     codec='h264' 走 ffmpeg libx264（文件约为 mp4v 的一半，画质更好，且
     浏览器/播放器兼容性好）；imageio-ffmpeg 不可用时自动回退 opencv mp4v。
+
+    这里用 -preset medium -crf 20（离线出片，画质优先）；C++ 实时链路的 Writer
+    用 veryfast/crf23（编码不能拖慢采集），故两者产物的体积与画质不可直接对比。
     """
     w, h, fps, total = meta
     cap = cv2.VideoCapture(canvas_video)
@@ -210,7 +280,8 @@ def render(canvas_video, out_path, all_boxes, cum_map, meta, canvas_kpts=None,
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
         except ImportError:
-            print("[Render] 未安装 imageio-ffmpeg，回退 mp4v")
+            print("[Render] 警告：未安装 imageio-ffmpeg，回退 mp4v（体积约翻倍）。"
+                  "装回：pip install imageio-ffmpeg==0.6.0")
     if proc is None:
         writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 

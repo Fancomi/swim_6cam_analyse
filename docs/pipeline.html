@@ -160,12 +160,21 @@ mjx-container[display="true"]{overflow-x:auto;overflow-y:hidden;max-width:100%;p
 </head>
 <body>
 <div class="wrap">
-<h1>swim_6cam_analyse：六路相机游泳分析计算链路</h1>
+<h1>swim_6cam_analyse：Plan A 计算链路</h1>
 
 <p class="lede">
 六机位拍摄的泳池被拼成一张全景画布：<b>在画布上做检测与跟踪</b>（视野全、ID 连续），
 再用泳池的三角网格把每个人的框<b>映射回拍得最清楚的那路原始相机</b>去回归 17 个关键点，
 最后由关键点时序算出划水次数、由框中心轨迹算出速度，叠回画布输出标注视频。
+</p>
+
+<p class="note">
+<b>本页只讲 Plan A</b>（跨相机 mesh 方案，Python 参考实现）。Plan B/C 把 Stage1+2 换成
+画布单遍或画布两阶段，Stage3/4 完全相同；三套方案的指标对比见 <code>README.md</code>，
+C++ 实时链路（Plan C）见 <code>cpp/README.md</code>。
+<b>本页所有数字的口径是：Plan A · 数据集 <code>data/20260629</code> · 单张 H800</b>，
+该数据集平均 19.3 人/帧，与 C++ 链路用的 <code>data/20260730</code>（8.0 人/帧）人数密度差一倍以上，
+两者的耗时与统计量不可直接比较。
 </p>
 
 <div class="grid g4">
@@ -176,7 +185,7 @@ mjx-container[display="true"]{overflow-x:auto;overflow-y:hidden;max-width:100%;p
 </div>
 
 <p class="note">
-本页所有数字均来自这一次 3000 帧全量运行的实测日志与缓存统计。凡是推断而非实测的结论都标了
+本页所有数字均来自这一次 3000 帧全量运行（Plan A · <code>data/20260629</code> · H800）的实测日志与缓存统计。凡是推断而非实测的结论都标了
 <span class="mark m-inf">推断</span>，尚未验证的标 <span class="mark m-tbc">待确认</span>。
 </p>
 
@@ -273,7 +282,7 @@ RTMPose 输入是 192×256，画布上 225×83 的框被拉到该尺寸时纵向
       <b>按面积从大到小排序</b>。面积越大 ≈ 该相机看这个人越"占像素"≈ 越清晰。</li>
   <li><b>取第一名</b>，进入批量推理。</li>
   <li><b>仅当</b>该目标 17 个关键点的<b>平均置信度低于阈值</b>
-      （<code>--kpt-thr</code>，默认 0.4）时，才用<b>第二名</b>相机对这个人单独再推一次；
+      （<code>--pose-score-thr</code>，默认 0.4）时，才用<b>第二名</b>相机对这个人单独再推一次；
       新结果达标就换用它（坐标系一并切换），否则保留原结果。<b>只补检一次，不再往下扩展。</b></li>
 </ol>
 <p><b>实测候选数分布</b>（同上 563 个框）：</p>
@@ -392,7 +401,7 @@ flowchart TB
   D["按相机分组<br/>平均 4.65 组/帧 · 4.15 框/组"]:::s2
   E["读该相机第 fi 帧 4K 图<br/>MultiVideoReader 帧缓存去重"]:::io2
   F["RTMPose inference_topdown<br/>整帧 + 一批 bbox → 17 关键点"]:::s2
-  G{"17 点平均置信度<br/>≥ kpt-thr 0.4 ?"}:::dec
+  G{"17 点平均置信度<br/>≥ pose-score-thr 0.4 ?"}:::dec
   H["写入 raw_seq"]:::data
   I["取第二名相机<br/>对该目标单独重推一次"]:::retry
   J{"新结果<br/>≥ 0.4 ?"}:::dec
@@ -570,7 +579,8 @@ k^\star=\arg\max_k \mathrm{area}_k
 \quad\Longrightarrow\quad \text{用次优相机 } k^{\star\star} \text{ 重推一次}
 \]
 <p>
-\(\tau\) 即 <code>--kpt-thr</code>（默认 0.4）。新结果满足 \(\bar{s}'\ge\tau\) 才替换，
+\(\tau\) 即 <code>--pose-score-thr</code>（默认 0.4，与绘制用的 <code>--kpt-thr</code>
+是两个独立参数）。新结果满足 \(\bar{s}'\ge\tau\) 才替换，
 否则保留原结果——低置信度点在下游会被过滤，不需要引入新的处理分支。
 </p>
 </div>

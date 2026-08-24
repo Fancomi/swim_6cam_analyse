@@ -3,20 +3,27 @@
     pytest tests/ -q      或      python tests/test_core.py
 """
 
+import json
 import os
+import pickle
 import sys
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
+# 拼接查找表的烘制脚本在 cpp/tools/（服务 C++ 链路的一次性工具，不是库）
+sys.path.insert(0, os.path.join(_HERE, "..", "cpp", "tools"))
 
+from swim_analyse.cli import cache_key, load_cache, parse_args
 from swim_analyse.geometry import MeshProjector, _Grid, _in_triangle
 from swim_analyse.metrics import (_detect_valleys, _detect_zero_crossings, _fill_nan,
                                   _local_stats, _smooth, compute_speed, count_strokes,
                                   cumulative_counts)
-from swim_analyse.pose import KPT_THR, interpolate_keypoints
-from swim_analyse.tracking import SimpleTracker, filter_contained_boxes
+from swim_analyse.pose import interpolate_keypoints
+from swim_analyse.tracking import (SimpleTracker, contained_keep_mask,
+                                   filter_contained_boxes)
 
 FPS = 30.0
 
@@ -92,6 +99,18 @@ def test_filter_contained_boxes():
     assert filter_contained_boxes([]) == []
 
 
+def test_contained_keep_mask_indexes_parallel_arrays():
+    """掩码要能直接索引与 boxes 同序的关键点数组，且分数重复时不错配。"""
+    boxes = [(0, 0, 100, 100, 0.5), (10, 10, 30, 30, 0.5),
+             (500, 500, 600, 600, 0.5)]     # 三个 conf 完全相同
+    keep = contained_keep_mask(boxes)
+    assert keep.dtype == bool and keep.shape == (3,)
+    assert list(keep) == [True, False, True], "conf 相等时丢弃被包住的那个"
+    kpts = np.arange(3 * 17 * 2, dtype=float).reshape(3, 17, 2)
+    assert np.array_equal(kpts[keep], kpts[[0, 2]])
+    assert [b for b, k in zip(boxes, keep) if k] == filter_contained_boxes(boxes)
+
+
 def test_tracker_keeps_id_across_frames():
     tracker = SimpleTracker(iou_thresh=0.3, max_lost=2)
     ids = [tracker.update([(x, 0, x + 100, 100, 0.9)])[0][0] for x in (0, 10, 20)]
@@ -108,7 +127,44 @@ def test_tracker_new_id_after_jump_and_lost_expiry():
     assert tracker.tracks == {}, "超过 max_lost 的 track 应被清除"
 
 
-def test_tracker_matches_two_targets_independently():
+def test_tracker_reuses_id_after_brief_loss():
+    """max_lost 之内的短暂丢检应复用同一 id —— 遮挡场景的核心诉求。"""
+    tracker = SimpleTracker(iou_thresh=0.3, max_lost=5)
+    first = tracker.update([(0, 0, 100, 100, 0.9)])[0][0]
+    for _ in range(3):
+        tracker.update([])                      # 连续 3 帧丢检，未到 max_lost
+    again = tracker.update([(5, 0, 105, 100, 0.9)])[0][0]
+    assert again == first, "丢检未超期时应复用原 id 而非新建"
+
+
+def test_tracker_is_deterministic_under_shuffled_input():
+    """同一序列跑两遍必须得到逐位相同的 id —— C++ 侧要按帧对齐，靠这条守着。"""
+    rng = np.random.default_rng(7)
+    dets = []
+    for fi in range(50):
+        boxes = [(200 * j + 2 * fi, 0, 200 * j + 2 * fi + 100, 100, 0.9)
+                 for j in range(6)]
+        rng.shuffle(boxes)                      # 每帧打乱检测顺序
+        dets.append(boxes)
+
+    def run():
+        t = SimpleTracker()
+        return [[p[0] for p in t.update(list(b))] for b in dets]
+
+    assert run() == run()
+
+
+def test_tracker_tie_break_is_stable():
+    """两个 track 对同一检测框 IoU 完全相等时，配对结果必须可复现。"""
+    def run():
+        t = SimpleTracker(iou_thresh=0.1)
+        t.update([(0, 0, 100, 100, 0.9), (100, 0, 200, 100, 0.9)])
+        return [p[0] for p in t.update([(50, 0, 150, 100, 0.9)])]   # 与两者各半重叠
+    assert run() == run()
+
+
+def test_tracker_matches_by_iou_not_input_order():
+    """检测框顺序打乱时，配对仍应按 IoU 走，且 id 集合不变。"""
     tracker = SimpleTracker()
     a = tracker.update([(0, 0, 100, 100, 0.9), (400, 0, 500, 100, 0.9)])
     b = tracker.update([(410, 0, 510, 100, 0.9), (5, 0, 105, 100, 0.9)])   # 顺序反了
@@ -297,6 +353,127 @@ def test_compute_speed_constant_motion():
 def test_compute_speed_ignores_single_frame_track():
     samples, frame_map = compute_speed({0: [(9, 0, 0, 10, 10, 0.9)]}, FPS, 100.0, 10)
     assert 9 not in samples and 9 not in frame_map
+
+
+# ── cli: Stage1/2 缓存键 ────────────────────────────────────────────────────
+
+def _args(tmp_path, weight, *extra):
+    """构造一份 Plan C 的最小参数（不触碰视频，只要路径存在即可算指纹）。"""
+    return parse_args([
+        "--plan", "C", "--canvas-video", str(tmp_path / "canvas.mp4"),
+        "--output-dir", str(tmp_path), "--yolo-model", str(weight),
+        "--pose-config", str(weight), "--pose-checkpoint", str(weight), *extra])
+
+
+def test_cache_key_covers_params_and_weight_mtime(tmp_path):
+    weight = tmp_path / "w.pt"
+    weight.write_bytes(b"v1")
+    base = cache_key(_args(tmp_path, weight), 100)
+
+    assert cache_key(_args(tmp_path, weight), 100) == base, "同参同文件应稳定命中"
+    assert cache_key(_args(tmp_path, weight), 200) != base, "帧数不同应 miss"
+    assert cache_key(_args(tmp_path, weight, "--conf", "0.5"), 100) != base
+    assert cache_key(_args(tmp_path, weight, "--containment", "0.5"), 100) != base
+    # Stage3/4 的参数不该影响 Stage1/2 缓存
+    assert cache_key(_args(tmp_path, weight, "--kpt-thr", "0.9"), 100) == base
+    assert cache_key(_args(tmp_path, weight, "--signal", "wrist_x_head"), 100) == base
+
+    other = tmp_path / "w2.pt"
+    other.write_bytes(b"v1")
+    assert cache_key(_args(tmp_path, other), 100) != base, "换权重路径应 miss"
+    weight.write_bytes(b"version-2-longer")             # 同名覆盖 -> 大小变化
+    assert cache_key(_args(tmp_path, weight), 100) != base, "权重内容变了应 miss"
+
+
+def test_load_cache_hit_miss_and_legacy(tmp_path):
+    path = tmp_path / "cache.pkl"
+    assert load_cache(str(path), "k1") is None, "文件不存在 -> miss"
+
+    payload = {"key": "k1", "all_boxes": {}, "raw_seq": {}}
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+    assert load_cache(str(path), "k1") == payload
+    assert load_cache(str(path), "k2") is None, "key 不符 -> miss"
+
+    with open(path, "wb") as f:                        # 旧格式：只有 plan，无 key
+        pickle.dump({"plan": "C", "all_boxes": {}, "raw_seq": {}}, f)
+    assert load_cache(str(path), "k1") is None, "旧格式 -> miss 而非异常"
+
+    path.write_bytes(b"not a pickle")                  # 损坏文件也只能 miss
+    assert load_cache(str(path), "k1") is None
+
+
+# ── 拼接查找表（六路 -> 画布，仅 C++ 链路用；纯几何，无需 GPU）───────────────
+
+def _flat_mesh(x0, y0, w, h):
+    """一个 w×h 米的矩形面片（两个三角形），UV 铺满整张纹理。"""
+    def vert(u, v):
+        return {"pos": [x0 + u * w, y0 + v * h], "uv": [u, v]}
+
+    return {"node": f"P{x0}_{y0}",
+            "triangles": [[vert(0, 0), vert(1, 0), vert(1, 1)],
+                          [vert(0, 0), vert(1, 1), vert(0, 1)]]}
+
+
+def test_stitch_lut_roundtrip(tmp_path):
+    """烘出的表能被自己读回，且几何、权重、覆盖都自洽。
+
+    这是 C++ 侧 StitchLut::load 的同构校验：两边读同一份字节，Python 这边
+    先把契约钉住（header 尺寸、bbox 在画布内、权重和为 1、无空洞）。
+    """
+    import build_stitch_lut as S
+
+    # 两块横向重叠 2 米的面片：制造一条羽化带，覆盖并集是 18x10 米
+    mesh = {"meshes": [_flat_mesh(0, 0, 10, 10), _flat_mesh(8, 0, 10, 10)]}
+    mesh_json = tmp_path / "mesh.json"
+    mesh_json.write_text(json.dumps(mesh), encoding="utf-8")
+    out = tmp_path / "t.lut"
+
+    info = S.build(mesh_json, out, ppm=10.0, neg_v=False, neg_u=False,
+                   camera_ids=("camA", "camB"), src_size=(64, 32))
+    # 18x10 米 @10px/m -> 181x101 像素，向上取偶
+    assert (info["width"], info["height"]) == (182, 102)
+    assert info["cameras"] == 2 and info["holes"] == 0
+
+    raw = out.read_bytes()
+    hdr = S.HEADER.unpack_from(raw)
+    assert hdr[0] == S.MAGIC and hdr[1] == 1
+    assert hdr[2] == S.HEADER.size == 72          # C++ 侧 static_assert 同一个数
+    assert (hdr[3], hdr[4]) == (182, 102)         # 画布
+    assert (hdr[5], hdr[6]) == (64, 32)           # 源图
+    assert hdr[7] == 2 and hdr[8] == S.CAMERA.size == 48
+
+    total = np.zeros((102, 182), np.float64)
+    for i, name in enumerate(("camA", "camB")):
+        cid, bx, by, bw, bh, coff, woff = S.CAMERA.unpack_from(
+            raw, S.HEADER.size + i * S.CAMERA.size)
+        assert cid.split(b"\0")[0].decode() == name
+        assert bx + bw <= 182 and by + bh <= 102, "bbox 必须在画布内"
+        coords = np.frombuffer(raw, "<f4", bw * bh * 2, coff).reshape(bh, bw, 2)
+        weight = np.frombuffer(raw, "<u2", bw * bh, woff).reshape(bh, bw)
+        # 源坐标必须落在源图内（越界会让 kernel 采到镜像像素）
+        covered = weight > 0
+        assert coords[..., 0][covered].min() >= 0
+        assert coords[..., 0][covered].max() <= 64
+        assert coords[..., 1][covered].max() <= 32
+        total[by:by + bh, bx:bx + bw] += weight / 65535.0
+
+    inside = total > 0
+    assert inside.sum() == 181 * 101, "logical 区域应全覆盖，补边不覆盖"
+    # 权重全局归一化：kernel 因此不必再除 alpha（只兜 u16 量化残差）
+    assert np.allclose(total[inside], 1.0, atol=2.0 / 65535.0)
+    assert not inside[101].any() and not inside[:, 181].any(), "补边行列不应有覆盖"
+
+
+def test_stitch_lut_rejects_camera_count_mismatch(tmp_path):
+    import build_stitch_lut as S
+
+    mesh_json = tmp_path / "m.json"
+    mesh_json.write_text(json.dumps({"meshes": [_flat_mesh(0, 0, 4, 4)]}),
+                         encoding="utf-8")
+    with pytest.raises(SystemExit):
+        S.build(mesh_json, tmp_path / "x.lut", ppm=10.0, neg_v=False,
+                neg_u=False, camera_ids=("a", "b"), src_size=(32, 16))
 
 
 if __name__ == "__main__":
