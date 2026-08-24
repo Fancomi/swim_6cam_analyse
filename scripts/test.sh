@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 一条命令验证仓库还好用。默认只跑秒级检查，加 --full 才跑 GPU 冒烟。
+# 一条命令验证仓库还好用。三档由快到慢，各自回答一个不同的问题。
 #
-#   bash scripts/test.sh          # 单元测试 + 入口脚本语法（无需 GPU/权重，约 2 秒）
-#   bash scripts/test.sh --full   # 再加 Python Plan C、C++ 画布、C++ 六路拼接各 30 帧
+#   bash scripts/test.sh            # 能跑吗：单元测试 + 入口脚本语法（无 GPU，约 2 秒）
+#   bash scripts/test.sh --full     # 跑得通吗：Python Plan C、C++ 画布、C++ 六路各 30 帧
+#   bash scripts/test.sh --baseline # 数字没变吗：四种组合各 3000 帧核对基线（约 5 分钟）
 #
 # 冒烟的产物全部落在 output/_smoke_*，跑完自动删除。
 set -uo pipefail
@@ -10,7 +11,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # scripts/ 的上一级 = 仓库根
 cd "$ROOT"
 export PYTHONUTF8=1
-FULL=0; [[ "${1:-}" == "--full" ]] && FULL=1
+FULL=0; BASE=0
+case "${1:-}" in --full) FULL=1;; --baseline) BASE=1;; esac
 
 PASS=0; FAIL=0
 ok()   { printf '\033[1;32m[ok]\033[0m   %s\n' "$1"; PASS=$((PASS+1)); }
@@ -76,55 +78,109 @@ else
   skip "单元测试" "未找到 .venv，先跑 bash scripts/install.sh"
 fi
 
-# ── 3. GPU 冒烟（--full）────────────────────────────────────────────────────
+# ── 3. GPU 档：--full「跑得通吗」30 帧；--baseline「数字没变吗」3000 帧 ──────
 CANVAS="${CANVAS:-$ROOT/data/20260730/merged_3000f.mp4}"
-if [[ $FULL -eq 0 ]]; then
-  echo "（加 --full 可跑 30 帧的 Python + C++（画布与六路拼接）真实冒烟）"
+CAMS="${CAM_DIR:-D:/WindowsProject/workspace/SWIM/20260730-4k-raw}"
+EXE="$ROOT/cpp/build/Release/swim_analyse.exe"
+[[ -x "$EXE" ]] || EXE="$ROOT/cpp/build/swim_analyse"
+
+# TRT 的动态库不在默认搜索路径里；Linux 用 RPATH（CMake 已写入），Windows 只能
+# 靠 PATH。注意 Git Bash 的 PATH 以 ':' 分隔，"D:/x" 会被拆成 "D" 和 "/x" 两项
+# 而失效，所以要先转成 /d/x 形式。
+trt_path() {
+  local lib="${SWIM_TRT_LIB:-D:/WindowsProject/workspace/TRT/TensorRT-10.11.0.33/lib}"
+  [[ -d "$lib" ]] || return 0
+  command -v cygpath >/dev/null && lib="$(cygpath -u "$lib")"
+  export PATH="$lib:$PATH"
+}
+# 交给 Windows 进程（exe / .venv 的 python.exe）的路径必须是 Windows 形式：
+# msys 的 /tmp/xxx 会被当成相对路径，静默写不出文件而不报错。
+win() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
+
+# 全量核对：把 [Summary] 的三元组（人次 / track / 划水）与基线比。四种组合互不
+# 可比，各自只对自己那一行，口径见 CLAUDE.md「怎么验证一处改动」。
+baseline() { local name="$1" want="$2"; shift 2
+  local log; log="$(mktemp)"
+  if ! "$@" >"$log" 2>&1; then bad "$name（进程失败）"; tail -15 "$log"; rm -f "$log"; return; fi
+  # 锚定 ^[Summary]：耗时表的表头也含「累计(s)」，不锚就会被它清空；
+  # ghost 那行同样含「人次」但不含「累计」，两条都得排除掉。
+  local got
+  got="$(awk '/^\[Summary\].*累计/{n=$5;t=$7} /^\[Summary\].*划水合计/{s=$3}
+              END{printf "%s %s %s",n,t,s}' "$log")"
+  local ms; ms="$(awk '/ms\/帧/{for(i=1;i<=NF;i++) if($i=="ms/帧"){print $(i-1)" ms";exit}}' "$log")"
+  rm -f "$log"
+  [[ "$got" == "$want" ]] && ok "$name  $got  ${ms:-—}" \
+                          || bad "$name 基线不符：期望「$want」实得「$got」"
+}
+
+# rot180 的正确性判据：转过的首帧 == 不转的首帧再 [::-1,::-1]，**逐字节**。
+# 它比任何统计量都灵敏，且与推理无关 —— detect 对定向不是旋转等变的
+# （letterbox + 卷积），统计三元组只能各自对基线，不能相互 diff。
+rot_oracle() { local name="$1"; shift              # "$@" = 取一帧的命令前缀
+  local d; d="$(mktemp -d)"
+  local a b; a="$(win "$d/up.png")"; b="$(win "$d/rot.png")"
+  if "$@" --max-frames 1 --dump-canvas "$a" >/dev/null 2>&1 &&
+     "$@" --max-frames 1 --rot180 --dump-canvas "$b" >/dev/null 2>&1 &&
+     "$PYTHON" -c "
+import sys, cv2, numpy as np
+a, b = cv2.imread(sys.argv[1]), cv2.imread(sys.argv[2])
+sys.exit(0 if a is not None and b is not None and np.array_equal(a[::-1, ::-1], b) else 1)
+" "$a" "$b"; then ok "$name"; else bad "$name"; fi
+  rm -rf "$d"
+}
+
+if [[ $FULL -eq 0 && $BASE -eq 0 ]]; then
+  echo "（--full 跑 30 帧真实冒烟；--baseline 跑 3000 帧核对基线三元组，约 5 分钟）"
 elif [[ ! -f "$CANVAS" ]]; then
-  skip "GPU 冒烟" "缺少画布视频 $CANVAS（用 CANVAS=... 指定）"
+  skip "GPU 档" "缺少画布视频 $CANVAS（用 CANVAS=... 指定）"
 else
-  SMOKE="$ROOT/output/_smoke_py"
-  if [[ -x "$PYTHON" && -f weights/plans/planC_rtmpose_m_canvas.pth ]]; then
-    rm -rf "$SMOKE"
-    run "Python Plan C 30 帧" env CANVAS="$CANVAS" OUTPUT_DIR="$SMOKE" \
-      bash scripts/run.sh C --max-frames 30
-    [[ -f "$SMOKE/result.json" ]] && ok "Plan C 产出 result.json" \
-                                  || bad "Plan C 未产出 result.json"
-    rm -rf "$SMOKE"
-  else
-    skip "Python Plan C" "缺少 .venv 或 Plan C 权重"
-  fi
+  trt_path
+  CPP=0;    [[ -x "$EXE" && -f cpp/models/detect.onnx ]] && CPP=1
+  STITCH=0; [[ $CPP -eq 1 && -d "$CAMS" && -f cpp/models/stitch.lut ]] && STITCH=1
+  ORACLE=0; [[ $CPP -eq 1 && -x "$PYTHON" ]] && ORACLE=1
+  [[ $CPP -eq 1 ]] || skip "C++ 档" "未构建（双击 scripts/build.bat）或缺少 cpp/models/*.onnx"
+  [[ $STITCH -eq 1 || $CPP -eq 0 ]] || \
+    skip "六路拼接" "缺少六路原片 $CAMS（用 CAM_DIR=... 指定）或 cpp/models/stitch.lut"
 
-  EXE="$ROOT/cpp/build/Release/swim_analyse.exe"
-  [[ -x "$EXE" ]] || EXE="$ROOT/cpp/build/swim_analyse"
-  if [[ -x "$EXE" && -f cpp/models/detect.onnx ]]; then
-    # TRT 的动态库不在默认搜索路径里；Linux 用 RPATH（CMake 已写入），
-    # Windows 只能靠 PATH。注意 Git Bash 的 PATH 以 ':' 分隔，"D:/x" 会被
-    # 拆成 "D" 和 "/x" 两项而失效，所以要先转成 /d/x 形式。
-    TRT_LIB="${SWIM_TRT_LIB:-D:/WindowsProject/workspace/TRT/TensorRT-10.11.0.33/lib}"
-    if [[ -d "$TRT_LIB" ]]; then
-      command -v cygpath >/dev/null && TRT_LIB="$(cygpath -u "$TRT_LIB")"
-      export PATH="$TRT_LIB:$PATH"
-    fi
-    JSON="$ROOT/output/_smoke_cpp.json"
-    run "C++ 30 帧" "$EXE" --input "$CANVAS" --models cpp/models \
-        --max-frames 30 --json "$JSON"
-    [[ -s "$JSON" ]] && ok "C++ 产出 json" || bad "C++ 未产出 json"
-    rm -f "$JSON"
-
-    # 六路上游拼接（--cam-dir）：要有六路原片与烘好的表才跑
-    CAMS="${CAM_DIR:-D:/WindowsProject/workspace/SWIM/20260730-4k-raw}"
-    if [[ -d "$CAMS" && -f cpp/models/stitch.lut ]]; then
-      JSON="$ROOT/output/_smoke_stitch.json"
-      run "C++ 六路拼接 30 帧" "$EXE" --cam-dir "$CAMS" --models cpp/models \
-          --max-frames 30 --json "$JSON"
-      [[ -s "$JSON" ]] && ok "六路拼接产出 json" || bad "六路拼接未产出 json"
-      rm -f "$JSON"
+  if [[ $FULL -eq 1 ]]; then
+    SMOKE="$ROOT/output/_smoke_py"
+    if [[ -x "$PYTHON" && -f weights/plans/planC_rtmpose_m_canvas.pth ]]; then
+      rm -rf "$SMOKE"
+      run "Python Plan C 30 帧" env CANVAS="$CANVAS" OUTPUT_DIR="$SMOKE" \
+        bash scripts/run.sh C --max-frames 30
+      [[ -f "$SMOKE/result.json" ]] && ok "Plan C 产出 result.json" \
+                                    || bad "Plan C 未产出 result.json"
+      rm -rf "$SMOKE"
     else
-      skip "C++ 六路拼接" "缺少六路原片 $CAMS（用 CAM_DIR=... 指定）或 cpp/models/stitch.lut"
+      skip "Python Plan C" "缺少 .venv 或 Plan C 权重"
     fi
+
+    for t in "画布|--input|$CANVAS|$CPP" "六路拼接|--cam-dir|$CAMS|$STITCH"; do
+      IFS='|' read -r nm flag src on <<<"$t"    # 不能用 ':' 分隔：CAM_DIR 是 D:/… 带盘符冒号
+      [[ $on -eq 1 ]] || continue
+      JSON="$ROOT/output/_smoke_${flag#--}.json"
+      run "C++ $nm 30 帧" "$EXE" "$flag" "$src" --models cpp/models \
+          --max-frames 30 --json "$JSON"
+      [[ -s "$JSON" ]] && ok "C++ $nm 产出 json" || bad "C++ $nm 未产出 json"
+      rm -f "$JSON"
+      # 单帧的字节判据：比统计量灵敏，代价只是多一次 engine 加载
+      [[ $ORACLE -eq 1 ]] && rot_oracle "rot180 逐字节（$nm）" \
+        "$EXE" "$flag" "$src" --models cpp/models
+    done
   else
-    skip "C++ 冒烟" "未构建（双击 scripts/build.bat）或缺少 cpp/models/*.onnx"
+    # 基线三元组（RTX 4080 Laptop / data/20260730 与 20260730-4k-raw / 默认参数）
+    [[ $CPP -eq 1 ]] && {
+      baseline "画布 3000 帧      " "24107 63 376" \
+        "$EXE" --input "$CANVAS" --models cpp/models --max-frames 3000 --show-fps
+      baseline "画布 3000 帧 rot180" "24233 90 361" \
+        "$EXE" --input "$CANVAS" --models cpp/models --max-frames 3000 --show-fps --rot180
+    }
+    [[ $STITCH -eq 1 ]] && {
+      baseline "六路 3000 帧      " "25078 91 379" \
+        "$EXE" --cam-dir "$CAMS" --models cpp/models --max-frames 3000 --show-fps
+      baseline "六路 3000 帧 rot180" "25578 119 359" \
+        "$EXE" --cam-dir "$CAMS" --models cpp/models --max-frames 3000 --show-fps --rot180
+    }
   fi
 fi
 

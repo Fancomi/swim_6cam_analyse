@@ -195,23 +195,31 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 
 ## 怎么验证一处改动
 
-```bash
-bash scripts/test.sh         # 语法 + 单元测试（约 2 秒，无需 GPU）
-bash scripts/test.sh --full  # 再加 Python Plan C、C++ 画布、C++ 六路拼接各 30 帧
-```
-
-改了 C++ 且要证明"没改数值"，跑全量 3000 帧对基线：
+**三档，各回答一个不同的问题**。先跑够格的那一档，别手工拼命令 —— 基线三元组
+（人次 / track / 划水）由脚本自己核对，省掉「跑完再回头翻文档比数字」这一步。
 
 ```bash
-cpp/build/Release/swim_analyse.exe --input data/20260730/merged_3000f.mp4 \
-    --models cpp/models --json out.json --show-fps
+bash scripts/test.sh            # 能跑吗：语法 + 编码 + 单元测试（约 2 秒，无需 GPU）
+bash scripts/test.sh --full     # 跑得通吗：Python Plan C、C++ 画布、C++ 六路各 30 帧
+                                #           外加 rot180 的逐字节判据（画布 + 六路）
+bash scripts/test.sh --baseline # 数字没变吗：四种组合各 3000 帧核对基线（约 5 分钟）
 ```
 
-**基线（RTX 4080 Laptop，`data/20260730/merged_3000f.mp4`，3000 帧，默认参数）**：
-24107 人次、63 个 track、划水合计 376 次。纯分析与渲染两种模式的 `--json` 与
-`--dump` 应**逐字节相同**；不同就说明渲染路径动了帧缓冲。
-`--decoder cpu`（OpenCV/MSMF）是**另一组合法数字**（24245 人次、63 track），
-因为 MSMF 与 swscale 的 YUV→BGR 换算不同，不是回归。
+改了推理链路就跑 `--baseline`：它把下面四组数字写死在脚本里，不符会指出期望与实得，
+不必人工比对。四组互不可比，各自只对自己那一行。
+
+| 组合 | 人次 | track | 划水 |
+| --- | --- | --- | --- |
+| 画布 `--input` | 24107 | 63 | 376 |
+| 画布 `--rot180` | 24233 | 90 | 361 |
+| 六路 `--cam-dir` | 25078 | 91 | 379 |
+| 六路 `--rot180` | 25578 | 119 | 359 |
+
+口径：RTX 4080 Laptop、`data/20260730/merged_3000f.mp4` 与 `20260730-4k-raw`、
+默认参数。耗时随机器负载抖（画布实测 13.5~19.6 ms/帧），**不作为判据**。
+纯分析与渲染两种模式的 `--json` 与 `--dump` 应**逐字节相同**；不同就说明渲染路径
+动了帧缓冲。`--decoder cpu`（OpenCV/MSMF）是**另一组合法数字**（24245 人次、
+63 track），因为 MSMF 与 swscale 的 YUV→BGR 换算不同，不是回归。
 
 改了拼接（`stitch.cu` / `build_stitch_lut.py` / `configs/pool_mesh.json`）：
 
@@ -220,21 +228,17 @@ cpp/build/Release/swim_analyse.exe --input data/20260730/merged_3000f.mp4 \
 cpp/build/Release/swim_analyse.exe --cam-dir <六路片段目录> --models cpp/models \
     --max-frames 1 --dump-canvas f0.png
 # 2) 全量分析数字
-cpp/build/Release/swim_analyse.exe --cam-dir <六路片段目录> --models cpp/models \
-    --max-frames 3000 --json out.json --show-fps
+bash scripts/test.sh --baseline
 ```
 
-**拼接基线（RTX 4080 Laptop，`20260730-4k-raw` 六路原片，3000 帧）**：画布 5002×2102、
-25078 人次、91 个 track、划水合计 379 次、26.2 ms/帧（38.2 fps）。
-首帧画布与离线 CPU 参考差 **mean|d| 0.34 灰阶 / 最大 3 / 100% 在 2 灰阶内**。
-它与 `--input` 那条路是**两组不可 diff 的数字**（画布差 0.34 灰阶就足以让短 track
-数量变化），各自对自己的基线。
+**六路那两行还多一条独立判据**：画布 5002×2102，首帧与离线 CPU 参考差
+**mean|d| 0.34 灰阶 / 最大 3 / 100% 在 2 灰阶内**。它与 `--input` 那条路
+**不可 diff**（画布差 0.34 灰阶就足以让短 track 数量变化）。
 
-**`--rot180` 又各自是一组基线**（画布 24233 人次 / 90 track / 361 划水；六路现拼
-25578 / 119 / 359）：detect 对定向不是旋转等变的，转与不转不能相互 diff。旋转本身
-的正确性用 `--dump-canvas` 验：转过的首帧应与「不转的首帧再 `[::-1,::-1]`」
-**逐字节相同**，这是灵敏且与推理无关的判据。耗时不应变化（实测 +0.1 ms/帧，
-在 run 间抖动内）。口径与实现见 `cpp/README.md`「画面定向」。
+**`--rot180` 也是各自的基线**：detect 对定向不是旋转等变的，转与不转不能相互 diff。
+旋转本身的正确性另有判据 —— 转过的首帧应与「不转的首帧再 `[::-1,::-1]`」
+**逐字节相同**，灵敏且与推理无关，`--full` 档已把它自动化（两条输入路径各一条）。
+耗时不应变化。口径与实现见 `cpp/README.md`「画面定向」。
 
 改了 Python 侧，用同一段跑 `bash scripts/run.sh C --max-frames N` 前后对比 `result.json`。
 注意 `output/*/cache.pkl` 会跳过 Stage1/2，验证推理改动前先删。
