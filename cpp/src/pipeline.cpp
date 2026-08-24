@@ -1,6 +1,7 @@
 #include "swim/pipeline.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace swim {
@@ -39,6 +40,7 @@ void PipelineOptions::validate() const {
   SWIM_CHECK(containment > 0.f && containment <= 1.f, "包含率阈值须在 (0,1]");
   SWIM_CHECK(track_iou > 0.f && track_iou <= 1.f, "跟踪 IoU 阈值须在 (0,1]");
   SWIM_CHECK(track_max_lost >= 1, "track_max_lost 须 >=1");
+  SWIM_CHECK(ghost_sec >= 0.f, "--ghost 不能为负");
   SWIM_CHECK(ppm > 0.f, "--ppm 须为正（否则速度为 inf）");
   SWIM_CHECK(valid_stroke(stroke_type),
              "--stroke-type 只能是: " + std::string(kStrokeTypes));
@@ -61,7 +63,9 @@ void Pipeline::alloc_ring(std::vector<Slot<T>>& ring, size_t elems) {
 
 Pipeline::Pipeline(const PipelineOptions& opt, double fps)
     : opt_(opt), fps_(fps), chan_(opt.queue_depth),
-      tracker_(opt.track_iou, opt.track_max_lost),
+      // ghost 的秒数在这里一次换成帧数：跟踪器只认帧，帧率只有这里知道
+      tracker_(opt.track_iou, opt.track_max_lost,
+               int(std::lround(std::max(0.0, opt.ghost_sec * fps)))),
       metrics_(fps, opt.ppm, opt.kpt_thr,
                MetricsTracker::split_sides(opt.stroke_type), opt.signal) {
   opt_.validate();
@@ -262,7 +266,10 @@ void Pipeline::post_loop(const Sink& sink) {
       }
       tracker_.update(fr.persons);
       for (auto& p : fr.persons) {
-        metrics_.update(p.track_id, raw.index, p);
+        // ghost 占位框不是新观测：喂进去会在信号序列里插一个"原地不动"的样本，
+        // 划水与速度都会被抹平（信号位置按观测计数，见 metrics.h）。
+        // 但标签仍取该 track 的当前读数，于是占位期间显示的是最后一次真实值。
+        if (p.lost == 0) metrics_.update(p.track_id, raw.index, p);
         p.strokes = metrics_.strokes(p.track_id);
         p.speed   = metrics_.speed(p.track_id);
       }

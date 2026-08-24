@@ -66,7 +66,7 @@ void Tracker::update(std::vector<Person>& persons) {
   for (const auto& [tid, t] : tracks_)
     for (size_t i = 0; i < persons.size(); ++i) {
       const auto& p = persons[i];
-      const float v = iou(t.x1, t.y1, t.x2, t.y2, p.x1, p.y1, p.x2, p.y2);
+      const float v = iou(t.p.x1, t.p.y1, t.p.x2, t.p.y2, p.x1, p.y1, p.x2, p.y2);
       if (v >= iou_thr_) cands.push_back({v, tid, int(i)});
     }
   // stable_sort：IoU 相等时保持枚举序，配对结果与运行次数无关（决定论输出）
@@ -83,20 +83,35 @@ void Tracker::update(std::vector<Person>& persons) {
     used_det[c.di] = 1;
   }
 
-  // 先处理未匹配的既有 track：累加丢失计数，超阈值才删除。
+  // 先处理未匹配的既有 track：累加丢失计数，超阈值才删除；丢失还在 ghost 期内的
+  // 复制一份上次观测，待本帧真检出落地后再追加（占位框）。
   // 必须在给 persons 赋新 id 之前做 —— 否则新建的 id 已写进 tracks_，
   // 就分不清"本帧匹配上的"与"本帧新建的"，lost 永远累加不起来。
+  std::vector<Person> ghosts;
   for (auto it = tracks_.begin(); it != tracks_.end();) {
     if (matched.count(it->first)) { it->second.lost = 0; ++it; continue; }
-    it = (++it->second.lost > max_lost_) ? tracks_.erase(it) : std::next(it);
+    if (++it->second.lost > max_lost_) { it = tracks_.erase(it); continue; }
+    if (it->second.lost <= ghost_) {
+      ghosts.push_back(it->second.p);
+      ghosts.back().track_id = it->first;
+      ghosts.back().lost     = it->second.lost;
+    }
+    ++it;
   }
 
   // 再落地本帧结果：匹配上的沿用 id 并更新框，未匹配的检测框开新 id
   for (size_t i = 0; i < persons.size(); ++i) {
     auto& p = persons[i];
     p.track_id = assign[i] >= 0 ? assign[i] : next_id_++;
-    tracks_[p.track_id] = {p.x1, p.y1, p.x2, p.y2, 0};
+    p.lost     = 0;
+    tracks_[p.track_id] = {p, 0};
   }
+
+  // ghost 追加在真检出之后。按 id 排序而不是按 unordered_map 的遍历序，
+  // 否则同一份输入两次运行的输出顺序可能不同（--dump 就不再逐字节可复现）。
+  std::sort(ghosts.begin(), ghosts.end(),
+            [](const Person& a, const Person& b) { return a.track_id < b.track_id; });
+  persons.insert(persons.end(), ghosts.begin(), ghosts.end());
 }
 
 MetricsTracker::MetricsTracker(double fps, float ppm, float kpt_thr, bool split,

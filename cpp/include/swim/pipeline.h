@@ -91,6 +91,11 @@ struct PipelineOptions {
   float  containment      = 0.7f;         // 包含率去重阈值（交集/自身面积）
   float  track_iou        = 0.3f;
   int    track_max_lost   = 30;
+  /// ghost（丢检占位）时长，秒。detect 偶发漏检时让框停在原地这么久，画面不闪断；
+  /// 占位框只进渲染，不进统计与划水信号（见 Tracker 与 post_loop）。0 = 关闭。
+  /// 用秒而不是帧：漏检是时间现象，30/60 fps 两种源不该配两个值。实际占位帧数
+  /// 为 round(ghost_sec * fps)，且不会超过 track_max_lost（超了 track 已被删）。
+  float  ghost_sec        = 1.0f;
   float  ppm              = 100.f;         // 画布每米像素数
   /// 泳姿：只影响"左右是否分开计数"（对齐 metrics.py 的 split_sides）
   std::string  stroke_type = "freestyle";

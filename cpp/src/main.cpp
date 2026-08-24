@@ -43,9 +43,9 @@ namespace {
 constexpr int kSkel[][2] = {{15,13},{13,11},{16,14},{14,12},{11,12},{5,11},{6,12},
                             {5,6},{5,7},{7,9},{6,8},{8,10},{1,2},{0,1},{0,2},{1,3},{2,4}};
 
-cv::Scalar id_color(int id) {           // 与 Python 版同思路：按 id 稳定散列
+cv::Scalar id_color(int id, double k = 1.0) {   // 与 Python 版同思路：按 id 稳定散列
   const uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
-  return cv::Scalar((h >> 16) & 255, (h >> 8) & 255, h & 255);
+  return cv::Scalar(((h >> 16) & 255) * k, ((h >> 8) & 255) * k, (h & 255) * k);
 }
 
 /// 叠加层的三个开关。预览窗口里按 1/2/3 实时切换，`--out` 落盘用当前状态
@@ -152,6 +152,10 @@ std::vector<HelpRow> help_rows() {
     {"--track-iou", "F", sfmt("跟踪匹配的 IoU 阈值 (0,1] (默认 %g)", d.track_iou)},
     {"--track-max-lost", "N", sfmt("track 连续丢失多少帧后销毁 (默认 %d)",
                                    d.track_max_lost)},
+    {"--ghost", "SEC", sfmt("检测漏检时框原地停留的秒数 (默认 %g, 0=关闭)。\n"
+                            "占位框标 HOLD 且画得弱一档，只进画面，\n"
+                            "不进人次/track/划水统计与 --dump",
+                            d.ghost_sec)},
     {"--queue-depth", "N", sfmt("推理->后处理队列深度 1..%d (默认 %d)。渲染时每格\n"
                                 "多占一整帧锁页内存，调大只在后处理抖动时有用",
                                 kMaxQueueDepth, d.queue_depth)},
@@ -244,6 +248,7 @@ bool parse(int argc, char** argv, Args& a) {
     else if (k == "--track-iou")   o.track_iou   = frac(i, k);
     else if (k == "--track-max-lost")
       o.track_max_lost = int(integer(i, k, 1, 1 << 20));
+    else if (k == "--ghost")        o.ghost_sec = num(i, k, 0.0, 60.0);
     else if (k == "--queue-depth")
       o.queue_depth = int(integer(i, k, 1, kMaxQueueDepth));
     else if (k == "--stroke-type") o.stroke_type = need(i);
@@ -440,16 +445,22 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
   };
 
   for (const auto& p : fr.persons) {
-    const auto col = id_color(p.track_id);
+    // ghost（丢检占位）画得弱一档：颜色减半、线宽最细、标签加 HOLD 后缀，
+    // 于是"人还在但这一帧没检出"与"真检出"在画面上一眼可分。
+    const bool  gh  = p.lost > 0;
+    const auto  col = id_color(p.track_id, gh ? 0.5 : 1.0);
+    const int   lw  = gh ? 1 : th;
+    const double dim = gh ? 0.5 : 1.0;
     if (ov.boxes) {
-      cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, th);
+      cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, lw);
 
       char buf[96];
+      const char* tag = gh ? " HOLD" : "";
       if (std::isnan(p.speed))
-        snprintf(buf, sizeof buf, "ID:%d S:%d", p.track_id, p.strokes);
+        snprintf(buf, sizeof buf, "ID:%d S:%d%s", p.track_id, p.strokes, tag);
       else
-        snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s", p.track_id, p.strokes,
-                 p.speed);
+        snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s%s", p.track_id, p.strokes,
+                 p.speed, tag);
       int base = 0;
       const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, fs, th, &base);
       const int tx = int(p.x1 * s);
@@ -457,7 +468,7 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
       cv::rectangle(img, {tx, ty - sz.height - 4}, {tx + sz.width + 4, ty + 2},
                     col, cv::FILLED);
       cv::putText(img, buf, {tx + 2, ty}, cv::FONT_HERSHEY_SIMPLEX, fs,
-                  {255, 255, 255}, th, cv::LINE_AA);
+                  {255 * dim, 255 * dim, 255 * dim}, th, cv::LINE_AA);
     }
 
     if (!ov.kpts) continue;
@@ -465,12 +476,12 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
       if (p.scores[e[0]] < kpt_thr || p.scores[e[1]] < kpt_thr) continue;
       cv::line(img, pt(p.kpts[e[0] * 2], p.kpts[e[0] * 2 + 1]),
                pt(p.kpts[e[1] * 2], p.kpts[e[1] * 2 + 1]),
-               {0, 255, 0}, th, cv::LINE_AA);
+               {0, 255 * dim, 0}, lw, cv::LINE_AA);
     }
     for (int k = 0; k < kNumKpts; ++k)
       if (p.scores[k] >= kpt_thr)
         cv::circle(img, pt(p.kpts[k * 2], p.kpts[k * 2 + 1]), r,
-                   {0, 0, 255}, cv::FILLED, cv::LINE_AA);
+                   {0, 0, 255 * dim}, cv::FILLED, cv::LINE_AA);
   }
 }
 
@@ -587,7 +598,7 @@ int main(int argc, char** argv) try {
   }
 
   std::map<int, std::pair<int, float>> summary;   // track -> (划水, 末速)
-  int64_t n_person = 0;
+  int64_t n_person = 0, n_ghost = 0;
   const double t0 = now_ms();
   double last_log = t0;
   // 在 Sink 里首帧惰性构造：窗口必须由 pump 它的线程（后处理线程）创建
@@ -595,10 +606,14 @@ int main(int argc, char** argv) try {
   bool quit = false;
 
   pipe.run(*src, [&](const FrameResult& fr) {
-    n_person += static_cast<int64_t>(fr.persons.size());
-    for (const auto& p : fr.persons) summary[p.track_id] = {p.strokes, p.speed};
-    if (dump.is_open())
-      for (const auto& p : fr.persons) {
+    // ghost 占位框（lost>0）只参与渲染：人次、track 汇总与 --dump 一律只认真检出，
+    // 于是加不加 --ghost，[Summary] 与 CSV 都逐字节不变（见 Person::lost）。
+    size_t n_real = 0;
+    for (const auto& p : fr.persons) {
+      if (p.lost) { ++n_ghost; continue; }
+      ++n_real;
+      summary[p.track_id] = {p.strokes, p.speed};
+      if (dump.is_open()) {
         dump << fr.index << ',' << p.track_id << ',' << p.x1 << ',' << p.y1
              << ',' << p.x2 << ',' << p.y2 << ',' << p.conf;
         for (int k = 0; k < kNumKpts; ++k)
@@ -606,6 +621,8 @@ int main(int argc, char** argv) try {
                << p.scores[k];
         dump << '\n';
       }
+    }
+    n_person += static_cast<int64_t>(n_real);
 
     if (fr.bgr) {
       cv::Mat img(fr.h, fr.w, CV_8UC3, const_cast<uint8_t*>(fr.bgr));
@@ -631,11 +648,16 @@ int main(int argc, char** argv) try {
     }
     if (a.show_fps && now_ms() - last_log > 1000) {
       const double el = (now_ms() - t0) / 1000.0;
+      // 「当前 N 人」只数真检出，(+M) 是本帧的 ghost 占位数（0 时不显示）：
+      // 占位数持续偏高就说明 detect 在漏检，与网络掉帧是两件事。
       // 源侧摘要（六路现拼才有：每路到帧率 + 丢/顶/重连）跟在后面。掉帧时能当场
       // 分清是「某一路网络」还是「下游算不过来」，见 FrameSource::status()。
-      printf("\r[%.0fs] %lld 帧 %.1f fps  当前 %zu 人 %s  ", el,
+      char gh[16] = "";
+      if (fr.persons.size() > n_real)
+        snprintf(gh, sizeof gh, "(+%zu)", fr.persons.size() - n_real);
+      printf("\r[%.0fs] %lld 帧 %.1f fps  当前 %zu%s 人 %s  ", el,
              static_cast<long long>(fr.index + 1), (fr.index + 1) / el,
-             fr.persons.size(), src->status().c_str());
+             n_real, gh, src->status().c_str());
       fflush(stdout);
       last_log = now_ms();
     }
@@ -648,6 +670,12 @@ int main(int argc, char** argv) try {
   printf("[Summary] %lld 帧, 累计 %lld 人次, %zu 个 track\n",
          static_cast<long long>(pipe.frames_done()),
          static_cast<long long>(n_person), summary.size());
+  // 占位框数只在开了 ghost 时报：占 人次 的比例就是 detect 的漏检率
+  if (n_ghost)
+    printf("[Summary] ghost 占位 %lld 个框 (%.2f%% of 人次), 每框最长 %.2f s\n",
+           static_cast<long long>(n_ghost),
+           100.0 * double(n_ghost) / double(std::max<int64_t>(n_person, 1)),
+           double(a.opt.ghost_sec));
   int total_strokes = 0;
   for (const auto& [tid, v] : summary) total_strokes += v.first;
   printf("[Summary] 划水合计 %d 次\n", total_strokes);

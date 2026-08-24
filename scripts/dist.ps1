@@ -339,7 +339,11 @@ rem   double-click                 read cameras.txt, live preview window
 rem   run_6cam.bat --json out.json      also write per-swimmer results
 rem   run_6cam.bat --out out.mp4        also write an annotated video
 rem   run_6cam.bat --fps 30        force the time axis to 30fps
+rem   run_6cam.bat --ghost 0       stop holding boxes over detector misses
 rem   run_6cam.bat <list.txt>      use a different camera list
+rem
+rem A box that the detector missed is held in place for 1s and tagged HOLD;
+rem held boxes are drawn only - they never enter the counts or --json.
 rem
 rem In the preview window: 1 = keypoints, 2 = boxes/labels, 3 = metre grid,
 rem q/ESC = quit. Toggles also apply to what --out writes. Resize or
@@ -408,13 +412,14 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   run_6cam.bat --max-frames 300     只跑前 300 帧
   run_6cam.bat --preview-scale 0.4  预览窗口缩放比
   run_6cam.bat --fps 30             按 30fps 算时间轴（流报错帧率时用）
+  run_6cam.bat --ghost 0            关掉丢检占位（默认停 1 秒，标 HOLD）
   swim_analyse.exe --help           全部参数
 
 预览窗口的热键（焦点要在窗口上）
 --------------------------------
   1     人体关键点（骨架）开关
   2     分析框与 ID/划水/速度 标签开关
-  3     米制标尺网格开关（每 1 m 一条，5 m 加粗标米数）
+  3     米制标尺网格开关（粗线=泳道分割线每 2.5 m，细线均分 0.5 m）
   q/ESC 退出
 
 窗口可随意拖拽缩放或最大化：画面按窗口等比放到最大并居中，四周补黑边，

@@ -34,20 +34,33 @@
 namespace swim {
 
 /// 逐帧 IoU 贪心匹配。丢失超过 max_lost 帧才删除 track。
+///
+/// ghost（丢检占位框）：detect 偶发漏检时（实测每人每秒可丢两三帧），只保留
+/// track 而不输出，画面上那个人会闪断。开了 ghost 之后，丢检的前 ghost 帧继续
+/// 原样输出上一次的观测（框、关键点都停在原地），并把 Person::lost 置为已丢帧数，
+/// 于是下游能一眼分开"真检出"与"占位"：
+///   * 渲染照画（暗一档、细线），画面连续；
+///   * 统计/落盘/划水信号一律跳过 lost>0 的，数字与关掉 ghost 时逐字节相同。
+/// ghost 只能在 ID 保留期内占位：track 一旦丢满 max_lost 帧就被删掉，
+/// 所以实际占位时长自然是 min(ghost, max_lost)，不必额外夹取。
 class Tracker {
  public:
-  Tracker(float iou_thr = 0.3f, int max_lost = 30)
-      : iou_thr_(iou_thr), max_lost_(max_lost) {}
+  Tracker(float iou_thr = 0.3f, int max_lost = 30, int ghost = 0)
+      : iou_thr_(iou_thr), max_lost_(max_lost), ghost_(ghost) {}
 
-  /// 就地给 persons 填 track_id（顺序不变）。
+  /// 就地给 persons 填 track_id（原有元素顺序不变），并在末尾追加本帧的 ghost
+  /// 框（按 track_id 升序，与运行次数无关）。
   void update(std::vector<Person>& persons);
   size_t active() const { return tracks_.size(); }
 
  private:
-  struct Track { float x1, y1, x2, y2; int lost; };
+  /// 存整个 Person 而不只是框：ghost 要把关键点也一并停在原地，
+  /// 且 IoU 匹配用的坐标就在里面，不必再存一份。
+  struct Track { Person p; int lost; };
   std::unordered_map<int, Track> tracks_;
   float iou_thr_;
   int   max_lost_;
+  int   ghost_;
   int   next_id_ = 0;
 };
 
