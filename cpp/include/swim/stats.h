@@ -38,6 +38,11 @@ class StatsBoard {
   /// id 与最近一次 update() 的 sel 不符、或那人本帧不在场，返回 false。
   bool follow_rect(int id, int& x, int& y, int& w, int& h) const;
 
+  /// 显示编号「x 道 y 号」。取到即填 lane/slot 返回 true；那人在池岸（不属于任何
+  /// 泳道）或号已随离场回收时返回 false，由调用方决定退化文案。
+  /// 给 OpenCV 那条渲染路用 —— 看板走 json() 里下发的 ln/sl，同一份状态。
+  bool display_no(int id, int& lane, int& slot) const;
+
   // ── 收尾汇总（口径与改造前逐字节一致）──────────────────────────────────
   int64_t persons() const { return persons_; }    ///< 累计人次（只计真检出）
   int64_t ghosts()  const { return ghosts_; }     ///< 累计 ghost 占位框
@@ -65,13 +70,20 @@ class StatsBoard {
     int64_t first = -1, last = -1;
     float   sx = 0.f, sy = 0.f; ///< 上一个里程采样点（画布像素）
     int64_t sf = -1;            ///< 该采样点的帧号
-    int     lane = 0;
+    int     lane = 0;           ///< 带迟滞的泳道（0 = 池岸），见 lane_at()
+    int     slot = 0;           ///< 道内占位号（1 起，0 = 还没分配），见 take_slot()
     int64_t rf[kRecentSlots] = {};  ///< 里程快照的帧号（环，按 rn 推进）
     float   rd[kRecentSlots] = {};  ///< 快照当时的累计里程
     int     rn = 0;                 ///< 已推入的快照数（只增，不回绕）
   };
 
   int    lane_of(float cy) const;
+  /// 带迟滞的泳道判定：从 prev 换出去要越过分道绳再深入 kLaneHystM 米。
+  int    lane_at(float cy, int prev) const;
+  /// 取 lane 道内 id 的占位号（已占则返回原号，否则补最小空号，满了才加新号）。
+  int    take_slot(int lane, int id);
+  /// 归还占位号（换道时调用；彻底离场的人由 take_slot 按帧号回收）。
+  void   free_slot(int lane, int id);
   double secs(const Track& t) const;
   /// 近 kRecentSec 秒的均速（里程差 ÷ 时长差，与 vavg 同口径）；样本不足返回 NaN。
   double recent_v(const Track& t) const;
@@ -85,6 +97,10 @@ class StatsBoard {
   double fps_;
 
   std::map<int, Track> sum_;           ///< track -> 累计（有序，收尾输出稳定）
+  /// 每条道的占位表（下标 0 = 池岸）：`occ_[lane][slot-1] = track id`，-1 = 空号。
+  /// 「补最小空号」就是找第一个 -1，所以下标本身即号码，不需要另立号池。
+  /// 只服务显示，任何统计都不看它 —— 见头注释「两套编号」。
+  std::vector<int>     occ_[kNumLanes + 1];
   std::vector<Person>  cur_;           ///< 本帧人物（含 ghost，供前端画面一致）
   int64_t index_   = -1;
   int64_t persons_ = 0, ghosts_ = 0;

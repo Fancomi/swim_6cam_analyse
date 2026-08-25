@@ -457,8 +457,10 @@ void draw_grid(cv::Mat& img, float ppm, float s) {
 /// 画标注。`s` 是画面缩放比（预览窗口 <1，落盘视频为 1）：坐标乘 s，字号与
 /// 线宽跟着降但留下限，否则缩到 1/3 后文字糊成一团。
 /// ov 是三个叠加层开关（预览里按 1/2/3 实时切换），关掉的层连计算都跳过。
-void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
-          float ppm, float s = 1.f) {
+/// 标签上的编号与看板同一口径（「x 道 y 号」，见 StatsBoard::display_no）；
+/// Hershey 字体没有中文，所以这里写作 `L3-3`，池岸的人写 `SIDE`。
+void draw(cv::Mat& img, const FrameResult& fr, const StatsBoard& board,
+          float kpt_thr, const Overlay& ov, float ppm, float s = 1.f) {
   if (ov.grid) draw_grid(img, ppm, s);
   const double fs = std::max(0.4, double(s));   // 字号下限，保证小窗仍可读
   const int    th = s < 0.6f ? 1 : 2;           // 线宽/字宽
@@ -475,12 +477,14 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
     if (ov.boxes) {
       cv::rectangle(img, pt(p.x1, p.y1), pt(p.x2, p.y2), col, th);
 
-      char buf[96];
+      char buf[96], no[16] = "SIDE";
+      int lane = 0, slot = 0;
+      if (board.display_no(p.track_id, lane, slot))
+        snprintf(no, sizeof no, "L%d-%d", lane, slot);
       if (std::isnan(p.speed))
-        snprintf(buf, sizeof buf, "ID:%d S:%d", p.track_id, p.strokes);
+        snprintf(buf, sizeof buf, "%s S:%d", no, p.strokes);
       else
-        snprintf(buf, sizeof buf, "ID:%d S:%d %.2fm/s", p.track_id, p.strokes,
-                 p.speed);
+        snprintf(buf, sizeof buf, "%s S:%d %.2fm/s", no, p.strokes, p.speed);
       int base = 0;
       const auto sz = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, fs, th, &base);
       const int tx = int(p.x1 * s);
@@ -532,14 +536,14 @@ class Preview {
   /// 返回 false 表示用户要求退出。raw 必须是**未画过**的原始帧。
   /// ov 按引用传：1/2/3 就地翻转，落盘那条路随即用同一份状态，
   /// 于是「窗口里看到的」与「写进 mp4 的」永远一致，无需第二份开关。
-  bool show(const cv::Mat& raw, const FrameResult& fr, float kpt_thr,
-            Overlay& ov, float ppm) {
+  bool show(const cv::Mat& raw, const FrameResult& fr, const StatsBoard& board,
+            float kpt_thr, Overlay& ov, float ppm) {
     fit(raw.cols, raw.rows);
     // 直接缩到画板的画面区里：尺寸与类型都和 roi_ 一致，resize 不会重新分配，
     // 于是每帧只有一次缩放、零额外拷贝（黑边是建 pad_ 时就写好的）。
     cv::Mat view = pad_(roi_);
     cv::resize(raw, view, roi_.size(), 0, 0, cv::INTER_AREA);
-    draw(view, fr, kpt_thr, ov, ppm, s_);   // 标注画在画面区内，溢不到黑边上
+    draw(view, fr, board, kpt_thr, ov, ppm, s_);  // 标注画在画面区内，溢不到黑边上
     cv::imshow(kWin, pad_);
     // waitKey 只在本线程（创建窗口的那个）有效，也是唯一能读到按键的地方。
     // 高位是修饰键与平台位，取低 8 位才能与字符比。
@@ -667,14 +671,14 @@ int main(int argc, char** argv) try {
       // 而 writer 的 draw 是在整帧上原地画的。
       if (a.preview && !quit) {
         if (!preview) preview = std::make_unique<Preview>(fr.w, fr.h, a.preview_scale);
-        if (!preview->show(img, fr, a.opt.kpt_thr, a.ov, a.opt.ppm)) {
+        if (!preview->show(img, fr, board, a.opt.kpt_thr, a.ov, a.opt.ppm)) {
           quit = true;
           printf("\n[Preview] 收到退出键，停止取帧（已入队的帧仍会处理完）\n");
           pipe.request_stop();
         }
       }
       if (writer) {
-        draw(img, fr, a.opt.kpt_thr, a.ov, a.opt.ppm);
+        draw(img, fr, board, a.opt.kpt_thr, a.ov, a.opt.ppm);
         writer->write(img);
       }
     }

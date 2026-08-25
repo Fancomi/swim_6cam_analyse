@@ -97,7 +97,7 @@ main.m0 .sub{display:none}
     <label><input type="checkbox" data-g="f" data-k="det">检测</label>
     <label><input type="checkbox" data-g="f" data-k="info" checked>分析</label>
     <label><input type="checkbox" data-g="f" data-k="grid" checked>网格</label>
-    <label title="跟随目标离场约 1.5 秒后，自动切到近期均速最快的人（与概览同一口径）">
+    <label title="没在跟谁时立刻跟上近期均速最快的人（与概览同一口径）；正在跟的人离场约 1.5 秒后换人">
       <input type="checkbox" data-g="f" data-k="auto" checked>自动接管</label></span>
   <span class="sp"></span>
   <span id="hud">连接中…</span>
@@ -140,6 +140,18 @@ const idColor = id => {
   return `rgb(${h & 255},${h >> 8 & 255},${h >> 16 & 255})`;
 };
 const num = (v, d = 2) => (v === null || v === undefined || !isFinite(v)) ? '—' : v.toFixed(d);
+
+// 显示编号：界面一律「x 道 y 号」，道内号由服务端按占位分配（见 stats.cpp 的
+// take_slot）。原始 track id 是选人、跟随、统计的唯一键 —— 它全程不变，而显示号会
+// 随换道重排，拿它当键就会串；id 刻意不出现在界面上。
+// 没有号只有两种情形：人在池岸（不属于任何泳道），或号已随离场回收 —— 后者只可能
+// 出现在「跟随一个早已离场的人」这一档，故 alt 由调用方给。
+const ptag = (ln, sl, alt = '池岸') => sl ? `${ln} 道 ${sl} 号` : alt;
+/// 按原始 id 取本帧的显示号（概览的「最快」用，那人必然在场）。
+const idtag = id => {
+  const p = S.p.find(q => q.id === id);
+  return p ? ptag(p.ln, p.sl) : '—';
+};
 
 // ── 画面区计算：<img object-fit:contain> 的实际显示矩形 ────────────────────
 // 叠加层与画面必须共用同一个 letterbox，否则骨架整体偏移。
@@ -234,7 +246,8 @@ function drawPerson(g, p, V) {
   }
   if (sw.info) {
     // 半透明胶囊 + 色点：比纯色块压画面轻，水面上也读得清
-    const txt = `${p.id} 号 · ${p.s} 划` + (p.v === null ? '' : ` · ${p.v.toFixed(2)} m/s`);
+    const txt = `${ptag(p.ln, p.sl)} · ${p.s} 划`
+              + (p.v === null ? '' : ` · ${p.v.toFixed(2)} m/s`);
     const fh = V.fix ? 19 : Math.max(11, Math.min(16, 13 * Math.max(s * 3, .8)));
     g.font = `600 ${fh}px system-ui`;
     const ph = fh + 7, pw = g.measureText(txt).width + ph + 8;
@@ -302,12 +315,17 @@ function render() {
     autoFollow();
     const fbox = $('#fstage'), rc = S.sel && S.sel.rect;
     // 提示层按「有没有跟随矩形」显示，而不是按有没有选人 —— 选中的人离场后
-    // 跟随流停在最后一帧，不给提示的话看起来像画面卡住了。
+    // 跟随流停在最后一帧，不给提示的话看起来像画面卡住了。自动接管开着时不说
+    // 「点一名运动员」（它自己会挑），而是照实说在等什么：清场、还是刚入场的人
+    // 还没观察满 3 秒（服务端的排名门限，见 stats.cpp 的 kRecentMinSec）。
     $('#ftip').style.display = rc ? 'none' : '';
-    $('#ftip').textContent =
-      sel < 0     ? '在全景画面中点击一名运动员即可跟随'
-      : SW.f.auto ? `${sel} 号已离场，正在接管近期最快的人`
-                  : `${sel} 号已离场，等待重新出现`;
+    // 离场者的号取自 S.sel（服务端保留他最后的道与号），不查 S.p —— 他已经不在里面。
+    const who = S.sel ? ptag(S.sel.lane, S.sel.slot, '跟随目标') + '已离场，' : '';
+    $('#ftip').textContent = !SW.f.auto
+      ? (who ? who + '等待重新出现' : '在全景画面中点击一名运动员即可跟随')
+      : who + (S.all.hotid >= 0 ? '正在接管近期最快的人'
+             : S.all.now > 0    ? '正在挑选跟随目标…'
+                                : '全场暂无人在场，有人入场即自动跟随');
     const fg = prep(fo, fbox);
     if (rc) {
       const fr = fitRect(fbox, rc[2], rc[3]);
@@ -323,19 +341,24 @@ function render() {
   paintPanels();
 }
 
-// ── 自动接管：跟随目标离场后切到「近期均速最快」的人 ──────────────────────
-// 不立刻换人 —— 短暂丢检（服务端会用 ghost 顶几帧）很常见，一丢就跳会让画面乱蹦。
-// 计时用 S.t（服务端的流内秒数）而不是墙钟：暂停或掉帧时两者会分叉，按流内时间
-// 算才与「离场了多久」一致。判据就是概览里那个「近 N 秒最快」（all.hotid，
-// 服务端算的均速）—— 前端只有逐帧瞬时速度，自己反推不出来，而瞬时会每帧换人。
+// ── 自动接管：让跟随视图在「有人可跟」时永不空着 ──────────────────────────
+// 三种入场都走同一段：进入本模式时还没选人、被跟的人离场、清场后又有人下水。
+// 差别只在宽限 —— 已经在跟的人丢了要等 AUTO_GRACE_SEC（短暂丢检很常见，服务端
+// 会用 ghost 顶几帧，一丢就跳会让画面乱蹦）；而「本来就没在跟谁」没有可丢的东西，
+// 立刻接管。全场无人时 hotid 为 -1，什么都不做、也不清计时：等到有人入场并观察
+// 满 3 秒，那时 S.t - lostAt 早已超过宽限，于是自动接管，正是清场后想要的行为。
+// 计时用 S.t（服务端的流内秒数）而不是墙钟：暂停或掉帧时两者会分叉。
+// 判据是概览里那个「近 N 秒最快」（all.hotid，服务端算的均速）—— 前端只有逐帧
+// 瞬时速度，自己反推不出来，而瞬时会每帧换人。
+// 副作用：开着它就点不成「谁都不跟」（点空水面会立刻被接管回来），要空着就取消勾选。
 const AUTO_GRACE_SEC = 1.5;
 let lostAt = -1;                               // <0 = 未在计时（S.t 可能正好是 0）
 function autoFollow() {
-  if (sel < 0 || !SW.f.auto || (S.sel && S.sel.rect)) { lostAt = -1; return; }
-  if (lostAt < 0) { lostAt = S.t; return; }
-  const hot = S.all.hotid;
-  if (S.t - lostAt < AUTO_GRACE_SEC || hot < 0 || hot === sel) return;
-  select(hot);
+  if (!SW.f.auto || (S.sel && S.sel.rect)) { lostAt = -1; return; }
+  if (sel >= 0 && lostAt < 0) { lostAt = S.t; return; }  // 目标刚丢：宽限从此刻起算
+  const hot = S.all.hotid;                               // 全场无人在场时为 -1
+  if (hot < 0 || hot === sel) return;                    // 无人可跟 / 已经在跟他
+  if (sel < 0 || S.t - lostAt >= AUTO_GRACE_SEC) select(hot);
 }
 
 // ── 统计面板 ──────────────────────────────────────────────────────────────
@@ -356,7 +379,7 @@ function paintPanels() {
      </div>
      <div class="kv">
        ${row(`近 ${a.hotsec} 秒最快`,
-             (a.hotid >= 0 ? `${a.hotid} 号 · ` : '') + num(a.hotv) + ' m/s')}
+             (a.hotid >= 0 ? idtag(a.hotid) + ' · ' : '') + num(a.hotv) + ' m/s')}
        ${row('画布', meta.w + ' x ' + meta.h + ' px')}
        ${row('标定', meta.ppm + ' px/m · ' + meta.grid.lanes + ' 道')}
      </div>
@@ -367,9 +390,11 @@ function paintPanels() {
 
   if (mode !== 1) return;
   const s = S.sel;
+  // 色点仍按原始 id 取（与全景里他的框同色，换道也不变），但标题只写显示号。
+  // 标题已含道号，所以不再单列「所在泳道」那一行。
   $('#person').innerHTML = !s
     ? '<h2>个人统计</h2><div class="kv"><span>未选中运动员</span><b></b></div>'
-    : `<h2><i id="pid" style="background:${idColor(s.id)}"></i>${s.id} 号
+    : `<h2><i id="pid" style="background:${idColor(s.id)}"></i>${ptag(s.lane, s.slot, '跟随目标')}
          ${s.rect ? '' : '<span class="off">（已离场）</span>'}</h2>
        <div class="big">
          ${cell('划水次数', s.strokes)}
@@ -378,7 +403,6 @@ function paintPanels() {
          ${cell('划频', num(s.spm, 1), 'spm')}
        </div>
        <div class="kv">
-         ${row('所在泳道', s.lane ? s.lane + ' 道' : '池岸')}
          ${row('在场时长', num(s.sec, 1) + ' s')}
          ${row('累计里程', num(s.dist, 1) + ' m')}
          ${row('峰值速度', num(s.vmax) + ' m/s')}
