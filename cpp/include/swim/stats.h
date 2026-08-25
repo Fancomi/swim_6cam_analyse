@@ -48,6 +48,14 @@ class StatsBoard {
   void write_json(const std::string& path) const;
 
  private:
+  /// 「近期均速」的观察窗（秒）。看板的「最快」与自动接管**共用这一个口径** ——
+  /// 瞬时速度每帧换人，读数与镜头都会乱闪。5 秒够覆盖两三个划水周期。
+  static constexpr int kRecentSec   = 5;
+  /// 里程快照格数（每秒一格，环形覆盖）。取最老那格与当下作差即近期均速。
+  /// 刻意不留逐帧历史 —— `sum_` 从不回收，每 track 多一份长数组就是长跑时的常驻
+  /// 内存，而「谁最近游得快」并不需要那个精度。
+  static constexpr int kRecentSlots = kRecentSec + 1;
+
   /// 单个 track 的累计量。全部是「只增」的派生量，故 O(1) 更新、无需留历史。
   struct Track {
     int     strokes = 0;
@@ -58,10 +66,15 @@ class StatsBoard {
     float   sx = 0.f, sy = 0.f; ///< 上一个里程采样点（画布像素）
     int64_t sf = -1;            ///< 该采样点的帧号
     int     lane = 0;
+    int64_t rf[kRecentSlots] = {};  ///< 里程快照的帧号（环，按 rn 推进）
+    float   rd[kRecentSlots] = {};  ///< 快照当时的累计里程
+    int     rn = 0;                 ///< 已推入的快照数（只增，不回绕）
   };
 
   int    lane_of(float cy) const;
   double secs(const Track& t) const;
+  /// 近 kRecentSec 秒的均速（里程差 ÷ 时长差，与 vavg 同口径）；样本不足返回 NaN。
+  double recent_v(const Track& t) const;
   /// 推进跟随镜头的平滑状态（每帧一次，见 update 的注释）。
   void   track_camera(int sel);
   /// 追加一个 track 的个人指标字段（不含外层花括号）。

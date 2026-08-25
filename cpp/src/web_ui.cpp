@@ -96,7 +96,9 @@ main.m0 .sub{display:none}
     <label><input type="checkbox" data-g="f" data-k="kpts">关键点</label>
     <label><input type="checkbox" data-g="f" data-k="det">检测</label>
     <label><input type="checkbox" data-g="f" data-k="info" checked>分析</label>
-    <label><input type="checkbox" data-g="f" data-k="grid" checked>网格</label></span>
+    <label><input type="checkbox" data-g="f" data-k="grid" checked>网格</label>
+    <label title="跟随目标离场约 1.5 秒后，自动切到近期均速最快的人（与概览同一口径）">
+      <input type="checkbox" data-g="f" data-k="auto" checked>自动接管</label></span>
   <span class="sp"></span>
   <span id="hud">连接中…</span>
   <button class="btn" id="fs">全屏</button>
@@ -123,6 +125,7 @@ let meta = null, S = null, sel = -1, mode = 0;
 // 两组叠加层开关：全景一组、跟随一组（同名不同默认值，见 header 里的 checked）。
 // 绘制函数只收其中一组，于是「画哪个视图」与「开了什么」彻底解耦。
 // det（检测框）与 info（文本标签）刻意分开：跟随视图要读数字但不要框挡住手臂。
+// f.auto 不是叠加层，只是搭同一个收集器（省一套 DOM 绑定），绘制侧不看它。
 const SW = {c: {}, f: {}};
 for (const el of document.querySelectorAll('header input[type=checkbox]')) {
   const g = el.dataset.g, k = el.dataset.k;
@@ -296,12 +299,15 @@ function render() {
   g.restore();
 
   if (mode === 1) {
+    autoFollow();
     const fbox = $('#fstage'), rc = S.sel && S.sel.rect;
     // 提示层按「有没有跟随矩形」显示，而不是按有没有选人 —— 选中的人离场后
     // 跟随流停在最后一帧，不给提示的话看起来像画面卡住了。
     $('#ftip').style.display = rc ? 'none' : '';
-    $('#ftip').textContent = sel < 0 ? '在全景画面中点击一名运动员即可跟随'
-                                     : `${sel} 号已离场，等待重新出现`;
+    $('#ftip').textContent =
+      sel < 0     ? '在全景画面中点击一名运动员即可跟随'
+      : SW.f.auto ? `${sel} 号已离场，正在接管近期最快的人`
+                  : `${sel} 号已离场，等待重新出现`;
     const fg = prep(fo, fbox);
     if (rc) {
       const fr = fitRect(fbox, rc[2], rc[3]);
@@ -315,6 +321,21 @@ function render() {
     }
   }
   paintPanels();
+}
+
+// ── 自动接管：跟随目标离场后切到「近期均速最快」的人 ──────────────────────
+// 不立刻换人 —— 短暂丢检（服务端会用 ghost 顶几帧）很常见，一丢就跳会让画面乱蹦。
+// 计时用 S.t（服务端的流内秒数）而不是墙钟：暂停或掉帧时两者会分叉，按流内时间
+// 算才与「离场了多久」一致。判据就是概览里那个「近 N 秒最快」（all.hotid，
+// 服务端算的均速）—— 前端只有逐帧瞬时速度，自己反推不出来，而瞬时会每帧换人。
+const AUTO_GRACE_SEC = 1.5;
+let lostAt = -1;                               // <0 = 未在计时（S.t 可能正好是 0）
+function autoFollow() {
+  if (sel < 0 || !SW.f.auto || (S.sel && S.sel.rect)) { lostAt = -1; return; }
+  if (lostAt < 0) { lostAt = S.t; return; }
+  const hot = S.all.hotid;
+  if (S.t - lostAt < AUTO_GRACE_SEC || hot < 0 || hot === sel) return;
+  select(hot);
 }
 
 // ── 统计面板 ──────────────────────────────────────────────────────────────
@@ -334,7 +355,8 @@ function paintPanels() {
        ${cell('每划距离', num(a.dps), 'm')}
      </div>
      <div class="kv">
-       ${row('最快瞬时', (a.vmaxid >= 0 ? `${a.vmaxid} 号 · ` : '') + num(a.vmax) + ' m/s')}
+       ${row(`近 ${a.hotsec} 秒最快`,
+             (a.hotid >= 0 ? `${a.hotid} 号 · ` : '') + num(a.hotv) + ' m/s')}
        ${row('画布', meta.w + ' x ' + meta.h + ' px')}
        ${row('标定', meta.ppm + ' px/m · ' + meta.grid.lanes + ' 道')}
      </div>
@@ -399,6 +421,7 @@ co.onclick = e => {
 };
 function select(id) {
   sel = id;
+  lostAt = -1;                                 // 手工点人即重置自动接管的宽限计时
   fetch('select?id=' + id);
   if (id >= 0 && mode !== 1) setMode(1);
   dirty = true;

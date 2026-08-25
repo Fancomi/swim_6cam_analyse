@@ -38,6 +38,9 @@ constexpr double kFollowAspect = 3.5;
 /// 横向延迟跟随的时间常数（秒）。镜头以一阶低通追人：bbox 抖动被滤掉，
 /// 快速游动时落后约 tau*v（2 m/s 时约 1.2 m，仍在窗内三成偏移以内）。
 constexpr double kFollowTauSec = 0.6;
+/// 参与「近期最快」排名的最短观察时长（秒）。刚入场的人里程还没积起来，
+/// 不设门限的话一两次关键点抖动就能把他排到第一。
+constexpr double kRecentMinSec = 3.0;
 
 }  // namespace
 
@@ -87,8 +90,26 @@ void StatsBoard::update(const FrameResult& fr, double elapsed_sec, int sel) {
       t.dist_m += std::hypot(double(p.cx() - t.sx), double(p.cy() - t.sy)) / ppm_;
       t.sx = p.cx(); t.sy = p.cy(); t.sf = fr.index;
     }
+    // 每秒给里程留一格快照（环形，只留最近十来格）。近期均速由此得来 ——
+    // 见 recent_v()；不留逐帧历史是因为 sum_ 从不回收。
+    const int64_t sec_step = std::max<int64_t>(int64_t(fps_ + 0.5), 1);
+    if (t.rn == 0 || fr.index - t.rf[(t.rn - 1) % kRecentSlots] >= sec_step) {
+      const int k = t.rn % kRecentSlots;
+      t.rf[k] = fr.index;
+      t.rd[k] = float(t.dist_m);
+      ++t.rn;
+    }
   }
   track_camera(sel);
+}
+
+// 近 kRecentSec 秒的均速：拿环里最老那格与当下作差。与 vavg 同口径（里程 ÷ 时长），
+// 所以两者可直接比；样本不足 kRecentMinSec 秒时不给数（返回 NaN）。
+double StatsBoard::recent_v(const Track& t) const {
+  if (t.rn == 0) return NAN;
+  const int k  = t.rn >= kRecentSlots ? t.rn % kRecentSlots : 0;
+  const double dt = double(t.last - t.rf[k]) / fps_;
+  return dt >= kRecentMinSec ? (t.dist_m - t.rd[k]) / dt : NAN;
 }
 
 // 跟随镜头：纵向锁泳道（泳姿会让 bbox 忽大忽小，按框定高会不停变焦），
@@ -167,18 +188,19 @@ std::string StatsBoard::json(int sel) const {
   // 划水合计 / 全场累计里程」：第一个是逐帧人数的和（没有物理意义），其余三个
   // 会被 ID 切换灌水，教练看到的只是噪声。
   int    lanes[kNumLanes + 1] = {};
-  double vsum = 0.0, vmax = 0.0, spm_sum = 0.0, dps_sum = 0.0;
-  int    nv = 0, nspm = 0, ndps = 0, vmax_id = -1;
+  double vsum = 0.0, spm_sum = 0.0, dps_sum = 0.0, hot_v = 0.0;
+  int    nv = 0, nspm = 0, ndps = 0, hot_id = -1;
   for (const auto& p : cur_) {
     if (p.lost) continue;                       // 在场人数/占位数在 update 里已数过
     ++lanes[lane_of(p.cy())];
-    if (std::isfinite(p.speed)) {
-      vsum += p.speed;
-      ++nv;
-      if (p.speed > vmax) { vmax = p.speed; vmax_id = p.track_id; }
-    }
+    if (std::isfinite(p.speed)) { vsum += p.speed; ++nv; }
     const auto it = sum_.find(p.track_id);
-    if (it == sum_.end() || it->second.strokes <= 0) continue;
+    if (it == sum_.end()) continue;
+    // 「最快」一律用近 kRecentSec 秒均速，不用瞬时：后者每帧换人，读数与自动
+    // 接管的镜头都会乱闪。看板与自动接管共用这一个 hot_id / hot_v。
+    const double rv = recent_v(it->second);
+    if (std::isfinite(rv) && rv > hot_v) { hot_v = rv; hot_id = p.track_id; }
+    if (it->second.strokes <= 0) continue;
     const double sec = secs(it->second);
     if (sec > 1.0) { spm_sum += it->second.strokes * 60.0 / sec; ++nspm; }
     dps_sum += it->second.dist_m / it->second.strokes;
@@ -187,9 +209,9 @@ std::string StatsBoard::json(int sel) const {
 
   put(s, "{\"i\":%lld,\"t\":%.1f,\"fps\":%.1f,\"all\":{",
       static_cast<long long>(index_), elapsed_, cur_fps_);
-  put(s, "\"now\":%d,\"vmaxid\":%d", now_real_, vmax_id);
+  put(s, "\"now\":%d,\"hotid\":%d,\"hotsec\":%d", now_real_, hot_id, kRecentSec);
   s += ",\"vavg\":";  put_num(s, nv ? vsum / nv : NAN);
-  s += ",\"vmax\":";  put_num(s, nv ? vmax : NAN);
+  s += ",\"hotv\":";  put_num(s, hot_id >= 0 ? hot_v : NAN);
   s += ",\"spm\":";   put_num(s, nspm ? spm_sum / nspm : NAN, 1);
   s += ",\"dps\":";   put_num(s, ndps ? dps_sum / ndps : NAN);
   s += ",\"lanes\":[";
