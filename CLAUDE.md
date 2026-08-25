@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # 给 Agent 的导航（先读这页，再决定读哪些文件）
 
 本仓库有**两条独立实现**同一套游泳分析算法。**先确认你在哪条线上，只读那条线的文件。**
@@ -37,7 +41,7 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `scripts/install.sh` | 建 `.venv` 装 Python 依赖 + 自检 | Linux / Git Bash |
 | `scripts/cams.sh` | 六路 ZCam：探测 / 配 4K30 / 生成清单 / 直接起预览 | Git Bash |
 | `scripts/run.sh` | Python 参考链路，`bash scripts/run.sh [A\|B\|C] [参数]` | Linux / Git Bash |
-| `scripts/test.sh` | 秒级自检；`--full` 加 30 帧 GPU 冒烟 | Linux / Git Bash |
+| `scripts/test.sh` | 三档自检：秒级 / `--full` 30 帧冒烟 / `--baseline` 3000 帧核对 | Linux / Git Bash |
 | `scripts/dist.bat` | **打交付包**（双击：先构建再打包，`inc` 出增量、`zip` 顺手压缩） | Windows |
 | `scripts/dist.ps1` | 同上的实现（`dist.bat` 调它；也可单独跑，见下） | Windows PowerShell |
 
@@ -127,6 +131,56 @@ TensorRT、检查 exe/onnx/lut/ffmpeg），设好 `MODE`/`INPUT`/`ARGS`/`NAME`/`
 所以从任何目录双击或调用都一样，脚本内部的相对路径一律以根为基准。
 C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/README.md` 有命令）。
 
+## 常用命令（不走双击入口时）
+
+**新克隆先取权重**：四个 `.pt`/`.pth` 走 Git LFS，不 pull 只会拿到 134 字节的指针文本，
+Python 侧会以「不是合法 checkpoint」失败。
+
+```bash
+git lfs pull                        # 取权重真身（约 466 MB）
+bash scripts/install.sh             # 建 .venv 装 Python 依赖（mmcv 必须从 OpenMMLab 源装）
+```
+
+**C++ 增量构建**（改了 `cpp/` 后最常用的一条；首次配置见 `cpp/README.md`「构建」）：
+
+```bash
+cmake --build cpp/build --config Release --target swim_analyse
+```
+
+本机的 configure 参数（换机器时改架构号：RTX30xx=86 / RTX40xx=89 / H800=90 / RTX50xx=120）：
+
+```
+-DTRT_ROOT=D:/WindowsProject/workspace/TRT/TensorRT-10.11.0.33
+-DCMAKE_TOOLCHAIN_FILE=D:/BaiduNetdiskDownload/vcpkg-2025.12.12/scripts/buildsystems/vcpkg.cmake
+-DCMAKE_CUDA_ARCHITECTURES=89
+```
+
+`workspace/TRT/` 下还躺着一个 **TensorRT 10.13.2.6，别用它** —— 换版本会让已缓存的
+engine 全部失效。vcpkg 不在常规位置，不给 toolchain file 就找不到 OpenCV。
+
+**从 Git Bash 直接跑 exe** 要先把 TRT 的 DLL 目录加进 `PATH`（`.bat` 入口由
+`env.bat` 代办，手工跑就得自己加；注意 Git Bash 的 `PATH` 以 `:` 分隔，
+`D:/x` 会被拆成两项，必须写 `/d/x` 形式）：
+
+```bash
+export PATH="/d/WindowsProject/workspace/TRT/TensorRT-10.11.0.33/lib:$PATH"
+cpp/build/Release/swim_analyse.exe --input data/20260730/merged_3000f.mp4 \
+    --models cpp/models --max-frames 30 --show-fps
+```
+
+**单个 pytest**（`scripts/test.sh` 跑的是全量；`tests/` 纯逻辑，无需 GPU 与数据）：
+
+```bash
+.venv/Scripts/python.exe -m pytest tests -q -k tracker_reuses_id   # Windows
+.venv/bin/python -m pytest tests -q -k tracker_reuses_id           # Linux
+```
+
+**没有 linter 配置**（无 ruff/black/clang-format）—— 代码风格靠与邻近代码一致来保持，
+不要引入格式化工具重排既有文件。
+
+写 Windows 进程要读的临时文件时，路径必须过 `cygpath -m`：MSYS 的 `/tmp/x` 会被
+exe 当成相对路径，静默写不出来还不报错。
+
 ## 目录职责（放新文件前先对一眼）
 
 | 目录 | 只放什么 |
@@ -145,6 +199,11 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 
 ## Python 侧速查
 
+**四段式，Stage1/2 有磁盘缓存**（`cli.py` 的 docstring 是权威描述）：
+Stage1/2 由 plan 出框与关键点 → Stage3 关键点插值 + 划水/速度 → Stage4 渲染编码。
+Stage1/2 的结果落 `output_dir/cache.pkl`，键由 `_KEY_ARGS` + 输入视频与权重的指纹算出
+（见『同步契约』第 2 条 —— 漏登记参数会静默返回旧结果）。
+
 | 关心什么 | 文件 |
 | --- | --- |
 | 命令行参数、Stage 编排、cache、渲染 | `cli.py` |
@@ -157,6 +216,14 @@ C++ 侧没有 shell 入口，Linux 上直接调 `cpp/build/swim_analyse`（`cpp/
 | 多路视频帧级随机读（仅 Plan A） | `video.py` |
 
 ## C++ 侧速查
+
+**三段线程 + 段间有界队列**（`pipeline.h` 的头注释是权威描述）：解码线程出 `GpuFrame`
+→ 推理线程在**单一 CUDA stream** 上排完 前处理/detect/去重/裁切/pose/SimCC 解码
+→ 后处理线程跟踪 + 划水/速度 + 回调。关键设计：全程显存驻留，纯分析模式**每帧只回读
+约 9 KB 关键点**（渲染模式才多一次整帧 D2H）；每帧的回读缓冲取自一个环 + 一个
+`cudaEvent`，推理线程排完拷贝就走，于是「GPU 算第 n+1 帧」与「CPU 处理第 n 帧」重叠。
+唯一必须当帧同步的是框数（4 字节，决定 pose 的 batch）。detect 与 pose 刻意**不拆两个
+线程** —— 二者有数据依赖，拆开只会引入跨线程同步。
 
 | 关心什么 | 文件 |
 | --- | --- |
