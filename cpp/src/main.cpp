@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +29,8 @@
 #include "swim/metrics.h"
 #include "swim/pipeline.h"
 #include "swim/proc.h"
+#include "swim/stats.h"
+#include "swim/web.h"
 #ifdef SWIM_HAS_STITCH
 #include "swim/stitch.h"
 #endif
@@ -38,14 +39,9 @@ using namespace swim;
 
 namespace {
 
-// COCO17 骨架：边表与 Python 版 pose.py 的 SKELETON 逐项一致；
-// 那边按左右肢分色，这里统一绿色（C++ 侧只用于目视核对，不追求配色一致）
-constexpr int kSkel[][2] = {{15,13},{13,11},{16,14},{14,12},{11,12},{5,11},{6,12},
-                            {5,6},{5,7},{7,9},{6,8},{8,10},{1,2},{0,1},{0,2},{1,3},{2,4}};
-
-cv::Scalar id_color(int id) {   // 与 Python 版同思路：按 id 稳定散列
-  const uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
-  return cv::Scalar((h >> 16) & 255, (h >> 8) & 255, h & 255);
+cv::Scalar id_color(int id) {   // 与 web 前端同一个散列（common.h 的 id_rgb）
+  const uint32_t c = id_rgb(id);
+  return cv::Scalar((c >> 16) & 255, (c >> 8) & 255, c & 255);
 }
 
 /// 叠加层的三个开关。预览窗口里按 1/2/3 实时切换，`--out` 落盘用当前状态
@@ -61,11 +57,13 @@ struct Overlay {
 struct Args {
   PipelineOptions opt;                  // 参数默认值只在 pipeline.h 定义一份
                                         // （--help 也从这里现取，见 help_rows）
+  WebOptions  web;                      // 同上，默认值只在 web.h 定义一份
   std::string input, out, json, dump;
   std::string cam_dir, lut;             // 六路拼接输入：片段目录 + 查找表
   std::string dump_canvas;              // 首帧画布原样落 PNG（拼接对照用）
   Overlay     ov;                       // 叠加层初始状态
   bool        show_fps = false, preview = false;
+  bool        serve = false;            // 开 web 服务（--web）
   /// 画面整体转 180°。**由帧源就地完成**（六路拼接改落点、单画布走解码器滤镜），
   /// 不是后处理：下游拿到的画布本身就已转好，检测/跟踪/渲染全不知道有这回事。
   bool        rot180 = false;
@@ -188,6 +186,19 @@ std::vector<HelpRow> help_rows() {
                       "1/2/3 切关键点/分析/网格）"},
     {"--preview-scale", "F", "预览缩放比 0.05~1（默认自适应 1600x900 以内），\n"
                              "给了它就等于同时开 --preview"},
+    {"--web", "", sfmt("开浏览器看板：全景画布 + 统计栏 + 点人跟随。\n"
+                       "叠加层（关键点/分析/网格）由前端重绘，可勾选；\n"
+                       "默认自动弹出 %s", (std::string("http://") + a.web.bind +
+                                           ":" + std::to_string(a.web.port) +
+                                           "/").c_str())},
+    {"--web-port", "N", sfmt("看板端口 (默认 %d)", a.web.port)},
+    {"--web-bind", "IP", sfmt("看板监听地址 (默认 %s)。**无认证无加密**，\n"
+                              "给 0.0.0.0 等于把实时画面对同网段全部开放",
+                              a.web.bind.c_str())},
+    {"--web-width", "N", sfmt("看板全景流的横向像素 (默认 %d，源更小则不放大)",
+                              a.web.width)},
+    {"--web-quality", "N", sfmt("看板 JPEG 质量 1..100 (默认 %d)", a.web.quality)},
+    {"--no-browser", "", "开 --web 但不自动弹浏览器"},
     {"--show-fps", "", "实时打印吞吐"},
     {"--fp32", "", "engine 算子用 fp32 (默认 fp16)。注意 ONNX 若是\n"
                    "fp16 权重导出的，这只放宽算子精度，不等于真 fp32"},
@@ -282,6 +293,13 @@ bool parse(int argc, char** argv, Args& a) {
       a.preview = true;                 // 给了比例显然是要预览，免得漏加 --preview
       a.preview_scale = num(i, k, 0.05, 1.0);
     }
+    else if (k == "--web")         a.serve = true;
+    // 给了任一看板参数显然是要开看板，免得漏加 --web（与 --preview-scale 同理）
+    else if (k == "--web-port")    { a.serve = true; a.web.port = int(integer(i, k, 1, 65535)); }
+    else if (k == "--web-bind")    { a.serve = true; a.web.bind = need(i); }
+    else if (k == "--web-width")   { a.serve = true; a.web.width = int(integer(i, k, 160, 8192)); }
+    else if (k == "--web-quality") { a.serve = true; a.web.quality = int(integer(i, k, 1, 100)); }
+    else if (k == "--no-browser")  a.web.open_browser = false;
     else if (k == "--fp32")        o.fp16 = false;
     else if (k == "--decoder") {
       // 严格校验：拼错的值（如 cpuu）必须报错。早先的三元链把一切非
@@ -307,8 +325,8 @@ bool parse(int argc, char** argv, Args& a) {
   SWIM_CHECK(a.input.empty() != a.cam_dir.empty(),
              "--input（已拼画布）与 --cam-dir（六路实时拼接）必须且只能给一个");
   if (a.lut.empty()) a.lut = o.models_dir + "/stitch.lut";
-  // 只有要图像（落盘、预览或导出画布）才付整帧 D2H；纯分析模式只回读关键点
-  o.need_image = !a.out.empty() || a.preview || !a.dump_canvas.empty();
+  // 只有要图像（落盘、预览、看板或导出画布）才付整帧 D2H；纯分析模式只回读关键点
+  o.need_image = !a.out.empty() || a.preview || a.serve || !a.dump_canvas.empty();
   o.validate();
   return true;
 }
@@ -392,21 +410,11 @@ class Writer {
   int64_t frames_ = 0;
 };
 
-/// 画布纵向两端各有一条池岸不属于水面，网格的 0 m 线要落在池边而不是画布边缘。
-/// 取值来自标定本身：`configs/pool_mesh.json` 的 y 顶点是
-/// 4.2358 / 4.7358 / 7.2358 … 22.2358 / 24.7358 / 25.2358 —— 中间 9 行按 2.5 m
-/// 等距（8 条泳道，正好是转出的画布里那 9 排红色分道绳），首尾各多出 0.5 m。
-/// 所以画布 21 m = 0.5 + 20 + 0.5，横向 50 m 是完整池长、不需要内缩。
-/// 改了标定就核这几个顶点；写死一个常数是刻意的 —— 网格只是目视标尺，
-/// 不值得为它把 LUT 的几何再读一遍进来。
-constexpr double kGridMarginM = 0.5;    // 池岸宽：纵向刻度零点的内缩量
-constexpr double kLanePitchM  = 2.5;    // 泳道宽：粗线就是分道绳（8 条 = 20 m）
-constexpr int    kLaneSubdiv  = 5;      // 每条泳道均分 5 格 → 细线 0.5 m，与池岸同宽
-
 /// 米制标尺网格：**粗线是泳道分割线**（每 2.5 m，纵向正落在那 9 排分道绳上），
 /// 细线以它为基准把每条泳道均分 5 格（0.5 m）。用途是目视量距离、核对速度口径
 /// （速度 = 框中心位移 / ppm）；只用 --ppm 与画面尺寸换算，不读标定，所以画布与
 /// 六路现拼两条路画出来的是同一套刻度。
+/// 常数在 common.h（web 前端从 /meta 取同一份，两处刻度必然一致）。
 /// 文案一律英文（图内文字规范），且画在缩放后的画面上，故坐标按 s 折算。
 void draw_grid(cv::Mat& img, float ppm, float s) {
   const double step = double(ppm) * double(s);        // 1 m 在当前画面上的像素数
@@ -484,7 +492,7 @@ void draw(cv::Mat& img, const FrameResult& fr, float kpt_thr, const Overlay& ov,
     }
 
     if (!ov.kpts) continue;
-    for (const auto& e : kSkel) {
+    for (const auto& e : kSkeleton) {
       if (p.scores[e[0]] < kpt_thr || p.scores[e[1]] < kpt_thr) continue;
       cv::line(img, pt(p.kpts[e[0] * 2], p.kpts[e[0] * 2 + 1]),
                pt(p.kpts[e[1] * 2], p.kpts[e[1] * 2 + 1]),
@@ -610,8 +618,12 @@ int main(int argc, char** argv) try {
     dump << '\n';
   }
 
-  std::map<int, std::pair<int, float>> summary;   // track -> (划水, 末速)
-  int64_t n_person = 0, n_ghost = 0;
+  // 汇总与序列化都交给 StatsBoard：[Summary]、--json 与看板的 /stats 共用一份口径，
+  // 于是「控制台看到的数字」与「网页看到的数字」不可能分叉。
+  StatsBoard board(src->width(), src->height(), a.opt.ppm, src->fps(), a.opt.kpt_thr);
+  std::unique_ptr<WebServer> web;
+  if (a.serve) web = std::make_unique<WebServer>(a.web, board.meta_json());
+  cv::Mat follow;                       // 跟随裁切的落点，copyTo 复用不重复分配
   const double t0 = now_ms();
   double last_log = t0;
   // 在 Sink 里首帧惰性构造：窗口必须由 pump 它的线程（后处理线程）创建
@@ -621,12 +633,10 @@ int main(int argc, char** argv) try {
   pipe.run(*src, [&](const FrameResult& fr) {
     // ghost 占位框（lost>0）只参与渲染：人次、track 汇总与 --dump 一律只认真检出，
     // 于是加不加 --ghost，[Summary] 与 CSV 都逐字节不变（见 Person::lost）。
-    size_t n_real = 0;
-    for (const auto& p : fr.persons) {
-      if (p.lost) { ++n_ghost; continue; }
-      ++n_real;
-      summary[p.track_id] = {p.strokes, p.speed};
-      if (dump.is_open()) {
+    board.update(fr, (now_ms() - t0) / 1000.0, web ? web->selected() : -1);
+    if (dump.is_open())
+      for (const auto& p : fr.persons) {
+        if (p.lost) continue;
         dump << fr.index << ',' << p.track_id << ',' << p.x1 << ',' << p.y1
              << ',' << p.x2 << ',' << p.y2 << ',' << p.conf;
         for (int k = 0; k < kNumKpts; ++k)
@@ -634,8 +644,7 @@ int main(int argc, char** argv) try {
                << p.scores[k];
         dump << '\n';
       }
-    }
-    n_person += static_cast<int64_t>(n_real);
+    const size_t n_real = size_t(board.now_real());
 
     if (fr.bgr) {
       cv::Mat img(fr.h, fr.w, CV_8UC3, const_cast<uint8_t*>(fr.bgr));
@@ -643,6 +652,16 @@ int main(int argc, char** argv) try {
       if (!a.dump_canvas.empty() && fr.index == 0) {
         SWIM_CHECK(cv::imwrite(a.dump_canvas, img), "无法写入 " + a.dump_canvas);
         printf("[Output] 首帧画布 %s (%dx%d)\n", a.dump_canvas.c_str(), fr.w, fr.h);
+      }
+      // 看板拿的是**未标注**的原图：三个叠加层由前端按 /meta 的口径重绘。
+      // 排在 writer 之前，否则推出去的画面会带上 CPU 画的框。
+      if (web) {
+        if (web->wants_canvas()) web->publish_canvas(fr.bgr, fr.w, fr.h);
+        int x, y, w, h;
+        if (web->wants_follow() && board.follow_rect(web->selected(), x, y, w, h)) {
+          img(cv::Rect(x, y, w, h)).copyTo(follow);   // ROI 不连续，须拷成 packed
+          web->publish_follow(follow.data, w, h);
+        }
       }
       // 预览次之：它要的是未画过的原图（缩小后再画，字才不糊），
       // 而 writer 的 draw 是在整帧上原地画的。
@@ -659,6 +678,9 @@ int main(int argc, char** argv) try {
         writer->write(img);
       }
     }
+    // 统计流最后推：此时 board 已含本帧，前端的叠加层与画面同属一帧。
+    // 没人订阅就连 JSON 都不拼（每帧 17×N 个关键点，是笔真开销）。
+    if (web && web->wants_stats()) web->publish_stats(board.json(web->selected()));
     if (a.show_fps && now_ms() - last_log > 1000) {
       const double el = (now_ms() - t0) / 1000.0;
       // 「当前 N 人」只数真检出，(+M) 是本帧的 ghost 占位数（0 时不显示）：
@@ -682,32 +704,17 @@ int main(int argc, char** argv) try {
   pipe.timers().report("GPU 流水线", total, pipe.frames_done());
   printf("[Summary] %lld 帧, 累计 %lld 人次, %zu 个 track\n",
          static_cast<long long>(pipe.frames_done()),
-         static_cast<long long>(n_person), summary.size());
+         static_cast<long long>(board.persons()), board.tracks());
   // 占位框数只在开了 ghost 时报：占 人次 的比例就是 detect 的漏检率
-  if (n_ghost)
+  if (board.ghosts())
     printf("[Summary] ghost 占位 %lld 个框 (%.2f%% of 人次), 每框最长 %d 帧\n",
-           static_cast<long long>(n_ghost),
-           100.0 * double(n_ghost) / double(std::max<int64_t>(n_person, 1)),
+           static_cast<long long>(board.ghosts()),
+           100.0 * double(board.ghosts()) / double(std::max<int64_t>(board.persons(), 1)),
            a.opt.ghost);
-  int total_strokes = 0;
-  for (const auto& [tid, v] : summary) total_strokes += v.first;
-  printf("[Summary] 划水合计 %d 次\n", total_strokes);
+  printf("[Summary] 划水合计 %d 次\n", board.total_strokes());
 
   if (!a.json.empty()) {
-    std::ofstream f(a.json);
-    SWIM_CHECK(f.good(), "无法写入 " + a.json);
-    f << "{\n";
-    bool first = true;
-    for (const auto& [tid, v] : summary) {
-      if (!first) f << ",\n";
-      first = false;
-      f << "  \"" << tid << "\": {\"strokes\": " << v.first << ", \"speed\": ";
-      // JSON 没有 NaN/Inf 字面量，非有限值统一写 null（否则下游解析直接失败）
-      if (std::isfinite(v.second)) f << v.second; else f << "null";
-      f << "}";
-    }
-    f << "\n}\n";
-    SWIM_CHECK(f.good(), "写入未完成 " + a.json);
+    board.write_json(a.json);
     printf("[Output] %s\n", a.json.c_str());
   }
   return 0;

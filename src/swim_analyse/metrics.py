@@ -11,8 +11,8 @@
       手腕沿泳道方向相对鼻子的带符号位移，做"由负转正"过零计数（手腕从
       头后摆到头前算一次）。
 
-自由泳/仰泳左右手交替各算一次划水，取 min(左, 右) 更抗单侧漏检；其余泳姿
-双臂同步，左右信号取均值后统一计数。
+自由泳/仰泳左右手交替，左右各自计数后**相加**（左手一次、右手一次算两次）；
+其余泳姿双臂同步，左右信号取均值后统一计数（一次摆动算一次）。
 """
 
 import numpy as np
@@ -215,7 +215,7 @@ def count_strokes(interp_data, fps, stroke_type, signal="elbow_angle"):
             event_frames.append(frame_idxs[events] if len(events) else np.empty(0, int))
 
         results[tid] = {
-            "count": min(len(e) for e in event_frames),
+            "count": sum(len(e) for e in event_frames),
             "frame_idxs": frame_idxs,
             "sides": sides,
             "event_frames": event_frames,
@@ -227,12 +227,12 @@ def cumulative_counts(stroke_results, total_frames):
     """
     {tid: 每帧的累计划水次数 (total_frames,)}。
 
-    多侧信号时取各侧累计次数的较小值——只有左右手都完成了一次摆动才算一次
-    完整划水，与 count_strokes 里 min(左, 右) 的口径一致。
+    多侧信号时把各侧累计次数**相加**——左右手各算一次划水，与 count_strokes
+    里 sum(左, 右) 的口径一致。
     """
     frames = np.arange(total_frames)
     return {
-        tid: np.min([np.searchsorted(ef, frames, side="right")
+        tid: np.sum([np.searchsorted(ef, frames, side="right")
                      for ef in res["event_frames"]], axis=0)
         for tid, res in stroke_results.items()
     }

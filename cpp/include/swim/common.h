@@ -29,6 +29,30 @@ constexpr int   kMaxDet      = 300;     // yolo26 end2end 的 max_det
 constexpr int   kMaxPersons  = 40;      // pose 的最大 batch（显存按此预留）
 // 归一化参数（RGB 顺序）只在 device 侧用到，定义在 kernels.cu 的 __constant__ 里。
 
+// ── 可视化口径（CPU 渲染与 web 前端共用一份，避免两处各写一遍而漂移）────────
+/// COCO17 骨架边表，与 Python 版 pose.py 的 SKELETON 逐项一致。
+constexpr int kSkeleton[][2] = {
+    {15,13},{13,11},{16,14},{14,12},{11,12},{5,11},{6,12},{5,6},{5,7},
+    {7,9},{6,8},{8,10},{1,2},{0,1},{0,2},{1,3},{2,4}};
+
+/// track_id -> 稳定配色，返回 0xRRGGBB。与 Python 版同思路（Knuth 乘法散列）。
+/// 返回 packed 整数而非 cv::Scalar：common.h 不依赖 OpenCV，且 web 前端只要
+/// 照同一个式子算就能得到同色（那边拿到的是 #RRGGBB）。
+inline uint32_t id_rgb(int id) {
+  const uint32_t h = static_cast<uint32_t>(id) * 2654435761u;
+  return ((h & 255u) << 16) | (((h >> 8) & 255u) << 8) | ((h >> 16) & 255u);
+}
+
+/// 泳池几何（米制标尺网格与泳道判定共用）。取值来自标定本身：
+/// `configs/pool_mesh.json` 的 y 顶点是 4.2358 / 4.7358 / 7.2358 … 24.7358 /
+/// 25.2358 —— 中间 9 行按 2.5 m 等距（8 条泳道，即画布里那 9 排分道绳），
+/// 首尾各多出 0.5 m 池岸。所以画布 21 m = 0.5 + 20 + 0.5，横向 50 m 是完整池长。
+/// 改了标定就核这几个顶点。
+constexpr double kGridMarginM = 0.5;    // 池岸宽：纵向刻度零点的内缩量
+constexpr double kLanePitchM  = 2.5;    // 泳道宽：粗线就是分道绳（8 条 = 20 m）
+constexpr int    kLaneSubdiv  = 5;      // 每条泳道均分 5 格 → 细线 0.5 m
+constexpr int    kNumLanes    = 8;
+
 // ── 错误检查 ──────────────────────────────────────────────────────────────
 #define SWIM_CUDA(call)                                                       \
   do {                                                                        \

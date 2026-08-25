@@ -305,12 +305,13 @@ def _synthetic_track(n_strokes=4, fps=FPS, speed_px=10.0, n_kpts=17):
 def test_count_strokes_and_cumulative():
     frames, n = _synthetic_track(n_strokes=4)
     res = count_strokes({7: frames}, FPS, "freestyle", "elbow_angle")[7]
-    assert res["count"] == 4
+    # 自由泳左右分开计数后相加：合成序列两侧同相位，各 4 次 -> 合计 8
+    assert res["count"] == 8
     assert len(res["sides"]) == 2, "自由泳左右分开统计"
 
     cum = cumulative_counts({7: res}, n)[7]
     assert cum.shape == (n,)
-    assert cum[0] == 0 and cum[-1] == 4
+    assert cum[0] == 0 and cum[-1] == 8
     assert np.all(np.diff(cum) >= 0), "累计计数必须单调不减"
 
 

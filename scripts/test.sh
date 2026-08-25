@@ -3,6 +3,7 @@
 #
 #   bash scripts/test.sh            # 能跑吗：单元测试 + 入口脚本语法（无 GPU，约 2 秒）
 #   bash scripts/test.sh --full     # 跑得通吗：Python Plan C、C++ 画布、C++ 六路各 30 帧
+#                                   #           外加 rot180 逐字节判据与 web 看板六路由
 #   bash scripts/test.sh --baseline # 数字没变吗：四种组合各 3000 帧核对基线（约 5 分钟）
 #
 # 冒烟的产物全部落在 output/_smoke_*，跑完自动删除。
@@ -129,6 +130,45 @@ sys.exit(0 if a is not None and b is not None and np.array_equal(a[::-1, ::-1], 
   rm -rf "$d"
 }
 
+# 看板：起一次服务，把六个路由都摸一遍。用非默认端口，免得撞上手工开着的那个。
+# 判据刻意只到「协议对不对」：/meta 是合法 JSON、SSE 首条含帧号、MJPEG 首段有
+# JPEG 魔数。像素与统计值另有基线管，这里只挡「路由/线程/析构」类回归。
+web_smoke() { local name="$1"; shift
+  command -v curl >/dev/null || { skip "$name" "没有 curl"; return; }
+  local port=18099 log body; log="$(mktemp)"; body="$(mktemp)"
+  "$@" --web --web-port $port --no-browser >"$log" 2>&1 &
+  local pid=$!
+  # engine 已缓存也要几秒起 TRT，轮询到监听为止
+  local i
+  for i in $(seq 40); do
+    curl -s -m 1 "http://127.0.0.1:$port/meta" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  # 一律先落盘再判：SSE 与 MJPEG 是无限流，curl 只能靠 -m 超时收尾、必然以 28
+  # 退出，而本脚本开了 pipefail —— `curl | grep` 会让这个退出码盖掉 grep 的结论。
+  local bad_web=""
+  probe() { curl -s -m "$1" -o "$body" "http://127.0.0.1:$port$2" || true; }
+  probe 2 /meta
+  "$PYTHON" -c "
+import json,sys
+m=json.load(sys.stdin)
+assert m['w']>0 and m['h']>0 and len(m['skel'])==17 and m['nk']==17, m
+" <"$body" >/dev/null 2>&1 || bad_web+=" /meta"
+  probe 2 /
+  grep -q '<!doctype html>' "$body" || bad_web+=" /"
+  probe 2 /stats
+  grep -q '^data: {"i":' "$body" || bad_web+=" /stats"
+  probe 2 /canvas.mjpg
+  grep -qa 'Content-Type: image/jpeg' "$body" || bad_web+=" /canvas.mjpg"
+  [[ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/select?id=0")" == 204 ]] \
+    || bad_web+=" /select"
+  [[ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/nope")" == 404 ]] \
+    || bad_web+=" 404"
+  wait $pid                       # 帧数跑完自己退出；析构卡死会在这里挂住
+  [[ -z "$bad_web" ]] && ok "$name" || { bad "$name 路由异常:$bad_web"; tail -8 "$log"; }
+  rm -f "$log" "$body"
+}
+
 if [[ $FULL -eq 0 && $BASE -eq 0 ]]; then
   echo "（--full 跑 30 帧真实冒烟；--baseline 跑 3000 帧核对基线三元组，约 5 分钟）"
 elif [[ ! -f "$CANVAS" ]]; then
@@ -167,18 +207,25 @@ else
       [[ $ORACLE -eq 1 ]] && rot_oracle "rot180 逐字节（$nm）" \
         "$EXE" "$flag" "$src" --models cpp/models
     done
+
+    # 看板只摸一遍（走画布那条路即可：web 层在帧源之上，与拼接无关）。
+    # 帧数要够服务活到探完六个路由 —— 六次 curl 的超时合计约 11 s，而画布 60 fps
+    # 上下，1200 帧（约 20 s）留足余量；给少了会只有 /meta 赶上，其余全报路由异常。
+    [[ $CPP -eq 1 && $ORACLE -eq 1 ]] && web_smoke "web 看板六路由" \
+      "$EXE" --input "$CANVAS" --models cpp/models --max-frames 1200
+
   else
     # 基线三元组（RTX 4080 Laptop / data/20260730 与 20260730-4k-raw / 默认参数）
     [[ $CPP -eq 1 ]] && {
-      baseline "画布 3000 帧      " "24107 63 376" \
+      baseline "画布 3000 帧      " "24107 63 875" \
         "$EXE" --input "$CANVAS" --models cpp/models --max-frames 3000 --show-fps
-      baseline "画布 3000 帧 rot180" "24233 90 361" \
+      baseline "画布 3000 帧 rot180" "24233 90 859" \
         "$EXE" --input "$CANVAS" --models cpp/models --max-frames 3000 --show-fps --rot180
     }
     [[ $STITCH -eq 1 ]] && {
-      baseline "六路 3000 帧      " "25078 91 379" \
+      baseline "六路 3000 帧      " "25078 91 883" \
         "$EXE" --cam-dir "$CAMS" --models cpp/models --max-frames 3000 --show-fps
-      baseline "六路 3000 帧 rot180" "25578 119 359" \
+      baseline "六路 3000 帧 rot180" "25578 119 883" \
         "$EXE" --cam-dir "$CAMS" --models cpp/models --max-frames 3000 --show-fps --rot180
     }
   fi

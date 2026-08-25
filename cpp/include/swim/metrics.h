@@ -6,7 +6,8 @@
 //          按信号派发（同 metrics.py 的 SIGNALS 字典）：
 //            elbow_angle   肩-肘-腕夹角，局部均值 + 拓扑 prominence 的波谷计数
 //            wrist_x_head  手腕相对鼻子的 x 位移，滞回过零计数
-//          自由泳/仰泳左右分开计数取 min，其余泳姿左右取均值后统一计数
+//          自由泳/仰泳左右分开计数后相加（左右手各算一次划水），
+//          其余泳姿双臂同步，左右取均值后统一计数
 //   速度   框中心位移 / ppm，每 0.2 s 一个采样点、窗口 2 s，采样点之间前向填充
 //
 // 刻意保留的设计差异（在线约束：live 场景不能等全序列结束）：
@@ -74,7 +75,7 @@ enum class StrokeSignal {
 class MetricsTracker {
  public:
   /// fps 用于帧数与秒的换算；ppm 为画布每米像素数；kpt_thr 为关键点置信度门限
-  /// （对应 CLI --kpt-thr）；split 为真时左右分开计数取 min（自由泳/仰泳），
+  /// （对应 CLI --kpt-thr）；split 为真时左右分开计数后相加（自由泳/仰泳），
   /// 否则左右取均值后统一计数；signal 选择划水信号。
   MetricsTracker(double fps, float ppm, float kpt_thr = 0.4f, bool split = true,
                  StrokeSignal signal = StrokeSignal::ElbowAngle);

@@ -43,7 +43,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio highgui)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio highgui)
 
 # ── TensorRT（无官方 find module，手动定位）───────────────────────────────
 # Windows 版的库名带版本后缀（nvinfer_10.lib / nvonnxparser_10.lib），
@@ -82,7 +82,8 @@ message(STATUS "TensorRT: ${TRT_INCLUDE}")
 
 add_executable(swim_analyse
   src/main.cpp src/pipeline.cpp src/trt_engine.cpp
-  src/frame_source.cpp src/proc.cpp src/metrics.cpp src/common.cpp src/kernels.cu)
+  src/frame_source.cpp src/proc.cpp src/metrics.cpp src/common.cpp src/kernels.cu
+  src/stats.cpp src/web.cpp src/web_ui.cpp)
 
 target_include_directories(swim_analyse PRIVATE include ${TRT_INCLUDE})
 target_link_libraries(swim_analyse PRIVATE
@@ -110,6 +111,9 @@ endif()
 
 if(UNIX)
   target_link_libraries(swim_analyse PRIVATE dl pthread)
+endif()
+if(WIN32)
+  target_link_libraries(swim_analyse PRIVATE ws2_32)   # web.cpp 的 winsock2
 endif()
 
 # 运行期要找到 TRT 的动态库：不拷 DLL（TRT lib 目录 2.3 GB），只把路径写进

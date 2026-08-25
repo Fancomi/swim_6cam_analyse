@@ -37,6 +37,7 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | --- | --- | --- |
 | `scripts/build.bat` | 构建 C++ + 导出 ONNX + 烘拼接表（首次一次） | Windows |
 | `scripts/preview.bat` | **开窗口实时看**（按 q/ESC 停） | Windows |
+| `scripts/web.bat` | **开浏览器看板**（画布流 + 统计 + 点人跟随，Ctrl-C 停） | Windows |
 | `scripts/analyse.bat` | **写文件**（json，加 `--out` 出标注 mp4），跑完退出 | Windows |
 | `scripts/install.sh` | 建 `.venv` 装 Python 依赖 + 自检 | Linux / Git Bash |
 | `scripts/cams.sh` | 六路 ZCam：探测 / 配 4K30 / 生成清单 / 直接起预览 | Git Bash |
@@ -45,7 +46,7 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | `scripts/dist.bat` | **打交付包**（双击：先构建再打包，`inc` 出增量、`zip` 顺手压缩） | Windows |
 | `scripts/dist.ps1` | 同上的实现（`dist.bat` 调它；也可单独跑，见下） | Windows PowerShell |
 
-两个 `.bat` 的第一个参数选输入源，语法完全一致（`env.bat` 统一解析）：
+三个 `.bat` 的第一个参数选输入源，语法完全一致（`env.bat` 统一解析）：
 
 | 第一个参数 | 输入 | 传给二进制 |
 | --- | --- | --- |
@@ -54,10 +55,13 @@ C++ 侧的输入有两条，产出同一个 `GpuFrame`，下游不感知差异�
 | 视频文件路径（可拖拽） | 那段全景视频 | `--input` |
 | 目录路径（可拖拽） | 那个目录里的六路片段 | `--cam-dir` |
 | **相机清单文件** | 每行 `<相机>=<地址>`，地址可为 `rtsp://` | `--cam-dir` |
-| `rtsp://…` | 单路直播画布流（只有 preview 能用） | `--input` |
+| `rtsp://…` | 单路直播画布流（analyse 不能用：流没有结尾） | `--input` |
 
 所以「带拼接的实时 pose」= `scripts\preview.bat 6cam`，「带拼接的批处理」=
-`scripts\analyse.bat 6cam`。默认源可用 `SWIM_CANVAS` / `SWIM_CAM_DIR` 覆盖。
+`scripts\analyse.bat 6cam`，「带拼接的浏览器看板」= `scripts\web.bat 6cam`。
+默认源可用 `SWIM_CANVAS` / `SWIM_CAM_DIR` 覆盖。
+**看板无认证无 TLS**，默认只绑 `127.0.0.1`；`--web-bind 0.0.0.0` 才对同网段开放，
+口径与路由契约见 `cpp/README.md`「浏览器看板」。
 **接现场相机**走 `bash scripts/cams.sh`（它生成 `configs/cameras.txt` 再喂给
 `--cam-dir`），细节见 `docs/cameras.md`。
 
@@ -237,6 +241,9 @@ Stage1/2 的结果落 `output_dir/cache.pkl`，键由 `_KEY_ARGS` + 输入视频
 | 拼接查找表的烘制（唯一写端） | `tools/build_stitch_lut.py` |
 | 子进程管道（解码与编码共用） | `src/proc.cpp` |
 | 跟踪 + 划水 + 速度（在线版） | `src/metrics.cpp` |
+| **统计汇总与 JSON 序列化（`[Summary]` / `--json` / 看板同一份口径）** | `src/stats.cpp` + `include/swim/stats.h` |
+| **看板的 HTTP / MJPEG / SSE（只管协议）** | `src/web.cpp` + `include/swim/web.h` |
+| **看板的单页前端（HTML/CSS/JS，只管界面）** | `src/web_ui.cpp` |
 
 ## 同步契约（改一处必须改另一处，编译器不会提醒你）
 
@@ -270,6 +277,7 @@ Stage1/2 的结果落 `output_dir/cache.pkl`，键由 `_KEY_ARGS` + 输入视频
 bash scripts/test.sh            # 能跑吗：语法 + 编码 + 单元测试（约 2 秒，无需 GPU）
 bash scripts/test.sh --full     # 跑得通吗：Python Plan C、C++ 画布、C++ 六路各 30 帧
                                 #           外加 rot180 的逐字节判据（画布 + 六路）
+                                #           与看板六个路由的协议冒烟
 bash scripts/test.sh --baseline # 数字没变吗：四种组合各 3000 帧核对基线（约 5 分钟）
 ```
 
@@ -278,10 +286,10 @@ bash scripts/test.sh --baseline # 数字没变吗：四种组合各 3000 帧核�
 
 | 组合 | 人次 | track | 划水 |
 | --- | --- | --- | --- |
-| 画布 `--input` | 24107 | 63 | 376 |
-| 画布 `--rot180` | 24233 | 90 | 361 |
-| 六路 `--cam-dir` | 25078 | 91 | 379 |
-| 六路 `--rot180` | 25578 | 119 | 359 |
+| 画布 `--input` | 24107 | 63 | 875 |
+| 画布 `--rot180` | 24233 | 90 | 859 |
+| 六路 `--cam-dir` | 25078 | 91 | 883 |
+| 六路 `--rot180` | 25578 | 119 | 883 |
 
 口径：RTX 4080 Laptop、`data/20260730/merged_3000f.mp4` 与 `20260730-4k-raw`、
 默认参数。耗时随机器负载抖（画布实测 13.5~19.6 ms/帧），**不作为判据**。
@@ -318,8 +326,8 @@ bash scripts/test.sh --baseline
 | 口径 | 典型数字 |
 | --- | --- |
 | Plan A / `data/20260629` / H800 | 19.3 人每帧、81 track、3000 帧约 21.5 分钟 |
-| Plan C(C++) / `data/20260730` 画布 / RTX 4080 Laptop | 8.0 人每帧、63 track、376 次划水、65–78 fps |
-| Plan C(C++) / `20260730-4k-raw` 六路现拼 / RTX 4080 Laptop | 91 track、379 次划水、38 fps |
+| Plan C(C++) / `data/20260730` 画布 / RTX 4080 Laptop | 8.0 人每帧、63 track、875 次划水、65–78 fps |
+| Plan C(C++) / `20260730-4k-raw` 六路现拼 / RTX 4080 Laptop | 91 track、883 次划水、38 fps |
 | Plan C(C++) / `data/20260730` / H800 | 12.4 ms 每帧（80 fps） |
 
 两个数据集的人数密度差一倍以上，跨口径比较毫无意义。

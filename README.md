@@ -10,7 +10,7 @@ ID / 划水数 / 速度 / 关键点骨架的视频。输入可以是**已拼好�
 
 | | 用途 | 入口 | 速度 |
 | --- | --- | --- | --- |
-| **C++/CUDA** | 实时、上线、看效果 | 双击 `scripts/preview.bat` | 画布 65–78 fps / 六路现拼 38 fps |
+| **C++/CUDA** | 实时、上线、看效果 | 双击 `scripts/preview.bat`（或 `web.bat` 看浏览器看板） | 画布 65–78 fps / 六路现拼 38 fps |
 | **Python** | 换模型、Plan A/B/C 对比、评测 | `bash scripts/run.sh C` | 约 13 倍实时 |
 
 C++ 只实现 Plan C，是 Python Plan C 的重写（同一份权重），两边靠数值对照保持一致；
@@ -28,15 +28,22 @@ scripts\build.bat            构建 + 导出 ONNX + 烘拼接查找表（首次�
 
 scripts\preview.bat          开窗口实时看 —— 已拼全景视频（默认）
 scripts\preview.bat 6cam     开窗口实时看 —— 六路 4K 原片，GPU 上现拼
+scripts\web.bat              开浏览器看板 —— 已拼全景视频（默认）
+scripts\web.bat 6cam         开浏览器看板 —— 六路 4K 原片，GPU 上现拼
 scripts\analyse.bat          跑完写 json  —— 已拼全景视频（默认）
 scripts\analyse.bat 6cam     跑完写 json  —— 六路 4K 原片，GPU 上现拼
 ```
 
-两个 `.bat` 跑的是**同一套算法**（逐帧 detect + pose + 跟踪 + 划水/速度，无缓存），
-区别只有结果去哪：`preview` 显示，`analyse` 落盘。第一个参数还可以是**视频文件**
-（= 指定一段全景视频）、**目录**（= 指定六路片段目录）、`rtsp://…`（直播流，只有
-preview 能用），都支持直接拖到 `.bat` 上。其余参数原样透传，例如
+三个 `.bat` 跑的是**同一套算法**（逐帧 detect + pose + 跟踪 + 划水/速度，无缓存），
+区别只有结果去哪：`preview` 开窗口、`web` 开浏览器、`analyse` 落盘。第一个参数还可以是
+**视频文件**（= 指定一段全景视频）、**目录**（= 指定六路片段目录）、`rtsp://…`（直播流，
+`analyse` 不能用），都支持直接拖到 `.bat` 上。其余参数原样透传，例如
 `scripts\analyse.bat 6cam --out o.mp4 --max-frames 300`。
+
+**看板**（`web.bat`）在浏览器里给两种可全屏的布局：全景 + 全场统计、全景 + 个人跟随 +
+个人统计；点画面里的人即跟随，关键点 / 分析 / 泳池网格是三个复选框，由浏览器叠加重绘。
+它**无认证也无加密**，默认只绑 `127.0.0.1`（本机可见），要给同网段看才加
+`--web-bind 0.0.0.0`。细节见 [`cpp/README.md`](cpp/README.md) 的『浏览器看板』。
 
 首次运行会构建 TensorRT engine（几分钟），之后秒开。
 环境要求与踩过的坑见 [`docs/windows.md`](docs/windows.md)。
@@ -135,8 +142,8 @@ Plan B/C 把 Stage1+2 换成画布单遍或画布两阶段，Stage3/4 不变。
 - `wrist_x_head` 手腕沿泳道方向相对鼻子的带符号位移，滞回过零计数。前进方向由该
   目标鼻子的首末净位移自动判定，与游动朝向无关。
 
-自由泳 / 仰泳左右手交替，两侧分别计数后取 `min`（更抗单侧漏检）；其余泳姿双臂同步，
-左右信号取均值后统一计数。
+自由泳 / 仰泳左右手交替，两侧分别计数后**相加**（左手一次、右手一次算两次）；
+其余泳姿双臂同步，左右信号取均值后统一计数（一次摆动算一次）。
 
 **速度**取检测框中心在画布坐标下的位移：画布是等比米制（`--ppm` 像素/米），像素距离
 除以 `ppm` 即得米，不需要反投影。相比用单个关键点（如鼻子），框中心来自跟踪器、
@@ -149,8 +156,9 @@ CLAUDE.md                        导航：该走哪条线、同步契约、验�
 scripts/                         全部用户入口，脚本自己 cd 到仓库根，从哪调都一样
   build.bat                      构建 + 导出 ONNX + 烘拼接表（双击）
   preview.bat                    开窗口实时看（双击；第一个参数选输入源）
+  web.bat                        开浏览器看板（双击；同一套参数）
   analyse.bat                    跑完写 json / mp4（双击；同一套参数）
-  env.bat                        两个 bat 共用：解析命令行 + 定位输入源 + 前置检查，不单独跑
+  env.bat                        三个 bat 共用：解析命令行 + 定位输入源 + 前置检查，不单独跑
   install.sh run.sh test.sh      Python 入口（Linux / Git Bash）
   cams.sh                        六路 ZCam：探测 / 配 4K30 / 生成清单 / 起预览
   dist.bat dist.ps1              打交付包（双击；全能包 + 增量包两级，纯 Windows 不需 bash）
@@ -169,7 +177,7 @@ src/swim_analyse/                Python 参考实现
   draw.py        骨架 / 标签绘制
   video.py       多路视频的帧级随机读取（带帧缓存），Plan A 用
 cpp/                             C++/CUDA 实时实现（Plan C），见 cpp/README.md
-  src/ include/swim/             实现与头文件（含六路 NVDEC 拼接 stitch.cu）
+  src/ include/swim/             实现与头文件（含六路 NVDEC 拼接 stitch.cu、看板 web.cpp）
   tools/export_onnx.py           weights/ -> ONNX（scripts/build.bat 会调）
   tools/build_stitch_lut.py      pool_mesh.json -> 逐像素拼接查找表（同上）
   models/                        ONNX / TRT engine / stitch.lut（除 pose_meta.json 外不入库）
@@ -282,7 +290,7 @@ C++ 侧只需 CUDA 12.x + TensorRT 10.11 + OpenCV 4.x + ffmpeg CLI，不依赖�
 
 有 `cache.pkl` 时跳过 Stage1+2，可省掉全程的 64%。
 
-### C++ Plan C：`data/20260730`，3000 帧（8.0 人/帧，63 个 track，划水合计 376 次）
+### C++ Plan C：`data/20260730`，3000 帧（8.0 人/帧，63 个 track，划水合计 875 次）
 
 | 机器 | 纯分析 | 实时预览 `--preview` | 渲染落盘 `--out` |
 | --- | --- | --- | --- |
@@ -294,7 +302,7 @@ GPU 段稳定在 6.2 ms（H800）/ 6.8–8 ms（4080 Laptop）。
 
 ### C++ 六路现拼：`20260730-4k-raw` 六路 4K，3000 帧，RTX 4080 Laptop
 
-26.2 ms/帧（**38.2 fps**），91 个 track、划水合计 379 次。慢一倍是因为
+26.2 ms/帧（**38.2 fps**），91 个 track、划水合计 883 次。慢一倍是因为
 **NVDEC 已跑满 100%**：六路 4K 并发的裸解码就要 25.8 ms/帧，拼接 kernel 只占约 1 ms。
 画布与离线 CPU 参考差 mean|d| 0.34 灰阶（最大 3，100% 在 2 灰阶内）。
 接实际 zcam 流后解码这一项会消失。

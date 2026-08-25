@@ -308,8 +308,9 @@ int MetricsTracker::strokes(int tid) const {
   auto it = st_.find(tid);
   if (it == st_.end()) return 0;
   const auto& s = it->second;
-  // split：自由泳/仰泳左右手交替，取较小值抗单侧漏检；否则只有一路左右均值信号
-  return split_ ? std::min(s.ch[0].count, s.ch[1].count) : s.ch[0].count;
+  // split：自由泳/仰泳左右手交替，每只手各算一次划水，故左右相加；
+  // 蝶泳/蛙泳双臂同步，只有一路左右均值信号，一次摆动算一次
+  return split_ ? s.ch[0].count + s.ch[1].count : s.ch[0].count;
 }
 
 float MetricsTracker::speed(int tid) const {

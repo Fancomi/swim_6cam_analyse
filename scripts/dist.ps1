@@ -12,7 +12,7 @@ PowerShell 而非 bash：交付链路只在 Windows 上跑，不该拖上 Git Ba
 （cmd 调起的 bash 是非登录 shell，连 dirname/md5sum 都找不到）。
 
 **全能包 = 目标机零安装**：exe、全部运行期 DLL、CUDA 运行库、VC 运行库、
-ffmpeg/ffprobe、预烘 engine、ONNX + TRT 构建资源、拼接查找表、两个双击入口。
+ffmpeg/ffprobe、预烘 engine、ONNX + TRT 构建资源、拼接查找表、三个双击入口。
 目标机只需要 NVIDIA 卡 + 驱动 >= 550，别的什么都不用装。
 
 带上 ONNX（133 MB）与 nvinfer_builder_resource（1.7 GB）是刻意的：engine 与
@@ -25,7 +25,7 @@ kernel 只能靠编进 exe 的 cubin**，ONNX 帮不上。所以 build.bat 默�
 （RTX40 + RTX50/Blackwell）双架构编译，本脚本用 cuobjdump 核一遍并写进 README.txt。
 
 **增量包 = 基础件（每次必带）+ 变了的大件** + 一个 update.bat（拷进目标目录）。
-基础件只有 exe 与三个生成的文本（两个入口 + README），合起来约 0.5 MB —— 改代码
+基础件只有 exe 与四个生成的文本（三个入口 + README），合起来约 0.5 MB —— 改代码
 只动这几个，不值得为省这点体积去赌「检测对不对」，所以一律带上，不做判断。
 大件（DLL / ffmpeg / engine / ONNX / stitch.lut）按 dist\<名>.manifest 比 md5，
 真变了才进包；有大件进包就说明该重打一次全能包，日志会点出来。
@@ -231,10 +231,11 @@ cam5=rtsp://192.168.3.105/live_stream
 cam6=rtsp://192.168.3.106/live_stream
 '@ $true
 
-# 两个入口只差三处：源的默认值、必需的模型文件、传 --input 还是 --cam-dir。
-# 所以共同骨架（cd、绝对路径调 exe、shift 循环解析参数、退出码提示）由这里拼，
-# 差异靠参数传进去 —— 两份 .bat 各自完整可读，但骨架只维护一份。
-function Write-Launcher ($name, $head, $default, $need, $flag) {
+# 三个入口只差四处：源的默认值、必需的模型文件、传 --input 还是 --cam-dir、
+# 结果去哪（预览窗口 / 浏览器看板）。所以共同骨架（cd、绝对路径调 exe、shift
+# 循环解析参数、退出码提示）由这里拼，差异靠参数传进去 —— 每份 .bat 各自完整
+# 可读，但骨架只维护一份。
+function Write-Launcher ($name, $head, $default, $need, $flag, $sink, $hint) {
   # 只有 --cam-dir 要查源：它必须是一份清单文件，缺了就得把人指回 cameras.txt。
   # --input 的源可以是 rtsp:// 也可以是视频文件，交给 exe 自己判断。
   $srcCheck = if ($flag -eq '--cam-dir') { @'
@@ -292,14 +293,14 @@ if not exist "$need" (
 $srcCheck
 echo.
 echo   source : %SRC%
-echo   press q or ESC on the preview window to stop
+echo   $hint
 echo.
 
 rem The canvas is rendered rotated 180 degrees (the rig hangs upside down).
 rem It costs nothing: the stitch kernel just writes each pixel to the mirrored
 rem slot, and the single-camera path lets the decoder do it. Append
 rem --no-rot180 to turn it off - later flags win over the ones set here.
-"%EXE%" $flag "%SRC%" --models models --preview --show-fps --rot180%ARGS%
+"%EXE%" $flag "%SRC%" --models models $sink --show-fps --rot180%ARGS%
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" echo [error] exited with code %RC% - see README.txt
@@ -333,7 +334,8 @@ rem Decoding goes through the bundled ffmpeg (about 78 fps here).
 rem
 rem ASCII only on purpose: cmd.exe parses .bat with the system ANSI codepage.
 rem Chinese notes are in README.txt.
-'@ 'rtsp://192.168.1.199/live_stream' 'models\detect.engine' '--input'
+'@ 'rtsp://192.168.1.199/live_stream' 'models\detect.engine' '--input' '--preview' `
+   'press q or ESC on the preview window to stop'
 
 Write-Launcher run_6cam.bat @'
 @echo off
@@ -365,7 +367,39 @@ rem Six 4K streams -> NVDEC -> GPU stitch -> detect + pose, about 38 fps.
 rem
 rem ASCII only on purpose: cmd.exe parses .bat with the system ANSI codepage.
 rem Chinese notes are in README.txt.
-'@ 'cameras.txt' 'models\stitch.lut' '--cam-dir'
+'@ 'cameras.txt' 'models\stitch.lut' '--cam-dir' '--preview' `
+   'press q or ESC on the preview window to stop'
+
+Write-Launcher run_6cam_web.bat @'
+@echo off
+rem Production six-camera run, viewed in a browser instead of a window.
+rem Same pipeline as run_6cam.bat: six 4K streams -> NVDEC -> GPU stitch ->
+rem detect + pose. Only the output differs.
+rem
+rem   double-click                 read cameras.txt, open the dashboard
+rem   run_6cam_web.bat --web-port 9000        serve on another port
+rem   run_6cam_web.bat --web-bind 0.0.0.0     let other machines watch - READ BELOW
+rem   run_6cam_web.bat --no-browser           do not open the browser
+rem   run_6cam_web.bat --json out.json        also write per-swimmer results
+rem   run_6cam_web.bat --no-rot180            render upright (180 is the default)
+rem   run_6cam_web.bat <list.txt>             use a different camera list
+rem
+rem WARNING: the dashboard has NO password and NO encryption, so it listens on
+rem 127.0.0.1 (this machine only) by default. --web-bind 0.0.0.0 puts the live
+rem pool footage in front of everyone on the subnet. Only do that on a network
+rem you control.
+rem
+rem The page has two layouts (both go fullscreen): panorama + venue stats, and
+rem panorama + follow view + that swimmer's stats. Click a swimmer in the
+rem panorama to follow them. Keypoints / analysis / pool grid are checkboxes,
+rem drawn by the browser on top of the video, so toggling them costs nothing.
+rem
+rem Press Ctrl-C in this window to stop the server.
+rem
+rem ASCII only on purpose: cmd.exe parses .bat with the system ANSI codepage.
+rem Chinese notes are in README.txt.
+'@ 'cameras.txt' 'models\stitch.lut' '--cam-dir' '--web' `
+   'the browser opens by itself; press Ctrl-C here to stop'
 
 $Arch = if ((Split-Path -Leaf $DetectEngine) -match '\.(sm\d+)-') { $Matches[1] } else { '未知架构' }
 $ArchList = if ($Arches) { $Arches -join ' ' } else { '未探测' }
@@ -376,12 +410,16 @@ $Readme = @"
 **目标机什么都不用装**（除了 NVIDIA 驱动）。CUDA 运行库、VC 运行库、ffmpeg
 都在本目录里，入口脚本会把本目录加到 PATH。整个目录拷到哪都能跑，别拆散。
 
-两个入口，双击即可：
+三个入口，双击即可：
 
   run_1cam.bat    单相机联调。直接分析一路 4K 原始画面，不拼接。
                   用来验相机、验网络、验这台机器的 GPU 链路。
   run_6cam.bat    六路上线。拉六路 4K，在 GPU 上拼成全景后分析，
-                  中间不落文件、不回 CPU。
+                  中间不落文件、不回 CPU。结果显示在一个 OpenCV 窗口里。
+  run_6cam_web.bat 同上，但结果显示在**浏览器看板**里（自动弹出）：全景画布 +
+                  全场统计栏 + 点人跟随视角与个人统计。叠加层是复选框（全景与
+                  跟随各一组），由浏览器重绘，勾选不占分析算力。
+                  详见下面「浏览器看板」。
 
 上线前只需要改一个文件：**cameras.txt**，把右边的 IP 换成现场的。
 左边的相机名不要动 —— 它与泳池标定（models/stitch.lut）绑定，改了会接缝错位。
@@ -423,12 +461,14 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   run_6cam.bat --preview-scale 0.4  预览窗口缩放比
   run_6cam.bat --fps 30             按 30fps 算时间轴（流报错帧率时用）
   run_6cam.bat --ghost 0            关掉丢检占位（默认停 5 帧，画法同真检出）
-  run_6cam.bat --no-rot180          画面转回正向（两个入口默认都转 180°）
+  run_6cam.bat --no-rot180          画面转回正向（三个入口默认都转 180°）
+  run_6cam_web.bat --web-port 9000  看板换端口（默认 8080）
+  run_6cam_web.bat --web-bind 0.0.0.0   允许别的机器看（无认证，看上面的告警）
   swim_analyse.exe --help           全部参数
 
 画面为什么是转 180° 的
 ----------------------
-机位是倒挂的，所以两个入口都默认加了 --rot180。这个旋转**不是后处理**：六路那条
+机位是倒挂的，所以三个入口都默认加了 --rot180。这个旋转**不是后处理**：六路那条
 路只是把拼接 kernel 的写入落点改成对角镜像（读写次数一模一样），单相机那条路交给
 解码器的滤镜顺手做掉，两者都不多花一帧的时间、也不多占一块显存。画布尺寸不变，
 相机顺序、标定、检测与统计全都不受影响。临时想看正向就追加 --no-rot180 ——
@@ -447,9 +487,47 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
 窗口里看到的就是 --out 写进 mp4 的：热键切换会同时作用于落盘。
 想一开始就是某个状态，用 --no-kpts / --no-boxes / --grid。
 
+浏览器看板（run_6cam_web.bat）
+------------------------------
+双击后浏览器自己弹出 http://127.0.0.1:8080/ 。页面分两种布局，都能全屏：
+
+  全景          完整画布 + 上方全场统计栏（画布是扁的，统计放上面不挤画布）
+  全景 + 个人   再加一块个人跟随视角与该运动员的个人统计（统计改到右侧）
+
+**在画布上点一名运动员**就切到后者并开始跟随（框重叠时取面积最小的那个，
+一般就是想点的人）。跟随视角纵向锁在他那一条泳道上（上下各多留半米），
+横向做延迟跟随，所以既不会随检测框忽大忽小而变焦，也不会跟着抖。
+
+顶栏有两组复选框（关键点 / 检测 / 分析 / 泳池网格），全景一组、跟随一组，各自独立：
+全景默认四个全开；跟随默认关掉关键点与检测框，只留分析标签与网格 —— 看泳姿时
+框与骨架会挡住手臂入水，但速度与划数还要读。「检测」是框本身，「分析」是那行
+文字标签，两者分开控制。跟随视角里标签钉在左上角固定位置，不跟着检测框上下抖；
+全景则贴各自的框沿，因为同一条道可能两个人并列游。
+它们对应窗口版的 1/2/3 热键，但**是浏览器自己画的**，不是把画好的像素传过来：
+勾选与取消完全不影响分析帧率，多人同时看各自的勾选也互不干扰。刻度口径与窗口版
+同一份（粗线 = 分道绳每 2.5 m，细线均分 0.5 m），因为两边都取自同一处标定；
+跟随视角里只画他这一道，每米一条刻度、每 5 米标米数，字号加大并换成橙黄
+（青色混在水色里读不清），一划推进几米直接读得出来。
+
+统计栏只报「此刻在场的人」：在场人数、平均速度、平均划频、平均每划距离、
+最快瞬时速度及其 ID、八条泳道各自的当前占用。
+个人栏：划水次数、当前/平均/峰值速度、划频 spm、所在泳道、在场时长、累计里程、
+每划距离、划水指数（均速 × 每划距离，同样速度下越大越省力）。
+
+几点现场须知：
+* **无密码、无加密**，所以默认只监听本机。要在别的机器上看就加
+  --web-bind 0.0.0.0（画面对同网段全部开放，只在自己可控的网络上这么做），
+  然后在那台机器上访问 http://<本机IP>:8080/ 。
+* 画面走 MJPEG、统计走 SSE，浏览器原生支持，不需要装插件。看的人多了也不会
+  拖慢分析：网络跟不上时只会丢帧，绝不会把背压顶回推理流水线。
+* 没人打开页面时，缩放与编码整个跳过，等于零开销；只看「全景」布局时跟随视角
+  那一路也不编码。
+* 全景流默认缩到 1280 宽再编码（--web-width 改），跟随视角原尺寸推。想更清就调大，
+  代价是带宽与一点编码时间（在独立线程上，不占分析帧预算）。
+
 怎么更新
 --------
-开发侧双击 scripts\dist.bat inc 出一个增量包（约 0.5 MB：程序本体 + 两个入口 +
+开发侧双击 scripts\dist.bat inc 出一个增量包（约 0.5 MB：程序本体 + 三个入口 +
 本文件），把整个 swim_analyse_update 文件夹拷进本目录，双击里面的 update.bat。
 它只覆盖不删除，也不动 cameras.txt（现场 IP 在里面）。不要手工挑文件拷。
 增量包里若还带了 models\ 或 DLL，说明模型/依赖也变了，照样双击即可。
@@ -482,6 +560,8 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
   单相机直分析      约 78 fps
   六路现拼 + 分析   约 38 fps（瓶颈是 NVDEC，六路 4K 已把解码器跑满）
   加 --out 落盘     约 27~35 fps（libx264 与解码抢 CPU）
+  开着浏览器看板    与不开基本同档（缩放与 JPEG 在独立线程上，发布侧只多一次
+                    整帧 memcpy 约 1.4 ms）
 "@
 Write-Gen README.txt $Readme $true -Base
 
