@@ -89,7 +89,7 @@ main.m0 .sub{display:none}
   </div>
   <span class="grp"><em>全景</em>
     <label><input type="checkbox" data-g="c" data-k="kpts" checked>关键点</label>
-    <label><input type="checkbox" data-g="c" data-k="det" checked>检测</label>
+    <label><input type="checkbox" data-g="c" data-k="det">检测</label>
     <label><input type="checkbox" data-g="c" data-k="info" checked>分析</label>
     <label><input type="checkbox" data-g="c" data-k="grid" checked>网格</label></span>
   <span class="grp" id="fgrp"><em>跟随</em>
@@ -228,14 +228,18 @@ const limbColor = (a, b) => {
        : '#7bed9f';
 };
 
-/// V = {s, tx, ty, thick, sw, fix?}：s 缩放、tx/ty 画布→屏幕平移、thick 线宽、
-/// sw 该视图的开关组。fix 给出时标签钉死在这个画布坐标（跟随视图只画一个人，
-/// 钉住远比跟着 bbox 上下抖好读）；不给则贴在框的上沿 —— 全景同一条道可能两人
-/// 并列，标签必须各自跟着自己的框走。
+/// V = {s, tx, ty, thick, sw, fix?, solo?}：s 缩放、tx/ty 画布→屏幕平移、
+/// thick 线宽、sw 该视图的开关组。fix 给出时标签钉死在这个画布坐标（跟随视图只画
+/// 一个人，钉住远比跟着 bbox 上下抖好读）；不给则贴在框的上沿 —— 全景同一条道可能
+/// 两人并列，标签必须各自跟着自己的框走。solo = 本视图只画选中者，于是不必再把他
+/// 从别人里挑出来（见下面的 hl）。
 function drawPerson(g, p, V) {
   const s = V.s, th = V.thick, sw = V.sw;
   const X = x => V.tx + x * s, Y = y => V.ty + y * s;
   const col = idColor(p.id), on = p.id === sel;
+  // 高亮 = 「他是选中的那个，且画面里还有别人」。全景默认不画检测框，所以认人全靠
+  // 骨架本身：给它加一圈白光环并加粗（白色与框/标签的选中色同源，是同一套语言）。
+  const hl = on && !V.solo;
   const bx = X(p.b[0]), by = Y(p.b[1]);
   g.lineJoin = g.lineCap = 'round';
   if (sw.det) {
@@ -276,11 +280,16 @@ function drawPerson(g, p, V) {
     q.moveTo(X(K[a * 3]), Y(K[a * 3 + 1]));
     q.lineTo(X(K[b * 3]), Y(K[b * 3 + 1]));
   }
+  // 逐色描边：暗底压住白色水花 →（选中时）白光环 → 彩色本体。全景默认不画检测框，
+  // 光环 + 加粗就是「锁定的是他」的唯一信号，白色与框/标签的选中色同源。
+  // 光环比暗底细一点，于是暗底仍在最外圈，亮线压在水花上也不糊。
+  const lw = th + (hl ? 1 : 0);
   for (const c in paths) {
-    g.strokeStyle = 'rgba(0,0,0,.45)'; g.lineWidth = th + 2.2; g.stroke(paths[c]);
-    g.strokeStyle = c;                 g.lineWidth = th;       g.stroke(paths[c]);
+    g.strokeStyle = 'rgba(0,0,0,.45)'; g.lineWidth = lw + 2.2; g.stroke(paths[c]);
+    if (hl) { g.strokeStyle = '#fff';  g.lineWidth = lw + 1.5; g.stroke(paths[c]); }
+    g.strokeStyle = c;                 g.lineWidth = lw;       g.stroke(paths[c]);
   }
-  const r = Math.max(1.6, th * 1.3);
+  const r = Math.max(1.6, lw * 1.3);
   for (let i = 0; i < meta.nk; i++) {
     if (K[i * 3 + 2] < thr) continue;
     const wrist = i === 9 || i === 10;                // 手腕点大一号：划水看的就是它
@@ -288,6 +297,8 @@ function drawPerson(g, p, V) {
     g.arc(X(K[i * 3]), Y(K[i * 3 + 1]), r * (wrist ? 1.7 : 1), 0, 6.2832);
     g.fillStyle = wrist ? '#ffd23f' : '#fff';
     g.fill();
+    // 选中者的点加一圈暗边：点被加粗的亮线包着容易糊成一团，描边把它们分回来
+    if (hl) { g.strokeStyle = 'rgba(13,17,23,.8)'; g.lineWidth = 1; g.stroke(); }
   }
 }
 )JS"
@@ -304,7 +315,9 @@ function render() {
   g.translate(r.x, r.y);
   if (SW.c.grid) drawGrid(g, r.s, 0, meta.w, 0);
   const V = {s: r.s, tx: 0, ty: 0, thick: 1.4, sw: SW.c};
-  for (const p of S.p) {
+  // 选中者排到最后画：全景里人会重叠，被压在别人骨架下面的高亮就白加了。
+  // 十几人的浅拷贝 + 排序在每帧预算里可忽略，比另起一个「先别人后他」的双循环短。
+  for (const p of [...S.p].sort((a, b) => (a.id === sel) - (b.id === sel))) {
     g.globalAlpha = p.g ? .55 : 1;             // ghost 占位框画淡一点（web 侧才区分）
     drawPerson(g, p, V);
   }
@@ -332,7 +345,9 @@ function render() {
       fg.save();
       fg.translate(fr.x - rc[0] * fr.s, fr.y - rc[1] * fr.s);
       if (SW.f.grid) drawGrid(fg, fr.s, rc[0], rc[2], S.sel.lane);
-      const FV = {s: fr.s, tx: 0, ty: 0, thick: 2.2, sw: SW.f, fix: [rc[0], rc[1]]};
+      // solo：这个视图只画他一个，不必再把他从别人里高亮出来（见 drawPerson 的 hl）
+      const FV = {s: fr.s, tx: 0, ty: 0, thick: 2.2, sw: SW.f,
+                  fix: [rc[0], rc[1]], solo: 1};
       for (const p of S.p)
         if (p.id === sel) drawPerson(fg, p, FV);
       fg.restore();
