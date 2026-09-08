@@ -94,7 +94,8 @@ echo        double-click update.bat inside it.
 goto :end
 :say_full
 echo        Copy dist\swim_analyse\ to the target machine and
-echo        double-click run_6cam.bat inside it. Nothing to install there.
+echo        double-click zcam_setup.bat first, then run_6cam_web.bat.
+echo        Nothing to install there.
 echo        Once it is deployed, run: scripts\dist.bat rebase
 goto :end
 

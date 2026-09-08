@@ -25,7 +25,7 @@ kernel 只能靠编进 exe 的 cubin**，ONNX 帮不上。所以 build.bat 默�
 （RTX40 + RTX50/Blackwell）双架构编译，本脚本用 cuobjdump 核一遍并写进 README.txt。
 
 **增量包 = 基础件（每次必带）+ 变了的大件** + 一个 update.bat（拷进目标目录）。
-基础件只有 exe 与四个生成的文本（三个入口 + README），合起来约 0.5 MB —— 改代码
+基础件只有 exe、入口脚本与 README，合起来约 0.5 MB —— 改代码
 只动这几个，不值得为省这点体积去赌「检测对不对」，所以一律带上，不做判断。
 大件（DLL / ffmpeg / engine / ONNX / stitch.lut）按 dist\<名>.manifest 比 md5，
 真变了才进包；有大件进包就说明该重打一次全能包，日志会点出来。
@@ -178,6 +178,10 @@ Add-File $DetectEngine 'models\detect.engine'
 Add-File (Get-Engine pose) 'models\pose.engine'
 Add-File (Join-Path $Root 'cpp\models\stitch.lut')     'models\stitch.lut'
 Add-File (Join-Path $Root 'cpp\models\pose_meta.json') 'models\pose_meta.json'
+
+# Keep the ZCam setup logic in one source file.  The delivery copy is placed at
+# the package root so it can be double-clicked next to cameras.txt and run_6cam.bat.
+Add-File (Join-Path $Root 'scripts\zcam_setup.bat') 'zcam_setup.bat' -Base
 
 # ONNX + 构建资源：让目标机在架构不符时能自己现烘 engine（见文件头的理由）
 if ($Lean) {
@@ -410,7 +414,7 @@ $Readme = @"
 **目标机什么都不用装**（除了 NVIDIA 驱动）。CUDA 运行库、VC 运行库、ffmpeg
 都在本目录里，入口脚本会把本目录加到 PATH。整个目录拷到哪都能跑，别拆散。
 
-三个入口，双击即可：
+三个分析入口，双击即可：
 
   run_1cam.bat    单相机联调。直接分析一路 4K 原始画面，不拼接。
                   用来验相机、验网络、验这台机器的 GPU 链路。
@@ -421,9 +425,17 @@ $Readme = @"
                   跟随各一组），由浏览器重绘，勾选不占分析算力。
                   详见下面「浏览器看板」。
 
+另有一个相机配置工具：
+
+  zcam_setup.bat    一键把现场六台 ZCam 配成 3840x2160 / 29.97fps / H.264
+                    主流。相机地址固定为 192.168.3.101-106。
+
 上线前只需要改一个文件：**cameras.txt**，把右边的 IP 换成现场的。
 左边的相机名不要动 —— 它与泳池标定（models/stitch.lut）绑定，改了会接缝错位。
 某台相机还没接就注释掉那一行，画布上它的区域留黑，其余五路照常工作。
+
+现场相机第一次接入或分辨率不对时，先双击 zcam_setup.bat；它会停止录制、设置
+主流并逐台回读校验。设置完成后再双击 run_6cam_web.bat。
 
 前置要求
 --------
@@ -438,6 +450,8 @@ $Readme = @"
 
 相机侧配置（4K + 30fps）
 ------------------------
+zcam_setup.bat 已把下面的动作按 192.168.3.101-106 逐台执行；需要手工排障时：
+
 movfmt 决定主流的分辨率与帧率，**它在录制中是只读的** —— 查询会看到 "ro":1，
 写入返回 code:-1 且不报原因。所以要先停录：
 
@@ -550,7 +564,7 @@ RTSP 只有一个挂载点 rtsp://<ip>/live_stream，它给出的是相机当前
 
 怎么更新
 --------
-开发侧双击 scripts\dist.bat inc 出一个增量包（约 0.5 MB：程序本体 + 三个入口 +
+开发侧双击 scripts\dist.bat inc 出一个增量包（约 0.5 MB：程序本体 + 入口脚本 +
 本文件），把整个 swim_analyse_update 文件夹拷进本目录，双击里面的 update.bat。
 它只覆盖不删除，也不动 cameras.txt（现场 IP 在里面）。不要手工挑文件拷。
 增量包里若还带了 models\ 或 DLL，说明模型/依赖也变了，照样双击即可。

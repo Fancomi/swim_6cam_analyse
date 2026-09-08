@@ -60,8 +60,10 @@ scripts\dist.bat zip        顺手压一个同名 .zip（inc zip 亦可）
 预烘 engine、ONNX 全在里面。**RTX 40 与 50 系（Blackwell）开箱即用** —— exe 按
 `sm_89;sm_120` 双架构编，engine 与本机架构不符时用包内 ONNX 现场重烘（几分钟，之后秒开）。
 其他代次的卡也能跑，只是 CUDA kernel 由驱动 JIT，首次启动多等几十秒。
-里面两个双击入口：`run_1cam.bat`（单相机联调）/ `run_6cam.bat`（六路上线，改
-`cameras.txt` 里的 IP 即可）。增量包只含变了的文件 + 一个 `update.bat`（只覆盖不删除，
+里面有三个运行入口：`run_1cam.bat`（单相机联调）、`run_6cam.bat`（窗口预览）和
+`run_6cam_web.bat`（浏览器看板）。先双击 `zcam_setup.bat` 把固定的
+`192.168.3.101-106` 配成 4K/29.97fps/H.264，再启动六路入口；`cameras.txt` 只需在
+现场 IP 不同的情况下修改。增量包只含变了的文件 + 一个 `update.bat`（只覆盖不删除，
 跳过 `cameras.txt`）。细节见 [`CLAUDE.md`](CLAUDE.md) 的『交付包』。
 
 **Python 参考链路（Linux 或 Git Bash）**：
