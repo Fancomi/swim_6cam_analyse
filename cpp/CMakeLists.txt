@@ -97,6 +97,15 @@ target_link_libraries(swim_analyse PRIVATE
 option(SWIM_ENABLE_STITCH "编入六路 NVDEC 拼接源（需要 FFmpeg libav*）" ON)
 if(SWIM_ENABLE_STITCH)
   find_package(FFMPEG QUIET)
+  # Linux 回退：FFmpeg 官方无 CMake 模块，find_package(FFMPEG) 只有 vcpkg 的
+  # config 能命中（Windows）。Linux 上的系统/自编 ffmpeg 靠 pkg-config 定位，
+  # 否则六路拼接源在 Linux 永远被跳过（现场 Ubuntu 部署踩过：--cam-dir 不可用）。
+  if(NOT FFMPEG_FOUND AND NOT FFMPEG_LIBRARIES)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(FFMPEG libavcodec libavformat libavutil libswscale)
+    endif()
+  endif()
   if(FFMPEG_FOUND OR FFMPEG_LIBRARIES)
     target_sources(swim_analyse PRIVATE src/stitch.cu src/stitch_source.cpp)
     target_include_directories(swim_analyse PRIVATE ${FFMPEG_INCLUDE_DIRS})

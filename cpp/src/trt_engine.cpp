@@ -198,6 +198,17 @@ void build_engine(const std::string& onnx, const std::string& out,
   auto buf = read_file(onnx);
   SWIM_CHECK(parser->parse(buf.data(), buf.size()), "ONNX 解析失败 " + onnx);
 
+  // 输出一律钉成 fp32：onnx-parser 会沿用 ONNX 里输出节点的 dtype，而
+  // export_onnx.py 导的是 fp16 ONNX，于是 SimCC 两个输出被标成 fp16。非强类型
+  // builder 是否在输出前补一个 cast 回 fp32 由 tactic 决定，**因 GPU 架构而异**：
+  // RTX40 上实测补了（输出 fp32），H800 上没补（输出 fp16）。而 k_simcc_decode
+  // 按 `const float*` 读这两个缓冲 —— 输出是 fp16 时每个 float 由相邻两个 half
+  // 拼成，simcc 被读成乱数，峰值塌到 ~0.01，所有关键点低于 --kpt-thr，划水恒为 0
+  // （现象：人次/track 对得上，划水全 0）。显式钉 fp32 消除这个平台相关性，让
+  // 解码端的 float 约定在所有机器上都成立（检测输出本就是 fp32，这里是空操作）。
+  for (int i = 0; i < net->getNbOutputs(); ++i)
+    net->getOutput(i)->setType(nvinfer1::DataType::kFLOAT);
+
   TrtPtr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
   cfg->setProgressMonitor(&progress);       // 生命期覆盖 buildSerializedNetwork
   if (fp16) {

@@ -344,6 +344,7 @@ bash scripts/test.sh --baseline
 | `docs/权重来源与复现.md` | 权重来源、训练复现 |
 | `docs/cameras.md` | ZCam 相机侧的一切：两路流分工、movfmt、拉流约束、现场坑 |
 | `docs/windows.md` | Windows 环境要求与踩过的坑（含脚本编码规则） |
+| `docs/linux部署踩坑.md` | Linux 加速链路从裸机到跑通的部署坑（git-lfs / TRT 缺头 / FFmpeg pkg-config / engine 烘制 / 六路相机序） |
 | 本页 | 导航、同步契约、验证方法、数字口径 |
 
 同一个数字只在负责它的文档里写一份，别处引用时给链接不复制。
