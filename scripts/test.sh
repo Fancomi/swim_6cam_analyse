@@ -216,6 +216,9 @@ else
 
   else
     # 基线三元组（RTX 4080 Laptop / data/20260730 与 20260730-4k-raw / 默认参数）
+    # ⚠ 下面四组是 train-3 权重的数字。检测权重已升级到上游 train-4，四行全部作废，
+    #   须在基线机 RTX 4080 上重导 ONNX 后重跑本档采集新值填回（勿用 H800 数字顶替，
+    #   H800 与 RTX4080 数值本就不同）。详见 CLAUDE.md「怎么验证一处改动」的告警。
     [[ $CPP -eq 1 ]] && {
       baseline "画布 3000 帧      " "24107 63 875" \
         "$EXE" --input "$CANVAS" --models cpp/models --max-frames 3000 --show-fps
